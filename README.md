@@ -1,298 +1,401 @@
-﻿# Adaptive Agent Orchestrator
+# Adaptive Agent Orchestrator
 
-一个面向可靠性、评估与收敛控制的轻量级多 Agent 编排运行时。
+一个面向 **多 Agent 协作、运行时评估、可恢复执行和人类介入** 的轻量级 Agent Runtime。
 
-它不是具体业务应用，而是一个 `runtime core（运行时内核）`：
+它不是一个固定的 AI Demo，而是一个可复用的多智能体编排底座：你可以在上面接入不同的 agent、workflow、tools 和 LLM provider，让系统按任务需要自动组织执行。
 
-- 让多个 Agent 稳定协作
-- 让状态显式共享与裁剪
-- 让评估进入运行时闭环
-- 让失败可重试、可降级、可解释
-- 未来支持 `Human -> Supervisor Agent -> Worker Agents` 的协作层级
+> 简单说：这是一个让多个 AI agent 像一个团队一样协作的运行时平台。
 
 ---
 
-## 一句话定位
+## 这个项目解决什么问题
 
-> 一个支持共享状态、运行时评估、收敛控制与诚实降级的轻量多 Agent 编排内核。
+单个 LLM 调用很容易做到，但真正做复杂任务时会遇到这些问题：
 
----
+- 多个 agent 怎么分工？
+- 中间状态怎么共享？
+- 哪一步失败了怎么恢复？
+- 输出质量怎么在运行时检查？
+- 什么时候继续、重试、回滚、转人工？
+- 不同 agent 能不能使用不同模型和工具？
+- 跑完以后怎么复盘整次执行过程？
 
-## 这个项目到底在做什么
-
-这个项目解决的不是“某个具体任务怎么回答”，而是：
-
-- 多个 Agent 如何分工协作
-- 状态如何在步骤之间传递
-- 什么时候应该继续、重试、失败或降级
-- 人类、Supervisor Agent、Worker Agents 之间如何分层协作
-
-可以把它理解成：
-
-- Agent workflow 的运行时内核
-- AI 团队协作模式背后的调度与评估系统
-- 未来 Agent 生态里的 runtime / control layer
+`Adaptive Agent Orchestrator` 解决的就是这些 **Agent 工程化问题**。
 
 ---
 
-## 最终目标形态
+## 核心亮点
 
-这个项目的长期目标不是普通 workflow，而是一个更完整的协作层级：
+### 1. 可插拔 Agent
 
-```text
-Human（人类，最高权限）
-  ↓
-Supervisor Agent（总控 / 监督智能体）
-  ↓
-Scheduler（调度器）
-  ↓
-Worker Agents（Planner / Search / Summarizer / Reviewer / Evaluator ...）
-  ↓
-StateCenter + Evaluator + Memory + Feedback Loop
+每个 agent 都有清晰契约：
+
+- 读什么状态
+- 写什么结果
+- 能用什么工具
+- 使用什么 trust level
+- 是否需要 human review
+- 使用什么 LLM profile / provider
+
+当前内置角色包括：
+
+- `planner`：任务规划
+- `search` / `real_search`：检索资料
+- `summarizer`：总结输出
+- `supervisor`：过程复核与修正建议
+- `human_review`：人工审核关口
+
+---
+
+### 2. 可插拔 Workflow
+
+workflow 不是写死在代码里的，而是 YAML 配置。
+
+当前已有：
+
+- `deep_research.yaml`
+- `deep_research_supervised.yaml`
+- `deep_research_human_review.yaml`
+- `customer_support_brief.yaml`
+- `quick_search.yaml`
+- `real_research.yaml`
+- `code_review_pipeline.yaml`
+
+这意味着同一个 runtime 可以承载不同类型任务。
+
+---
+
+### 3. 自然语言入口 + LLM Router
+
+你可以用更自然的方式启动任务：
+
+```powershell
+py -m orchestrator ask "研究固态电池商业化进展，需要主管复核"
 ```
 
-这意味着：
+`ask` 会先通过轻量 LLM Router 判断任务意图，再选择合适 workflow；如果 router 不可用，会自动 fallback 到规则路由。
 
-- 人类保留最高权限、风险判断和最终拍板
-- Supervisor Agent 未来可以代理大量日常总控动作
-- Worker Agents 负责具体执行
-- State、Evaluation、Memory、Feedback 进入统一闭环
+当前支持自动分流到：
 
-完整说明见：
-
-- `docs/ecosystem_architecture_v2.md`
+- `deep_research`
+- `deep_research_supervised`
+- `deep_research_human_review`
+- `customer_support_brief`
 
 ---
 
-## 当前一周冲刺范围
+### 4. 运行时评估与收敛控制
 
-当前不是把完整生态一次性做满，而是把这套设计的 `v1 final runtime core` 做成真的可运行系统。
+系统不是“agent 跑完就算了”，而是在运行过程中持续检查：
 
-本周必须完成：
+- `Evaluator L1`：结构检查
+- `Evaluator L2`：语义质量检查
+- retry / fail / continue
+- checkpoint-backed replan
+- supervisor revision
+- rollback
+- max step 收敛控制
 
-- `StateCenter`
-- `Scheduler`
-- `AgentRegistry`
-- `Evaluator(L1)`
-- `PlannerAgent`
-- `SearchAgent`
-- `SummarizerAgent`
-- 最简结构化执行日志
-- CLI 入口
-- 跑通一个 `deep_research` workflow
-
-本周不要求做满：
-
-- 完整 `Supervisor Agent`
-- 长期记忆层
-- `L2 / L3`
-- 完整 checkpoint rollback
-- 多模型路由
-- Web UI / API
-- 并发执行
-
-这不是降低标准，而是明确：
-
-- 长期目标形态不变
-- 当前优先把最核心的 runtime 做实
-
-完整说明见：
-
-- `docs/architecture.md`
+这让流程更像可靠系统，而不是一串 prompt。
 
 ---
 
-## 核心模块
+### 5. Human Review v2
 
-### `Scheduler`
-负责：
+系统可以在关键节点暂停给人确认：
 
-- 按 workflow 调度执行
-- 控制 retry / fail / 后续扩展 re-plan
-- 保证流程收敛
+```powershell
+py -m orchestrator review --task-id <task_id> --decision approve --reason "人工审核通过"
+```
 
-### `StateCenter`
-负责：
+支持：
 
-- 维护共享状态
-- 记录中间产物
-- 按 Agent 需要裁剪视图
-
-### `Evaluator`
-负责：
-
-- 在运行时判断输出质量
-- 决定 `continue / retry / fail`
-- 后续扩展 `L2 / L3`
-
-### Worker Agents
-当前 MVP 先做：
-
-- `PlannerAgent`
-- `SearchAgent`
-- `SummarizerAgent`
-
-### `Graceful Degradation`
-负责：
-
-- 在失败时明确给出边界和降级结果
-- 避免系统硬编答案
+- `needs_human_review`
+- `approve`
+- `reject`
+- approve 后继续执行后续 agent
+- reject 后明确失败或按推荐目标回退
 
 ---
 
-## 为什么这样设计
+### 6. 多 LLM Provider
 
-这套设计的核心取舍是：
+项目支持多种调用模式：
 
-- 先静态 workflow 骨架，再有限动态调整
-- 先做 `L1` 规则评估，再长 `L2 / L3`
-- 先做共享状态，不先做复杂消息总线
-- 先做 runtime core，不先做完整生态
+- `mock`：本地 mock provider
+- `codex`：本地 Codex CLI
+- `glm`：OpenAI-compatible HTTP API
+- `kimi`：OpenAI-compatible HTTP API
+- `deepseek`：OpenAI-compatible HTTP API
+- `openai`：OpenAI-compatible HTTP API
+- `anthropic`：Anthropic Messages API
+- `ollama`：本地 Ollama CLI
 
-这样做的原因是：
+查看当前 provider 状态：
 
-- 更容易跑通
-- 更容易 debug
-- 更容易验证 runtime evaluation 的真实价值
-- 更适合从真实应用里长出基础设施，而不是一开始就造宇宙级框架
+```powershell
+py -m orchestrator providers --verbose
+```
 
----
+也可以让不同 agent 使用不同模型：
 
-## 和其他两条线的关系
-
-这个项目不是孤立存在的，它和另外两条线直接相关：
-
-### `deep_research_agent`
-- 一个真实的 research workflow 应用
-- 未来可以作为一个 workflow 运行在这个 orchestrator 上
-- 也是 evaluate 资产的重要来源
-
-### future evaluate system
-- 从 `deep_research_agent` 中逐步抽离出的评估层
-- 提供 judge / taxonomy / compare / regression 经验
-- 未来会反哺本项目里的 `Evaluator`
-
-完整说明见：
-
-- `docs/project_relationships.md`
+```powershell
+py -m orchestrator run `
+  --workflow workflows/deep_research_supervised.yaml `
+  --query "solid-state battery progress" `
+  --agent-llm planner=codex:gpt-5.4,supervisor=deepseek:deepseek-chat
+```
 
 ---
 
-## 开发方式路线
+### 7. Memory / Report / Analyze 后台
 
-当前这个项目仍然以对话框模式开发为主，但开发习惯已经开始向更成熟的多 Agent 协作模式演化。
+每次运行都会自动沉淀：
 
-当前正式路线：
+- state
+- checkpoints
+- execution logs
+- convergence report
+- memory bundle
 
-- 对话框模式主力推进
-- 同时开始练：
-  - 文件化上下文
-  - 1 主 1 辅会话分工
-  - 任务拆解
-  - 角色边界定义
+你可以查看最近运行：
 
-长期目标是：
+```powershell
+py -m orchestrator analyze list --limit 10
+```
 
-- 人类保留最高权限
-- Supervisor Agent 代理大量日常总控动作
-- Worker Agents 围绕共享状态与长期记忆协作
+查看某次详情：
 
-完整说明见：
+```powershell
+py -m orchestrator analyze show --task-id <task_id>
+```
 
-- `docs/workflow_evolution.md`
+查看失败统计：
 
----
+```powershell
+py -m orchestrator analyze failures --limit 20
+```
 
-## 这个项目为什么值得做
+查看 memory：
 
-这个项目不是“再一个 AI Demo”，而是在做一条更少见的路线：
+```powershell
+py -m orchestrator analyze memory
+```
 
-- `workflow-native agent infrastructure`
-- `runtime evaluation`
-- `failure handling`
-- `graceful degradation`
-- `AI-native working style`
+查看回归对比：
 
-它的价值不只在代码本身，还在于：
-
-- 你可以把它讲成一条系统路线
-- 它和 `deep_research_agent`、future evaluate system 形成分层关系
-- 后面很适合做技术博客、项目展示和面试讲解
-
-市场方向参考见：
-
-- `docs/market_signals_and_skill_focus.md`
+```powershell
+py -m orchestrator analyze regression --find 10
+```
 
 ---
 
-## 文档导航
+## 快速开始
 
-### 核心文档
-- 当前设计基线：`docs/architecture.md`
-- 完整生态蓝图 v2：`docs/ecosystem_architecture_v2.md`
-- 下一对话框衔接文档：`docs/next_session_handoff.md`
-- 项目关系说明：`docs/project_relationships.md`
-- 工作方式演进：`docs/workflow_evolution.md`
-- 市场信号与能力积累方向：`docs/market_signals_and_skill_focus.md`
-- 1 到 2 年成长路径：`docs/growth_path.md`
+### 1. 安装依赖
 
-### 项目状态
-- 当前状态：`PROJECT_STATE.md`
-- 历史推进记录：`PROJECT_LOG.md`
+```powershell
+pip install -e .
+```
 
-### 决策沉淀
-- 决策记录索引：`docs/decisions/README.md`
-- 决策记录模板：`docs/decisions/000-template.md`
+如果要使用真实搜索或 HTTP LLM provider：
+
+```powershell
+pip install -e ".[all]"
+```
+
+### 2. 运行最简单任务
+
+```powershell
+py -m orchestrator ask "帮我做一个行业研究"
+```
+
+### 3. 指定 workflow 运行
+
+```powershell
+py -m orchestrator run --workflow workflows/deep_research.yaml --query "solid-state battery progress"
+```
+
+### 4. 单独测试某个 agent
+
+```powershell
+py -m orchestrator agent --name planner --query "solid-state battery progress" --format json
+```
+
+### 5. 使用真实 provider
+
+```powershell
+py -m orchestrator agent --name planner --query "solid-state battery progress" --llm codex --model gpt-5.4
+```
 
 ---
 
-## 目录结构
+## CLI 总览
+
+### 任务入口
+
+```powershell
+py -m orchestrator ask "自然语言任务"
+```
+
+### 指定 workflow
+
+```powershell
+py -m orchestrator run --workflow workflows/deep_research.yaml --query "任务"
+```
+
+### 单 agent 调试
+
+```powershell
+py -m orchestrator agent --name planner --query "任务"
+```
+
+### 查看 agent
+
+```powershell
+py -m orchestrator agents --verbose
+```
+
+### 查看 provider
+
+```powershell
+py -m orchestrator providers --verbose
+```
+
+### 人工审核
+
+```powershell
+py -m orchestrator review --task-id <task_id> --decision approve
+py -m orchestrator review --task-id <task_id> --decision reject --reason "人工拒绝"
+```
+
+### 后台分析
+
+```powershell
+py -m orchestrator analyze list --limit 10
+py -m orchestrator analyze show --task-id <task_id>
+py -m orchestrator analyze failures --limit 20
+py -m orchestrator analyze memory
+py -m orchestrator analyze regression --find 10
+```
+
+---
+
+## 环境变量
+
+可以通过 `.env` 或系统环境变量配置 provider：
+
+```env
+LLM_PROVIDER=deepseek
+LLM_DEFAULT_MODEL=deepseek-chat
+
+DEEPSEEK_API_KEY=...
+DEEPSEEK_API_BASE=https://api.deepseek.com/v1
+
+GLM_API_KEY=...
+GLM_API_BASE=...
+
+KIMI_API_KEY=...
+KIMI_API_BASE=https://api.moonshot.cn/v1
+```
+
+注意：`.env` 已被 `.gitignore` 排除，不要把 API Key 提交到 GitHub。
+
+---
+
+## 项目结构
 
 ```text
 adaptive-agent-orchestrator/
-├── docs/
-│   ├── decisions/
-│   ├── architecture.md
-│   ├── ecosystem_architecture_v2.md
-│   ├── project_relationships.md
-│   ├── workflow_evolution.md
-│   ├── growth_path.md
-│   └── market_signals_and_skill_focus.md
-├── src/
-├── tests/
-├── workflows/
-├── PROJECT_LOG.md
+├── src/orchestrator/
+│   ├── agents/                  # 内置 agents
+│   ├── scheduler.py             # Runtime 调度器
+│   ├── state_center.py          # 共享状态中心
+│   ├── evaluator.py             # L1 结构评估
+│   ├── evaluator_l2.py          # L2 语义评估
+│   ├── supervisor_orchestrator.py
+│   ├── llm_client.py
+│   ├── llm_providers.py
+│   ├── memory_manager.py
+│   ├── report_writer.py
+│   ├── regression_compare.py
+│   └── __main__.py              # CLI 入口
+├── workflows/                   # YAML workflows
+├── tests/                       # 回归测试
+├── docs/                        # 架构与决策文档
+├── examples/                    # 示例 agent
 ├── PROJECT_STATE.md
-├── pyproject.toml
+├── PROJECT_LOG.md
 └── README.md
 ```
 
 ---
 
-## 当前状态
+## 当前能力状态
 
-当前已经完成：
+已完成并测试通过的主干能力：
 
-- 独立新项目建立
-- 完整长期目标形态文档
-- 当前设计基线文档
-- 工作方式路线、项目关系、成长路径、市场方向文档
-- 决策记录体系初始化
+- 多 agent workflow runtime
+- StateCenter 共享状态
+- checkpoint / rollback / replan
+- Evaluator L1 + L2
+- SupervisorAgent + SupervisorOrchestrator
+- Human review approve / reject / resume
+- MemoryManager 检索与沉淀
+- ToolRegistry
+- Guardrails
+- Trust hierarchy
+- LLM Provider abstraction
+- Codex / DeepSeek 实机路径验证
+- Analyze CLI
+- RegressionCompare
+- Natural-language `ask` + LLM Router
 
-当前正在进入：
+当前测试：
 
-- `v1 final runtime core` 实现阶段
+```powershell
+$env:PYTHONPATH='src'; py -m unittest discover -s tests -p "test_*.py" -q
+```
+
+最近全量测试：`66 tests OK`
 
 ---
 
-## 图示
+## 和普通 Agent Demo 的区别
 
-### 固定 Workflow vs 动态多智能体生态
-![固定 Workflow vs 动态多智能体生态](docs/workflow-vs-ecosystem.png)
+这个项目重点不在“某个 prompt 写得多好”，而在：
 
-### 多智能体生态完全体
-![多智能体生态完全体](docs/complete-agent-ecosystem.png)
+- 运行时状态治理
+- 多 agent 协作契约
+- 过程评估与失败处理
+- 人类介入和恢复执行
+- 可审计的执行报告
+- 可扩展的 provider / workflow / tool 层
 
-### 参考与学习
-- 从 Claude Code 这类系统值得学习的设计点：`docs/claude_code_learnings.md`
+它更像一个 **Agent Infra / Agent Runtime**，而不是一次性的聊天机器人。
+
+---
+
+## 后续方向
+
+接下来会继续增强：
+
+- 接入已有 `deep_research_agent` 作为完整 research 能力模块
+- 长任务阶段性 alignment check，减少长流程跑偏
+- 更智能的 RegressionCompare
+- 自动 Debug / Failure Analysis Agent
+- 更完整的自然语言后台命令
+- 给外部用户/朋友试用的最小体验手册
+
+---
+
+## 文档导航
+
+- 当前状态：`PROJECT_STATE.md`
+- 历史推进：`PROJECT_LOG.md`
+- 当前架构：`docs/architecture.md`
+- 完整生态蓝图：`docs/ecosystem_architecture_v2.md`
+- 决策记录：`docs/decisions/`
+- 项目关系：`docs/project_relationships.md`
+- 成长路线：`docs/growth_path.md`
 
