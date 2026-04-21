@@ -1,0 +1,16 @@
+name: code_review_pipeline
+description: 代码审查流水线
+max_steps: 10
+
+agents:
+  - name: planner
+    next: search
+
+  - name: search
+    next: summarizer
+
+  - name: summarizer
+    next: code_reviewer
+
+  - name: code_reviewer
+    next: null

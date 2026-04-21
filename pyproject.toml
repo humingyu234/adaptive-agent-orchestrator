@@ -1,0 +1,29 @@
+[project]
+name = "adaptive-agent-orchestrator"
+version = "0.1.0"
+description = "A lightweight multi-agent orchestration engine with runtime evaluation and adaptive control."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "pydantic>=2.8",
+  "PyYAML>=6.0",
+  "python-dotenv>=1.0",
+]
+
+[project.optional-dependencies]
+search = ["ddgs>=6.0", "httpx>=0.25"]
+llm = ["httpx>=0.25"]
+all = [
+  "ddgs>=6.0",
+  "httpx>=0.25",
+]
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]

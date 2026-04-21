@@ -1,0 +1,10 @@
+name: quick_search
+description: 轻量搜索工作流，适合外部 CLI 调用
+max_steps: 5
+
+agents:
+  - name: search
+    next: summarizer
+
+  - name: summarizer
+    next: null

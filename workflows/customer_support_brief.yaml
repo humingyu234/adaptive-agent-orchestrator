@@ -1,0 +1,12 @@
+name: customer_support_brief
+max_steps: 10
+
+agents:
+  - name: planner
+    next: search
+
+  - name: search
+    next: summarizer
+
+  - name: summarizer
+    next: null

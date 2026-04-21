@@ -1,0 +1,15 @@
+name: deep_research_supervised
+max_steps: 12
+
+agents:
+  - name: planner
+    next: search
+
+  - name: search
+    next: summarizer
+
+  - name: summarizer
+    next: supervisor
+
+  - name: supervisor
+    next: null

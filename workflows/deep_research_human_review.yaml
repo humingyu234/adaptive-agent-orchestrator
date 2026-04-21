@@ -1,0 +1,18 @@
+name: deep_research_human_review
+max_steps: 14
+
+agents:
+  - name: planner
+    next: search
+
+  - name: search
+    next: summarizer
+
+  - name: summarizer
+    next: supervisor
+
+  - name: supervisor
+    next: human_review
+
+  - name: human_review
+    next: null

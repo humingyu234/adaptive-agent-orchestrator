@@ -1,0 +1,12 @@
+name: deep_research_real
+max_steps: 10
+
+agents:
+  - name: planner
+    next: real_search
+
+  - name: real_search
+    next: summarizer
+
+  - name: summarizer
+    next: null

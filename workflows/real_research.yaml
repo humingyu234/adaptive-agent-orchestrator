@@ -1,0 +1,13 @@
+name: real_research
+description: 真实研究工作流，使用真实 LLM 和真实搜索
+max_steps: 10
+
+agents:
+  - name: planner
+    next: real_search
+
+  - name: real_search
+    next: summarizer
+
+  - name: summarizer
+    next: null
