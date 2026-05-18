@@ -208,14 +208,29 @@ class TestEvaluationFailed:
         assert d.action == "retry"
         assert d.terminal is False
 
-    def test_evaluation_failed_retry_exhausted_needs_human_review(self):
+    def test_evaluation_failed_retry_exhausted_replans(self):
         pb = RecoveryPlaybook()
         record = _make_record(
             category=FailureCategory.TASK_QUALITY_ERROR,
             reason="evaluation_failed",
         )
-        d = pb.decide(record, attempt_count=2)
+        # max_attempts for retry is 1, so attempt 1 is exhausted
+        d = pb.decide(record, attempt_count=1)
+        assert d.action == "replan"
+        assert d.terminal is False
+        assert d.attempt_count == 0  # fresh attempt counter for replan
+
+    def test_evaluation_failed_replan_unsupported_falls_back(self):
+        pb = RecoveryPlaybook(
+            runtime_capabilities={"retry", "fail", "human_review"},
+        )
+        record = _make_record(
+            category=FailureCategory.TASK_QUALITY_ERROR,
+            reason="evaluation_failed",
+        )
+        d = pb.decide(record, attempt_count=1)
         assert d.action == "needs_human_review"
+        assert d.runtime_supported is False
         assert d.terminal is True
 
 
@@ -368,7 +383,8 @@ class TestToolFailed:
         )
         d = pb.decide(record, attempt_count=0)
         assert d.action == "retry"
-        d = pb.decide(record, attempt_count=2)
+        # max_attempts for retry is 1 → attempt 1 is exhausted
+        d = pb.decide(record, attempt_count=1)
         assert d.action == "needs_human_review"
 
 

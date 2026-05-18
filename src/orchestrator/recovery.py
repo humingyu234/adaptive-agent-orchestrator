@@ -111,7 +111,7 @@ _RUNTIME_CAPABILITY_ACTIONS: frozenset[str] = frozenset({
 # =============================================================================
 
 _MAX_ATTEMPTS: dict[str, int] = {
-    "retry": 2,
+    "retry": 1,
     "retry_with_backoff": 2,
     "request_evidence": 1,
     "replan": 1,
@@ -120,7 +120,6 @@ _MAX_ATTEMPTS: dict[str, int] = {
 }
 
 _EXHAUSTED_ACTION: dict[str, str] = {
-    "retry": "needs_human_review",
     "retry_with_backoff": "needs_human_review",
     "request_evidence": "needs_human_review",
     "replan": "needs_human_review",
@@ -128,11 +127,13 @@ _EXHAUSTED_ACTION: dict[str, str] = {
     "fallback_model_or_provider": "needs_human_review",
 }
 
-# Hints that must never produce a retry (hard stops / protected actions)
-_HARD_STOP_HINTS: frozenset[str] = frozenset({
-    "fail",
-    "needs_human_review",
-    "request_evidence",
+# Reasons whose retry exhaustion should trigger replan, not human_review.
+# Spec: task quality (evaluation_failed, low_quality_output, missing_required_field)
+# → retry once → if exhausted: replan.
+_RETRY_EXHAUSTED_REPLAN_REASONS: frozenset[str] = frozenset({
+    "evaluation_failed",
+    "low_quality_output",
+    "missing_required_field",
 })
 
 # Reasons that have dedicated non-retry handlers:
@@ -356,6 +357,39 @@ class RecoveryPlaybook:
         """Retry or retry_with_backoff — bounded by max attempts."""
         max_att = _MAX_ATTEMPTS.get(hint, 2)
         if exhausted:
+            # Task quality reasons retry once then replan (spec: evaluation_failed /
+            # low_quality_output / missing_required_field → replan on exhaustion)
+            if hint == "retry" and failure_record.reason in _RETRY_EXHAUSTED_REPLAN_REASONS:
+                if self._supports("replan"):
+                    return RecoveryDecision(
+                        failure_category=failure_record.category.value,
+                        failure_reason=failure_record.reason,
+                        failure_origin=failure_record.origin,
+                        recovery_hint="replan",
+                        action="replan",
+                        reason=f"Retry exhausted after {attempt_count} attempt(s), replanning",
+                        attempt_count=0,
+                        max_attempts=_MAX_ATTEMPTS.get("replan", 1),
+                        terminal=False,
+                        requires_human_review=False,
+                        runtime_supported=True,
+                        next_step_hint="Create a revised plan after retry exhaustion",
+                    )
+                else:
+                    return RecoveryDecision(
+                        failure_category=failure_record.category.value,
+                        failure_reason=failure_record.reason,
+                        failure_origin=failure_record.origin,
+                        recovery_hint="replan",
+                        action="needs_human_review",
+                        reason=f"Retry exhausted and replan not supported by runtime",
+                        attempt_count=attempt_count,
+                        max_attempts=max_att,
+                        terminal=True,
+                        requires_human_review=True,
+                        runtime_supported=False,
+                    )
+
             fallback = _EXHAUSTED_ACTION.get(hint, "needs_human_review")
             return RecoveryDecision(
                 failure_category=failure_record.category.value,
