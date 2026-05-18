@@ -15,6 +15,7 @@ from .llm_client import LLMClient
 from .llm_providers import get_provider
 from .memory_manager import MemoryManager
 from .models import EvalResult, RunResult
+from .policy import Policy, load_policy
 from .registry import get_agent
 from .project_context import ProjectContext
 from .report_writer import ConvergenceReportWriter
@@ -55,10 +56,11 @@ class Scheduler:
         project_root: str | Path | None = None,
         use_orchestrator: bool = True,
         llm_overrides: dict[str, dict[str, str | None]] | None = None,
+        policy: Policy | None = None,
     ):
         self.workflow = workflow
         self.evaluator = Evaluator()
-        self.control_plane = ControlPlane(evaluator=self.evaluator)
+        self.control_plane = ControlPlane(evaluator=self.evaluator, policy=policy)
         self.project_root = Path(project_root) if project_root else Path.cwd()
         self.memory_manager = MemoryManager(self.project_root)
         self.project_context = ProjectContext(self.project_root)
@@ -73,6 +75,7 @@ class Scheduler:
                 max_iterations=workflow.get("max_steps", 10),
                 stall_threshold=3,
             )
+        self._policy = policy or Policy.defaults()
 
     def run(self, query: str) -> tuple[StateCenter, RunResult]:
         state = StateCenter(query=query, max_steps=self.workflow.get("max_steps", 10))
@@ -383,6 +386,43 @@ class Scheduler:
             )
 
             if eval_result.action == "continue":
+                files_changed = output.get("files_changed", []) if isinstance(output, dict) else []
+                policy_events = self._run_policy_checks(
+                    state=state,
+                    agent_name=agent_name,
+                    output=output,
+                    files_changed=files_changed if isinstance(files_changed, list) else [],
+                )
+
+                needs_human_review_events = [
+                    e for e in policy_events
+                    if e.get("action") == "needs_human_review" and not e.get("passed")
+                ]
+                fail_events = [
+                    e for e in policy_events
+                    if e.get("action") == "fail" and not e.get("passed")
+                ]
+
+                if self._policy.mode == "controlled" and needs_human_review_events:
+                    first = needs_human_review_events[0]
+                    return self._finalize_run(
+                        state=state,
+                        status="needs_human_review",
+                        final_node=agent_name,
+                        reason=first.get("reason", "Policy requires human review"),
+                        failure_category=FailureCategory.POLICY_ERROR,
+                    )
+
+                if self._policy.mode == "controlled" and fail_events:
+                    first = fail_events[0]
+                    return self._finalize_run(
+                        state=state,
+                        status="failed",
+                        final_node=agent_name,
+                        reason=first.get("reason", "Policy blocked completion"),
+                        failure_category=FailureCategory.POLICY_ERROR,
+                    )
+
                 if agent.config.terminal_behavior == "pause_for_human":
                     human_review_gate = self._read_terminal_payload(state=state, agent=agent) or {}
                     decision = human_review_gate.get("decision")
@@ -695,6 +735,90 @@ class Scheduler:
             return agent_cls(llm_client=llm_client)
         return agent_cls()
 
+    def _run_policy_checks(
+        self,
+        *,
+        state: StateCenter,
+        agent_name: str,
+        output: dict,
+        files_changed: list[str] | None = None,
+    ) -> list[dict]:
+        """Collect runtime facts and run policy checks through ControlPlane.
+
+        Returns a list of trace events for any policy decisions.
+        """
+        events: list[dict] = []
+        changed = files_changed or []
+
+        # 1. file changes -> protected file check
+        file_decision = self.control_plane.check_policy_for_file_changes(
+            files_changed=changed,
+        )
+        if not file_decision.passed or file_decision.action != "continue":
+            events.append(
+                {
+                    "event": "policy_decision",
+                    "decision_type": "file_changes",
+                    "agent_name": agent_name,
+                    "passed": file_decision.passed,
+                    "action": file_decision.action,
+                    "reason": file_decision.reason,
+                    "failure_category": file_decision.failure_category,
+                    "failure_origin": file_decision.failure_origin,
+                    "recovery_hint": file_decision.recovery_hint,
+                    "timestamp": utc_now_iso(),
+                }
+            )
+
+        # 2. tool use -> high-risk tool check (infer from agent name)
+        tool_decision = self.control_plane.check_policy_for_tool_use(
+            tool_name=agent_name,
+        )
+        if not tool_decision.passed or tool_decision.action != "continue":
+            events.append(
+                {
+                    "event": "policy_decision",
+                    "decision_type": "tool_use",
+                    "agent_name": agent_name,
+                    "tool_name": agent_name,
+                    "passed": tool_decision.passed,
+                    "action": tool_decision.action,
+                    "reason": tool_decision.reason,
+                    "failure_category": tool_decision.failure_category,
+                    "failure_origin": tool_decision.failure_origin,
+                    "recovery_hint": tool_decision.recovery_hint,
+                    "timestamp": utc_now_iso(),
+                }
+            )
+
+        # 3. reviewer check
+        role = output.get("role", "")
+        reviewer_decision = self.control_plane.check_policy_for_reviewer_result(
+            worker_name=agent_name,
+            worker_role=role,
+            files_changed=changed,
+        )
+        if not reviewer_decision.passed or reviewer_decision.action != "continue":
+            events.append(
+                {
+                    "event": "policy_decision",
+                    "decision_type": "reviewer_write",
+                    "agent_name": agent_name,
+                    "passed": reviewer_decision.passed,
+                    "action": reviewer_decision.action,
+                    "reason": reviewer_decision.reason,
+                    "failure_category": reviewer_decision.failure_category,
+                    "failure_origin": reviewer_decision.failure_origin,
+                    "recovery_hint": reviewer_decision.recovery_hint,
+                    "timestamp": utc_now_iso(),
+                }
+            )
+
+        for event in events:
+            state.execution_trace.append(event)
+
+        return events
+
     def _run_input_guardrails(self, *, agent, agent_name: str, view: dict) -> None:
         """Run input-stage guardrails through ControlPlane."""
         decision = self.control_plane.guard_input(
@@ -876,6 +1000,55 @@ class Scheduler:
         reason: str = "",
         failure_category: FailureCategory | None = None,
     ) -> tuple[StateCenter, RunResult]:
+        # --- final policy checks for required checks and evidence ---
+        if status == "completed" and self._policy.mode == "controlled":
+            check_decision = self.control_plane.check_policy_for_required_checks(
+                observed_check_results=self._collect_observed_check_results(state),
+            )
+            evidence_decision = self.control_plane.check_policy_for_required_evidence(
+                required_evidence_keys=self._get_required_evidence_keys(),
+                observed_evidence_keys=self._collect_observed_evidence_keys(state),
+            )
+
+            # Record both decisions; strongest outcome wins
+            if not check_decision.passed:
+                state.execution_trace.append(
+                    {
+                        "event": "policy_decision",
+                        "decision_type": "required_checks",
+                        "passed": False,
+                        "action": check_decision.action,
+                        "reason": check_decision.reason,
+                        "failure_category": check_decision.failure_category,
+                        "failure_origin": check_decision.failure_origin,
+                        "recovery_hint": check_decision.recovery_hint,
+                        "timestamp": utc_now_iso(),
+                    }
+                )
+            if not evidence_decision.passed:
+                state.execution_trace.append(
+                    {
+                        "event": "policy_decision",
+                        "decision_type": "required_evidence",
+                        "passed": False,
+                        "action": evidence_decision.action,
+                        "reason": evidence_decision.reason,
+                        "failure_category": evidence_decision.failure_category,
+                        "failure_origin": evidence_decision.failure_origin,
+                        "recovery_hint": evidence_decision.recovery_hint,
+                        "evidence_required": True,
+                        "timestamp": utc_now_iso(),
+                    }
+                )
+
+            if not check_decision.passed:
+                status = "failed"
+                reason = check_decision.reason
+                failure_category = FailureCategory.POLICY_ERROR
+            elif not evidence_decision.passed:
+                status = "needs_human_review"
+                reason = evidence_decision.reason
+
         state.set_status(status, reason)
 
         failure_record: FailureRecord | None = None
@@ -970,6 +1143,36 @@ class Scheduler:
             event_type=event_type,
             eval_action=eval_action,
         )
+
+    def _collect_observed_check_results(self, state: StateCenter) -> dict[str, bool]:
+        """Scan trace for evidence of check results (e.g. pytest passed/failed)."""
+        results: dict[str, bool] = {}
+        for event in state.execution_trace:
+            if event.get("event") == "check_result":
+                name = event.get("check_name")
+                passed = event.get("passed")
+                if isinstance(name, str) and isinstance(passed, bool):
+                    results[name] = passed
+        return results
+
+    def _get_required_evidence_keys(self) -> set[str]:
+        """Map required checks to evidence keys the policy expects."""
+        required = self._policy.get_required_checks()
+        return set(required)
+
+    def _collect_observed_evidence_keys(self, state: StateCenter) -> set[str]:
+        """Scan trace for observed evidence (check results, evaluation events)."""
+        keys: set[str] = set()
+        for event in state.execution_trace:
+            if event.get("event") == "check_result":
+                name = event.get("check_name")
+                if isinstance(name, str) and event.get("passed") is True:
+                    keys.add(name)
+            if event.get("event") == "evaluation" and event.get("passed"):
+                agent = event.get("agent_name")
+                if isinstance(agent, str):
+                    keys.add(f"eval:{agent}")
+        return keys
 
     def _write_evidence(self, *, state: StateCenter, packs: list) -> str:
         evidence_dir = self.project_root / "outputs" / "evidence"

@@ -115,16 +115,28 @@ def build_live_view(
             }
             break
 
-    # ---- policy decision (checkpoint_replan or explicit policy event) --------
+    # ---- policy decision (policy_decision event, checkpoint_replan fallback) ---
     last_policy_decision: dict[str, Any] | None = None
     for e in reversed(trace):
-        if e.get("event") == "checkpoint_replan":
+        if e.get("event") == "policy_decision":
             last_policy_decision = {
-                "target": str(e.get("target", "")),
+                "type": str(e.get("decision_type", "")),
                 "action": str(e.get("action", "")),
                 "reason": str(e.get("reason", "")),
+                "passed": e.get("passed"),
+                "failure_category": str(e.get("failure_category", "")) or None,
+                "recovery_hint": str(e.get("recovery_hint", "")) or None,
             }
             break
+    if last_policy_decision is None:
+        for e in reversed(trace):
+            if e.get("event") == "checkpoint_replan":
+                last_policy_decision = {
+                    "target": str(e.get("target", "")),
+                    "action": str(e.get("action", "")),
+                    "reason": str(e.get("reason", "")),
+                }
+                break
 
     # ---- failure-derived fields ----------------------------------------------
     last_failure: dict[str, str] | None = None

@@ -33,6 +33,337 @@ class TestEvaluateOutputValid:
         assert decision.passed is True
         assert decision.action == "continue"
 
+
+# ===========================================================================
+# 9. policy enforcement — ControlPlane policy check methods
+# ===========================================================================
+
+class TestPolicyReviewerResult:
+    def test_reviewer_with_files_changed_triggers_needs_human_review(self):
+        from src.orchestrator.policy import Policy
+
+        policy = Policy.from_dict({
+            "mode": "controlled",
+            "human_review": {"required_for": ["protected_file_change"]},
+        })
+        cp = ControlPlane(policy=policy)
+        decision = cp.check_policy_for_reviewer_result(
+            worker_name="code_reviewer",
+            worker_role="reviewer",
+            files_changed=["src/main.py"],
+        )
+        assert decision.passed is False
+        assert decision.action == "needs_human_review"
+        assert decision.failure_origin == "policy"
+
+    def test_reviewer_with_no_files_passes(self):
+        from src.orchestrator.policy import Policy
+
+        policy = Policy.from_dict({"mode": "controlled"})
+        cp = ControlPlane(policy=policy)
+        decision = cp.check_policy_for_reviewer_result(
+            worker_name="code_reviewer",
+            worker_role="reviewer",
+            files_changed=[],
+        )
+        assert decision.passed is True
+        assert decision.action == "continue"
+
+    def test_non_reviewer_with_files_passes(self):
+        from src.orchestrator.policy import Policy
+
+        policy = Policy.from_dict({"mode": "controlled"})
+        cp = ControlPlane(policy=policy)
+        decision = cp.check_policy_for_reviewer_result(
+            worker_name="planner",
+            worker_role="planner",
+            files_changed=["src/main.py"],
+        )
+        assert decision.passed is True
+        assert decision.action == "continue"
+
+    def test_reviewer_write_off_mode_passes(self):
+        from src.orchestrator.policy import Policy
+
+        policy = Policy.from_dict({"mode": "off"})
+        cp = ControlPlane(policy=policy)
+        decision = cp.check_policy_for_reviewer_result(
+            worker_name="code_reviewer",
+            worker_role="reviewer",
+            files_changed=["src/main.py"],
+        )
+        assert decision.passed is True
+
+    def test_reviewer_write_log_mode_records_but_passes(self):
+        from src.orchestrator.policy import Policy
+
+        policy = Policy.from_dict({"mode": "log"})
+        cp = ControlPlane(policy=policy)
+        decision = cp.check_policy_for_reviewer_result(
+            worker_name="code_reviewer",
+            worker_role="reviewer",
+            files_changed=["src/main.py"],
+        )
+        assert decision.passed is True
+        assert decision.action == "continue"
+
+
+class TestPolicyFileChanges:
+    def test_protected_file_triggers_needs_human_review(self):
+        from src.orchestrator.policy import Policy
+
+        policy = Policy.from_dict({
+            "mode": "controlled",
+            "files": {"protected": [".env", "secrets/**"]},
+            "human_review": {"required_for": ["protected_file_change"]},
+        })
+        cp = ControlPlane(policy=policy)
+        decision = cp.check_policy_for_file_changes(
+            files_changed=["src/main.py", ".env"],
+        )
+        assert decision.passed is False
+        assert decision.action == "needs_human_review"
+        assert decision.failure_origin == "policy"
+        assert ".env" in decision.reason
+
+    def test_unprotected_file_passes(self):
+        from src.orchestrator.policy import Policy
+
+        policy = Policy.from_dict({
+            "mode": "controlled",
+            "files": {"protected": [".env"]},
+            "human_review": {"required_for": ["protected_file_change"]},
+        })
+        cp = ControlPlane(policy=policy)
+        decision = cp.check_policy_for_file_changes(
+            files_changed=["src/main.py", "tests/test_x.py"],
+        )
+        assert decision.passed is True
+        assert decision.action == "continue"
+
+    def test_protected_file_not_in_human_review_list_passes(self):
+        from src.orchestrator.policy import Policy
+
+        policy = Policy.from_dict({
+            "mode": "controlled",
+            "files": {"protected": [".env"]},
+            "human_review": {"required_for": ["failed_tests"]},
+        })
+        cp = ControlPlane(policy=policy)
+        decision = cp.check_policy_for_file_changes(files_changed=[".env"])
+        assert decision.passed is True
+
+    def test_protected_pattern_does_not_match_unrelated_path(self):
+        from src.orchestrator.policy import Policy
+
+        policy = Policy.from_dict({
+            "mode": "controlled",
+            "files": {"protected": ["secrets/**"]},
+            "human_review": {"required_for": ["protected_file_change"]},
+        })
+        cp = ControlPlane(policy=policy)
+        decision = cp.check_policy_for_file_changes(
+            files_changed=["src/main.py", "public/data.json"],
+        )
+        assert decision.passed is True
+
+    def test_no_files_changed_passes(self):
+        from src.orchestrator.policy import Policy
+
+        policy = Policy.from_dict({
+            "mode": "controlled",
+            "files": {"protected": [".env"]},
+            "human_review": {"required_for": ["protected_file_change"]},
+        })
+        cp = ControlPlane(policy=policy)
+        decision = cp.check_policy_for_file_changes(files_changed=[])
+        assert decision.passed is True
+
+    def test_file_check_off_mode_passes(self):
+        from src.orchestrator.policy import Policy
+
+        policy = Policy.from_dict({
+            "mode": "off",
+            "files": {"protected": [".env"]},
+            "human_review": {"required_for": ["protected_file_change"]},
+        })
+        cp = ControlPlane(policy=policy)
+        decision = cp.check_policy_for_file_changes(files_changed=[".env"])
+        assert decision.passed is True
+
+
+class TestPolicyToolUse:
+    def test_high_risk_tool_triggers_needs_human_review(self):
+        from src.orchestrator.policy import Policy
+
+        policy = Policy.from_dict({
+            "mode": "controlled",
+            "tools": {"shell": {"risk_level": "high"}},
+            "human_review": {"required_for": ["high_risk_tool"]},
+        })
+        cp = ControlPlane(policy=policy)
+        decision = cp.check_policy_for_tool_use(tool_name="shell")
+        assert decision.passed is False
+        assert decision.action == "needs_human_review"
+        assert decision.failure_origin == "policy"
+
+    def test_low_risk_tool_passes(self):
+        from src.orchestrator.policy import Policy
+
+        policy = Policy.from_dict({
+            "mode": "controlled",
+            "tools": {"search": {"risk_level": "low"}},
+            "human_review": {"required_for": ["high_risk_tool"]},
+        })
+        cp = ControlPlane(policy=policy)
+        decision = cp.check_policy_for_tool_use(tool_name="search")
+        assert decision.passed is True
+        assert decision.action == "continue"
+
+    def test_high_risk_tool_not_in_review_list_passes(self):
+        from src.orchestrator.policy import Policy
+
+        policy = Policy.from_dict({
+            "mode": "controlled",
+            "tools": {"shell": {"risk_level": "high"}},
+            "human_review": {"required_for": ["failed_tests"]},
+        })
+        cp = ControlPlane(policy=policy)
+        decision = cp.check_policy_for_tool_use(tool_name="shell")
+        assert decision.passed is True
+
+    def test_tool_check_off_mode_passes(self):
+        from src.orchestrator.policy import Policy
+
+        policy = Policy.from_dict({
+            "mode": "off",
+            "tools": {"shell": {"risk_level": "high"}},
+            "human_review": {"required_for": ["high_risk_tool"]},
+        })
+        cp = ControlPlane(policy=policy)
+        decision = cp.check_policy_for_tool_use(tool_name="shell")
+        assert decision.passed is True
+
+
+class TestPolicyRequiredChecks:
+    def test_failed_required_check_blocks_success(self):
+        from src.orchestrator.policy import Policy
+
+        policy = Policy.from_dict({
+            "mode": "controlled",
+            "checks": {"required": ["pytest"]},
+        })
+        cp = ControlPlane(policy=policy)
+        decision = cp.check_policy_for_required_checks(
+            observed_check_results={"pytest": False},
+        )
+        assert decision.passed is False
+        assert decision.action == "fail"
+        assert decision.failure_origin == "policy"
+
+    def test_passed_required_check_allows_success(self):
+        from src.orchestrator.policy import Policy
+
+        policy = Policy.from_dict({
+            "mode": "controlled",
+            "checks": {"required": ["pytest"]},
+        })
+        cp = ControlPlane(policy=policy)
+        decision = cp.check_policy_for_required_checks(
+            observed_check_results={"pytest": True},
+        )
+        assert decision.passed is True
+        assert decision.action == "continue"
+
+    def test_no_required_checks_configured_passes(self):
+        from src.orchestrator.policy import Policy
+
+        policy = Policy.from_dict({"mode": "controlled", "checks": {}})
+        cp = ControlPlane(policy=policy)
+        decision = cp.check_policy_for_required_checks(
+            observed_check_results={},
+        )
+        assert decision.passed is True
+
+    def test_check_off_mode_passes(self):
+        from src.orchestrator.policy import Policy
+
+        policy = Policy.from_dict({
+            "mode": "off",
+            "checks": {"required": ["pytest"]},
+        })
+        cp = ControlPlane(policy=policy)
+        decision = cp.check_policy_for_required_checks(
+            observed_check_results={"pytest": False},
+        )
+        assert decision.passed is True
+
+
+class TestPolicyRequiredEvidence:
+    def test_missing_required_evidence_blocks_success(self):
+        from src.orchestrator.policy import Policy
+
+        policy = Policy.from_dict({"mode": "controlled"})
+        cp = ControlPlane(policy=policy)
+        decision = cp.check_policy_for_required_evidence(
+            required_evidence_keys={"pytest"},
+            observed_evidence_keys=set(),
+        )
+        assert decision.passed is False
+        assert decision.action == "needs_human_review"
+        assert decision.evidence_required is True
+        assert decision.failure_origin == "policy"
+        assert decision.recovery_hint == "request_evidence"
+
+    def test_all_evidence_present_passes(self):
+        from src.orchestrator.policy import Policy
+
+        policy = Policy.from_dict({"mode": "controlled"})
+        cp = ControlPlane(policy=policy)
+        decision = cp.check_policy_for_required_evidence(
+            required_evidence_keys={"pytest"},
+            observed_evidence_keys={"pytest"},
+        )
+        assert decision.passed is True
+        assert decision.action == "continue"
+
+    def test_empty_required_evidence_passes(self):
+        from src.orchestrator.policy import Policy
+
+        policy = Policy.from_dict({"mode": "controlled"})
+        cp = ControlPlane(policy=policy)
+        decision = cp.check_policy_for_required_evidence(
+            required_evidence_keys=set(),
+            observed_evidence_keys=set(),
+        )
+        assert decision.passed is True
+
+    def test_evidence_check_off_mode_passes(self):
+        from src.orchestrator.policy import Policy
+
+        policy = Policy.from_dict({"mode": "off"})
+        cp = ControlPlane(policy=policy)
+        decision = cp.check_policy_for_required_evidence(
+            required_evidence_keys={"pytest"},
+            observed_evidence_keys=set(),
+        )
+        assert decision.passed is True
+
+
+class TestControlPlanePolicyIntegration:
+    def test_set_policy_and_check(self):
+        from src.orchestrator.policy import Policy
+
+        cp = ControlPlane()
+        cp.set_policy(Policy.defaults())
+        decision = cp.check_policy_for_file_changes(files_changed=["src/main.py"])
+        assert decision.passed is True
+
+    def test_null_policy_defaults_to_permissive(self):
+        cp = ControlPlane()
+        decision = cp.check_policy_for_file_changes(files_changed=[".env"])
+        assert decision.passed is True
+
     def test_passes_when_all_criteria_met(self):
         cp = _cp()
         criteria = [

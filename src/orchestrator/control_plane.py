@@ -21,6 +21,7 @@ from .failure_taxonomy import (
 )
 from .guardrails import GuardrailManager, GuardrailViolation, build_default_guardrail_manager
 from .models import EvalCriteriaItem, EvalResult
+from .policy import Policy
 
 # EvalResult.action uses "re_plan" (with underscore); ControlAction uses "replan"
 _EVAL_ACTION_TO_CONTROL: dict[str, ControlAction] = {
@@ -56,9 +57,19 @@ class ControlPlane:
         self,
         evaluator: Evaluator | None = None,
         guardrail_manager: GuardrailManager | None = None,
+        policy: Policy | None = None,
     ) -> None:
         self._evaluator = evaluator or Evaluator()
         self._guardrail = guardrail_manager or build_default_guardrail_manager()
+        self._policy: Policy | None = policy
+
+    def set_policy(self, policy: Policy) -> None:
+        """Set the active policy for runtime enforcement."""
+        self._policy = policy
+
+    def _get_policy(self) -> Policy:
+        """Return the active policy or a permissive default."""
+        return self._policy or Policy.defaults()
 
     # ------------------------------------------------------------------
     # evaluate_output
@@ -210,6 +221,154 @@ class ControlPlane:
             return guard_decision
 
         return ControlDecision(passed=True, action="continue")
+
+    # ------------------------------------------------------------------
+    # policy enforcement — runtime gates driven by declarative Policy
+    # ------------------------------------------------------------------
+
+    def check_policy_for_reviewer_result(
+        self,
+        *,
+        worker_name: str = "",
+        worker_role: str = "",
+        files_changed: list[str] | None = None,
+    ) -> ControlDecision:
+        """Reviewer workers must not write files."""
+        policy = self._get_policy()
+        if policy.mode == "off":
+            return ControlDecision(passed=True, action="continue")
+
+        is_reviewer = "reviewer" in worker_role.lower() or "reviewer" in worker_name.lower()
+        if not is_reviewer:
+            return ControlDecision(passed=True, action="continue")
+
+        files = files_changed or []
+        if not files:
+            return ControlDecision(passed=True, action="continue")
+
+        decision = ControlDecision(
+            passed=False,
+            action="needs_human_review",
+            reason=f"Reviewer worker '{worker_name}' attempted to modify files: {files}",
+            failure_category="policy_error",
+            failure_origin="policy",
+            recovery_hint="needs_human_review",
+        )
+        if policy.mode == "log":
+            decision.passed = True
+            decision.action = "continue"
+        return decision
+
+    def check_policy_for_file_changes(
+        self, *, files_changed: list[str] | None = None
+    ) -> ControlDecision:
+        """Check whether any changed files are protected by policy."""
+        policy = self._get_policy()
+        if policy.mode == "off":
+            return ControlDecision(passed=True, action="continue")
+
+        files = files_changed or []
+        protected = [f for f in files if policy.is_file_protected(f)]
+        if not protected:
+            return ControlDecision(passed=True, action="continue")
+
+        if not policy.requires_human_review_for_file(protected[0]):
+            return ControlDecision(passed=True, action="continue")
+
+        decision = ControlDecision(
+            passed=False,
+            action="needs_human_review",
+            reason=f"Protected files changed: {protected}",
+            failure_category="policy_error",
+            failure_origin="policy",
+            recovery_hint="needs_human_review",
+        )
+        if policy.mode == "log":
+            decision.passed = True
+            decision.action = "continue"
+        return decision
+
+    def check_policy_for_tool_use(self, *, tool_name: str) -> ControlDecision:
+        """Check whether a high-risk tool requires human review."""
+        policy = self._get_policy()
+        if policy.mode == "off":
+            return ControlDecision(passed=True, action="continue")
+
+        if not policy.requires_human_review_for_tool(tool_name):
+            return ControlDecision(passed=True, action="continue")
+
+        decision = ControlDecision(
+            passed=False,
+            action="needs_human_review",
+            reason=f"High-risk tool '{tool_name}' requires human review",
+            failure_category="policy_error",
+            failure_origin="policy",
+            recovery_hint="needs_human_review",
+        )
+        if policy.mode == "log":
+            decision.passed = True
+            decision.action = "continue"
+        return decision
+
+    def check_policy_for_required_checks(
+        self,
+        *,
+        observed_check_results: dict[str, bool] | None = None,
+    ) -> ControlDecision:
+        """Block success when required checks have failed."""
+        policy = self._get_policy()
+        if policy.mode == "off":
+            return ControlDecision(passed=True, action="continue")
+
+        required = policy.get_required_checks()
+        if not required:
+            return ControlDecision(passed=True, action="continue")
+
+        results = observed_check_results or {}
+        failed = [c for c in required if not results.get(c, False)]
+
+        if not failed:
+            return ControlDecision(passed=True, action="continue")
+
+        return ControlDecision(
+            passed=False,
+            action="fail",
+            reason=f"Required checks failed: {failed}",
+            failure_category="policy_error",
+            failure_origin="policy",
+            recovery_hint="needs_human_review",
+        )
+
+    def check_policy_for_required_evidence(
+        self,
+        *,
+        required_evidence_keys: set[str] | None = None,
+        observed_evidence_keys: set[str] | None = None,
+    ) -> ControlDecision:
+        """Block completion when required evidence is missing."""
+        policy = self._get_policy()
+        if policy.mode == "off":
+            return ControlDecision(passed=True, action="continue")
+
+        required = required_evidence_keys or set()
+        if not required:
+            return ControlDecision(passed=True, action="continue")
+
+        observed = observed_evidence_keys or set()
+        missing = required - observed
+
+        if not missing:
+            return ControlDecision(passed=True, action="continue")
+
+        return ControlDecision(
+            passed=False,
+            action="needs_human_review",
+            reason=f"Required evidence missing: {sorted(missing)}",
+            failure_category="evidence_error",
+            failure_origin="policy",
+            recovery_hint="request_evidence",
+            evidence_required=True,
+        )
 
     # ------------------------------------------------------------------
     # internal helpers

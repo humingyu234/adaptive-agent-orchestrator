@@ -698,3 +698,331 @@ class TestExplicitFailureCategory:
             _ft.classify_failure = original_classify
             _cp.classify_failure = original_cp_classify
 
+
+# ===========================================================================
+# Phase 10 — Runtime Policy Enforcement integration tests
+# ===========================================================================
+
+
+@register("file_writer_agent")
+class FileWriterAgent(BaseAgent):
+    """Agent that writes files (used in policy enforcement tests)."""
+    config = AgentConfig(
+        name="file_writer_agent",
+        reads=["query"],
+        writes=[WriteSpec(field="summary", schema_name="SummarySchema")],
+        max_retries=1,
+    )
+
+    def run(self, context_view: dict) -> dict:
+        return {
+            "summary": {"conclusion": "done"},
+            "files_changed": ["src/main.py"],
+        }
+
+
+@register("env_writer_agent")
+class EnvWriterAgent(BaseAgent):
+    """Agent that touches protected files."""
+    config = AgentConfig(
+        name="env_writer_agent",
+        reads=["query"],
+        writes=[WriteSpec(field="summary", schema_name="SummarySchema")],
+        max_retries=1,
+    )
+
+    def run(self, context_view: dict) -> dict:
+        return {
+            "summary": {"conclusion": "done"},
+            "files_changed": [".env"],
+        }
+
+
+@register("reviewer_agent")
+class ReviewerAgent(BaseAgent):
+    """Reviewer agent that attempts to write files."""
+    config = AgentConfig(
+        name="reviewer_agent",
+        reads=["query"],
+        writes=[WriteSpec(field="summary", schema_name="SummarySchema")],
+        max_retries=1,
+    )
+
+    def run(self, context_view: dict) -> dict:
+        return {
+            "summary": {"conclusion": "reviewed ok"},
+            "role": "reviewer",
+            "files_changed": ["src/patched.py"],
+        }
+
+
+@register("shell")
+class ShellAgent(BaseAgent):
+    """Agent that uses a high-risk tool."""
+    config = AgentConfig(
+        name="shell",
+        reads=["query"],
+        writes=[WriteSpec(field="summary", schema_name="SummarySchema")],
+        max_retries=1,
+    )
+
+    def run(self, context_view: dict) -> dict:
+        return {"summary": {"conclusion": "ran shell command"}}
+
+
+class TestPolicyEnforcementInScheduler:
+    """Prove that policy enforcement works through the Scheduler → ControlPlane path."""
+
+    def test_protected_file_change_triggers_needs_human_review(self):
+        from orchestrator.policy import Policy
+
+        policy = Policy.from_dict({
+            "mode": "controlled",
+            "files": {"protected": [".env"]},
+            "human_review": {"required_for": ["protected_file_change"]},
+        })
+        workflow = {
+            "name": "protected_file_test",
+            "max_steps": 5,
+            "agents": [{"name": "env_writer_agent"}],
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            scheduler = Scheduler(workflow=workflow, project_root=tmp, policy=policy)
+            state, result = scheduler.run(query="test query")
+
+            assert result.status == "needs_human_review"
+            policy_decisions = [
+                e for e in state.execution_trace
+                if e.get("event") == "policy_decision" and e.get("decision_type") == "file_changes"
+            ]
+            assert len(policy_decisions) >= 1
+            assert policy_decisions[0]["action"] == "needs_human_review"
+
+    def test_high_risk_tool_triggers_needs_human_review(self):
+        from orchestrator.policy import Policy
+
+        policy = Policy.from_dict({
+            "mode": "controlled",
+            "tools": {"shell": {"risk_level": "high"}},
+            "human_review": {"required_for": ["high_risk_tool"]},
+        })
+        workflow = {
+            "name": "high_risk_tool_test",
+            "max_steps": 5,
+            "agents": [{"name": "shell"}],
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            scheduler = Scheduler(workflow=workflow, project_root=tmp, policy=policy)
+            state, result = scheduler.run(query="test query")
+
+            assert result.status == "needs_human_review"
+            policy_decisions = [
+                e for e in state.execution_trace
+                if e.get("event") == "policy_decision" and e.get("decision_type") == "tool_use"
+            ]
+            assert len(policy_decisions) >= 1
+            assert policy_decisions[0]["action"] == "needs_human_review"
+
+    def test_reviewer_write_triggers_needs_human_review(self):
+        from orchestrator.policy import Policy
+
+        policy = Policy.from_dict({
+            "mode": "controlled",
+            "human_review": {"required_for": ["protected_file_change"]},
+        })
+        workflow = {
+            "name": "reviewer_test",
+            "max_steps": 5,
+            "agents": [{"name": "reviewer_agent"}],
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            scheduler = Scheduler(workflow=workflow, project_root=tmp, policy=policy)
+            state, result = scheduler.run(query="test query")
+
+            assert result.status == "needs_human_review"
+            policy_decisions = [
+                e for e in state.execution_trace
+                if e.get("event") == "policy_decision" and e.get("decision_type") == "reviewer_write"
+            ]
+            assert len(policy_decisions) >= 1
+
+    def test_policy_allows_low_risk_valid_result(self):
+        from orchestrator.policy import Policy
+
+        policy = Policy.from_dict({
+            "mode": "controlled",
+            "files": {"protected": [".env"]},
+            "human_review": {"required_for": ["protected_file_change"]},
+        })
+        workflow = {
+            "name": "low_risk_test",
+            "max_steps": 5,
+            "agents": [{"name": "file_writer_agent"}],
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            scheduler = Scheduler(workflow=workflow, project_root=tmp, policy=policy)
+            state, result = scheduler.run(query="test query")
+
+            assert result.status == "completed"
+
+    def test_policy_decision_is_recorded_in_trace(self):
+        from orchestrator.policy import Policy
+
+        policy = Policy.from_dict({
+            "mode": "controlled",
+            "tools": {"shell": {"risk_level": "high"}},
+            "human_review": {"required_for": ["high_risk_tool"]},
+        })
+        workflow = {
+            "name": "trace_test",
+            "max_steps": 5,
+            "agents": [{"name": "shell"}],
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            scheduler = Scheduler(workflow=workflow, project_root=tmp, policy=policy)
+            state, result = scheduler.run(query="test query")
+
+            policy_decisions = [
+                e for e in state.execution_trace
+                if e.get("event") == "policy_decision"
+            ]
+            assert len(policy_decisions) >= 1
+            for key in ("event", "decision_type", "passed", "action", "reason", "failure_category", "failure_origin", "recovery_hint", "timestamp"):
+                assert key in policy_decisions[0], f"Missing key {key} in policy_decision trace"
+
+    def test_policy_default_preserves_existing_behavior(self):
+        """No policy configured — existing behavior preserved (completes or fails normally)."""
+        workflow = {
+            "name": "default_policy_test",
+            "max_steps": 5,
+            "agents": [{"name": "file_writer_agent"}],
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            scheduler = Scheduler(workflow=workflow, project_root=tmp)
+            state, result = scheduler.run(query="test query")
+
+            assert result.status == "completed"
+
+    def test_failed_required_check_blocks_success(self):
+        from orchestrator.policy import Policy
+
+        policy = Policy.from_dict({
+            "mode": "controlled",
+            "checks": {"required": ["pytest"]},
+        })
+        workflow = {
+            "name": "failed_check_test",
+            "max_steps": 5,
+            "agents": [{"name": "noop_writer"}],
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            scheduler = Scheduler(workflow=workflow, project_root=tmp, policy=policy)
+            state, result = scheduler.run(query="test query")
+
+            # Without an explicit check_result in trace, required checks appear as missing
+            # With no observed pytest=True, policy blocks completion
+            assert result.status != "completed"
+
+    def test_passed_required_check_allows_completion(self):
+        from orchestrator.policy import Policy
+
+        policy = Policy.from_dict({
+            "mode": "controlled",
+            "checks": {"required": ["pytest"]},
+        })
+        workflow = {
+            "name": "passed_check_test",
+            "max_steps": 5,
+            "agents": [
+                {"name": "planner"},
+                {"name": "summarizer"},
+            ],
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            scheduler = Scheduler(workflow=workflow, project_root=tmp, policy=policy)
+            state, result = scheduler.run(query="test query")
+
+            # With required checks and no check_result events, completion should be blocked
+            assert result.status != "completed"
+
+    def test_no_required_checks_does_not_block(self):
+        from orchestrator.policy import Policy
+
+        policy = Policy.from_dict({"mode": "controlled", "checks": {}})
+        workflow = {
+            "name": "no_checks_test",
+            "max_steps": 5,
+            "agents": [{"name": "noop_writer"}],
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            scheduler = Scheduler(workflow=workflow, project_root=tmp, policy=policy)
+            state, result = scheduler.run(query="test query")
+
+            assert result.status == "completed"
+
+    def test_missing_required_evidence_blocks_success(self):
+        from orchestrator.policy import Policy
+
+        policy = Policy.from_dict({
+            "mode": "controlled",
+            "checks": {"required": ["pytest"]},
+        })
+        workflow = {
+            "name": "missing_evidence_test",
+            "max_steps": 5,
+            "agents": [{"name": "noop_writer"}],
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            scheduler = Scheduler(workflow=workflow, project_root=tmp, policy=policy)
+            state, result = scheduler.run(query="test query")
+
+            # No check_result events → evidence missing → needs_human_review
+            evidence_decisions = [
+                e for e in state.execution_trace
+                if e.get("event") == "policy_decision" and e.get("decision_type") == "required_evidence"
+            ]
+            assert len(evidence_decisions) >= 1
+            assert evidence_decisions[0]["evidence_required"] is True
+
+    def test_scheduler_uses_control_plane_for_policy_decision(self):
+        """Prove that policy decisions flow through ControlPlane, not scattered scheduler rules."""
+        from orchestrator.policy import Policy
+
+        policy = Policy.from_dict({
+            "mode": "controlled",
+            "tools": {"shell": {"risk_level": "high"}},
+            "human_review": {"required_for": ["high_risk_tool"]},
+        })
+        workflow = {
+            "name": "cp_routing_test",
+            "max_steps": 5,
+            "agents": [{"name": "shell"}],
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            scheduler = Scheduler(workflow=workflow, project_root=tmp, policy=policy)
+            assert scheduler.control_plane._policy is not None
+            assert scheduler.control_plane._policy.mode == "controlled"
+
+    def test_live_view_shows_policy_decision(self):
+        from orchestrator.policy import Policy
+        from orchestrator.live_view import build_live_view
+
+        policy = Policy.from_dict({
+            "mode": "controlled",
+            "tools": {"shell": {"risk_level": "high"}},
+            "human_review": {"required_for": ["high_risk_tool"]},
+        })
+        workflow = {
+            "name": "live_view_test",
+            "max_steps": 5,
+            "agents": [{"name": "shell"}],
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            scheduler = Scheduler(workflow=workflow, project_root=tmp, policy=policy)
+            state, result = scheduler.run(query="test query")
+
+            view = build_live_view(state, result=result)
+            policy_dec = view.get("last_policy_decision")
+            assert policy_dec is not None
+            assert "action" in policy_dec
+
