@@ -1,11 +1,14 @@
-﻿import hashlib
+from typing import Any
+import hashlib
 import json
 from datetime import datetime, timezone
 from pathlib import Path
 from time import perf_counter
 
+from .control_plane import ControlPlane
+from .evidence import evidence_packs_from_logs
 from .evaluator import Evaluator
-from .failure_taxonomy import FailureCategory, FailureRecord, create_failure_record, infer_failure_category
+from .failure_taxonomy import FailureCategory, FailureRecord
 from .guardrails import GuardrailViolation
 from .live_interrupt import InterruptSignal, LiveInterruptController
 from .llm_client import LLMClient
@@ -23,6 +26,28 @@ def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _bounded_output_summary(output: dict) -> str:
+    """Derive a bounded, human-readable summary from recorded output."""
+    if not output:
+        return ""
+    keys = list(output.keys())
+    parts: list[str] = []
+    for k in keys[:5]:
+        v = output.get(k)
+        if isinstance(v, str):
+            snippet = v[:120].replace("\n", " ")
+            parts.append(f"{k}: {snippet}")
+        elif isinstance(v, dict):
+            sub_keys = list(v.keys())[:3]
+            parts.append(f"{k}: dict({', '.join(sub_keys)})")
+        elif isinstance(v, list):
+            parts.append(f"{k}: list[{len(v)}]")
+        else:
+            parts.append(f"{k}: {type(v).__name__}")
+    summary = "; ".join(parts)
+    return summary[:500]
+
+
 class Scheduler:
     def __init__(
         self,
@@ -33,6 +58,7 @@ class Scheduler:
     ):
         self.workflow = workflow
         self.evaluator = Evaluator()
+        self.control_plane = ControlPlane(evaluator=self.evaluator)
         self.project_root = Path(project_root) if project_root else Path.cwd()
         self.memory_manager = MemoryManager(self.project_root)
         self.project_context = ProjectContext(self.project_root)
@@ -50,10 +76,11 @@ class Scheduler:
 
     def run(self, query: str) -> tuple[StateCenter, RunResult]:
         state = StateCenter(query=query, max_steps=self.workflow.get("max_steps", 10))
+        agents = self.workflow.get("agents", [])
+        state.metadata.workflow_total = len(agents)
         retrieved_memories = self.memory_manager.retrieve(query=query, top_k=3)
         state.write("retrieved_memories", retrieved_memories, "memory_manager")
 
-        agents = self.workflow.get("agents", [])
         workflow_agents = [node["name"] for node in agents]
         if self.orchestrator:
             self.orchestrator.initialize(query, workflow_agents)
@@ -199,6 +226,7 @@ class Scheduler:
                     status="timed_out",
                     final_node=agents[current_index]["name"] if current_index < len(agents) else None,
                     reason="达到最大步数限制",
+                    failure_category=FailureCategory.POLICY_ERROR,
                 )
 
             node = agents[current_index]
@@ -225,9 +253,9 @@ class Scheduler:
             status = "success"
 
             try:
-                agent.apply_input_guardrails(view)
+                self._run_input_guardrails(agent=agent, agent_name=agent_name, view=view)
                 output = agent.run(view)
-                agent.apply_output_guardrails(output)
+                self._run_output_guardrails(agent=agent, agent_name=agent_name, output=output)
                 for write_spec in agent.config.writes:
                     if write_spec.field in output:
                         state.write(write_spec.field, output[write_spec.field], agent.config.name)
@@ -310,12 +338,15 @@ class Scheduler:
                     status="failed",
                     final_node=agent_name,
                     reason=error_message,
+                    failure_category=FailureCategory.GUARDRAIL_BLOCKED
+                    if status == "guardrail_blocked"
+                    else None,
                 )
 
             if self.orchestrator:
                 self.orchestrator.mark_agent_completed(agent_name, output)
 
-            eval_result = self.evaluator.evaluate(
+            eval_result = self.control_plane.evaluate_output(
                 agent.config.eval_criteria,
                 output,
                 context=view,
@@ -412,6 +443,7 @@ class Scheduler:
                             status="failed",
                             final_node=agent_name,
                             reason=orch_decision.reason,
+                            failure_category=FailureCategory.POLICY_ERROR,
                         )
                     if orch_decision.next_agent:
                         target_index = next(
@@ -453,6 +485,7 @@ class Scheduler:
                         status="failed",
                         final_node=agent_name,
                         reason=reason,
+                        failure_category=FailureCategory.TOOL_ERROR,
                     )
                 continue
 
@@ -465,12 +498,28 @@ class Scheduler:
                 status="failed",
                 final_node=agent_name,
                 reason=reason,
+                failure_category=FailureCategory.TASK_QUALITY_ERROR,
+            )
+
+        final_node = agents[-1]["name"] if agents else None
+        if agents and not self._can_complete_after_agent(
+            state=state,
+            agents=agents,
+            current_index=len(agents) - 1,
+        ):
+            reason = "工作流结束时缺少必要产物，不能标记完成"
+            state.set_status("failed", reason)
+            return self._finalize_run(
+                state=state,
+                status="failed",
+                final_node=final_node,
+                reason=reason,
             )
 
         return self._finalize_run(
             state=state,
             status="completed",
-            final_node=agents[-1]["name"] if agents else None,
+            final_node=final_node,
             reason="工作流末尾节点已完成",
         )
 
@@ -571,11 +620,12 @@ class Scheduler:
         output: dict,
         duration_ms: int,
         status: str,
-        eval_result: EvalResult | None = None,
+        eval_result: Any | None = None,  # EvalResult or ControlDecision
     ) -> None:
         logs_dir = self.project_root / "outputs" / "logs"
         logs_dir.mkdir(parents=True, exist_ok=True)
         log_path = self._log_path(state)
+        output_summary = _bounded_output_summary(output) if status == "success" else ""
         record = {
             "task_id": state.metadata.task_id,
             "agent": agent,
@@ -585,6 +635,7 @@ class Scheduler:
             "token_usage": {"input": 0, "output": 0},
             "input_hash": self._hash_payload(input_view),
             "output_hash": self._hash_payload(output),
+            "output_summary": output_summary,
             "status": status,
         }
         if eval_result is not None:
@@ -643,6 +694,36 @@ class Scheduler:
             llm_client = LLMClient(default_model=model_name)
             return agent_cls(llm_client=llm_client)
         return agent_cls()
+
+    def _run_input_guardrails(self, *, agent, agent_name: str, view: dict) -> None:
+        """Run input-stage guardrails through ControlPlane."""
+        decision = self.control_plane.guard_input(
+            agent_name=agent_name,
+            payload=view,
+            guardrail_names=agent.config.guardrails,
+        )
+        if not decision.passed:
+            raise GuardrailViolation(
+                guardrail_name=decision.guardrail_name or "unknown",
+                stage="input",
+                message=decision.reason,
+                failure_category=FailureCategory(decision.failure_category or "guardrail_blocked"),
+            )
+
+    def _run_output_guardrails(self, *, agent, agent_name: str, output: dict) -> None:
+        """Run output-stage guardrails through ControlPlane."""
+        decision = self.control_plane.guard_output(
+            agent_name=agent_name,
+            payload=output,
+            guardrail_names=agent.config.guardrails,
+        )
+        if not decision.passed:
+            raise GuardrailViolation(
+                guardrail_name=decision.guardrail_name or "unknown",
+                stage="output",
+                message=decision.reason,
+                failure_category=FailureCategory(decision.failure_category or "guardrail_blocked"),
+            )
 
     def _handle_live_interrupt(
         self,
@@ -793,12 +874,20 @@ class Scheduler:
         status: str,
         final_node: str | None,
         reason: str = "",
+        failure_category: FailureCategory | None = None,
     ) -> tuple[StateCenter, RunResult]:
         state.set_status(status, reason)
 
         failure_record: FailureRecord | None = None
         if status in ("failed", "timed_out", "guardrail_blocked"):
-            failure_record = self._classify_failure(state=state, status=status, reason=reason, final_node=final_node)
+            if failure_category is not None:
+                failure_record = self.control_plane.create_failure_record(
+                    category=failure_category,
+                    agent_name=final_node,
+                    reason=reason,
+                )
+            else:
+                failure_record = self._classify_failure(state=state, status=status, reason=reason, final_node=final_node)
             state.execution_trace.append(
                 {
                     "event": "failure_classified",
@@ -806,19 +895,40 @@ class Scheduler:
                     "severity": failure_record.severity.value,
                     "agent_name": failure_record.agent_name,
                     "reason": failure_record.reason,
+                    "origin": failure_record.origin,
+                    "recovery_hint": failure_record.recovery_hint,
                     "timestamp": utc_now_iso(),
                 }
             )
 
         memory_bundle, memory_path = self.memory_manager.capture(state=state, final_node=final_node)
         state.write("memory_bundle", memory_bundle, "memory_manager")
+
+        # Phase 4: compute report_path first, then build evidence packs
+        report_path = (
+            self.project_root / "outputs" / "reports" / f"{state.metadata.task_id}.json"
+        )
+
+        log_records = self.report_writer.load_log_records(state)
+        evidence_packs = evidence_packs_from_logs(
+            log_records=log_records,
+            report_path=str(report_path),
+        )
+
         report_path = self.report_writer.write(
             state=state,
             final_node=final_node,
             memory_path=memory_path,
             failure_record=failure_record,
+            evidence_packs=evidence_packs,
         )
+
+        evidence_path = self._write_evidence(
+            state=state, packs=evidence_packs,
+        )
+
         state.save_to(self._state_path(state))
+
         return state, RunResult(
             task_id=state.metadata.task_id,
             status=status,
@@ -829,6 +939,7 @@ class Scheduler:
             state_version=state.version,
             checkpoint_dir=str(self._checkpoint_dir(state)),
             convergence_report_path=str(report_path),
+            evidence_path=evidence_path,
             memory_path=str(memory_path),
         )
 
@@ -849,28 +960,30 @@ class Scheduler:
             if event.get("event") == "evaluation" and event.get("passed") is False and last_failed_eval is None:
                 last_failed_eval = event
 
-        if last_guardrail and "failure_category" in last_guardrail:
-            category = FailureCategory(last_guardrail["failure_category"])
-            return create_failure_record(
-                category=category,
-                agent_name=final_node,
-                reason=reason,
-            )
-
         eval_action = last_failed_eval.get("action") if last_failed_eval else None
         event_type = last_guardrail.get("event") if last_guardrail else None
 
-        category = infer_failure_category(
+        return self.control_plane.classify_failure(
             status=status,
             reason=reason,
+            agent_name=final_node,
             event_type=event_type,
             eval_action=eval_action,
         )
-        return create_failure_record(
-            category=category,
-            agent_name=final_node,
-            reason=reason,
+
+    def _write_evidence(self, *, state: StateCenter, packs: list) -> str:
+        evidence_dir = self.project_root / "outputs" / "evidence"
+        evidence_dir.mkdir(parents=True, exist_ok=True)
+        evidence_path = evidence_dir / f"{state.metadata.task_id}.json"
+        evidence_path.write_text(
+            json.dumps(
+                [p.model_dump() for p in packs],
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
         )
+        return str(evidence_path)
 
     def _state_path(self, state: StateCenter) -> Path:
         return self.project_root / "outputs" / "states" / f"{state.metadata.task_id}.json"

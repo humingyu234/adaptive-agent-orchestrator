@@ -64,7 +64,7 @@ class RegressionCompare:
                 old_task_id=old_task_id,
                 new_task_id=new_task_id,
                 workflow_name=workflow_name,
-                summary="??????????",
+                summary="回归对比分析",
             )
 
         old_workflow = old_report.get("workflow_name")
@@ -76,7 +76,7 @@ class RegressionCompare:
                 old_task_id=old_task_id,
                 new_task_id=new_task_id,
                 workflow_name=resolved_workflow,
-                summary=f"??? workflow ???{old_workflow} vs {new_workflow}",
+                summary=f"工作流对比：{old_workflow} vs {new_workflow}",
             )
 
         metrics_diffs = self._compute_metrics_diffs(old_task_id, new_task_id, old_report, new_report)

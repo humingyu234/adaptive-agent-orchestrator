@@ -178,4 +178,5 @@ class RunResult(BaseModel):
     state_version: int
     checkpoint_dir: str | None = None
     convergence_report_path: str | None = None
+    evidence_path: str | None = None
     memory_path: str | None = None

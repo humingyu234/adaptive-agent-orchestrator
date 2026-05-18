@@ -1,4 +1,4 @@
-"""ProjectContext - ????????"""
+"""ProjectContext - 项目文件上下文扫描与摘要"""
 
 from __future__ import annotations
 

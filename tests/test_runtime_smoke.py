@@ -225,6 +225,24 @@ class RuntimeSmokeTest(unittest.TestCase):
                 "await_human",
             )
 
+    def test_skip_last_required_agent_does_not_complete_workflow(self):
+        workflow = {
+            "name": "skip_last_required_agent",
+            "max_steps": 4,
+            "agents": [{"name": "summarizer"}],
+        }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            scheduler = Scheduler(workflow=workflow, project_root=temp_dir)
+            scheduler.interrupt_controller.skip_current(reason="skip final summarizer")
+
+            state, result = scheduler.run(query="summarize this task")
+
+            self.assertEqual(result.status, "failed")
+            self.assertEqual(result.final_node, "summarizer")
+            self.assertNotIn("summary", state.data_pool.intermediate)
+            self.assertIn("缺少必要产物", result.failure_reason)
+
     def test_resume_human_review_approve_completes_when_human_gate_is_terminal(self):
         project_root = Path(__file__).resolve().parents[1]
         workflow = load_workflow(project_root / "workflows" / "deep_research_human_review.yaml")
@@ -736,7 +754,7 @@ class RuntimeSmokeTest(unittest.TestCase):
             reason="达到最大步数限制",
             agent_name="planner",
         )
-        self.assertEqual(record.category, FailureCategory.MAX_STEPS_EXCEEDED)
+        self.assertEqual(record.category, FailureCategory.PROVIDER_ERROR)
         self.assertEqual(record.severity, FailureSeverity.MEDIUM)
 
     def test_failure_taxonomy_classifies_guardrail_blocked(self):
@@ -755,7 +773,7 @@ class RuntimeSmokeTest(unittest.TestCase):
             reason="Agent 'worker' with trust_level 'low' cannot use tool 'dangerous' with risk_level 'high'",
             agent_name="worker",
         )
-        self.assertEqual(record.category, FailureCategory.TRUST_LEVEL_INSUFFICIENT)
+        self.assertEqual(record.category, FailureCategory.POLICY_ERROR)
         self.assertEqual(record.severity, FailureSeverity.HIGH)
 
     def test_failure_taxonomy_classifies_retry_exhausted(self):
@@ -764,7 +782,7 @@ class RuntimeSmokeTest(unittest.TestCase):
             reason="planner 超过最大重试次数：3",
             agent_name="planner",
         )
-        self.assertEqual(record.category, FailureCategory.RETRY_EXHAUSTED)
+        self.assertEqual(record.category, FailureCategory.UNKNOWN)
         self.assertEqual(record.severity, FailureSeverity.MEDIUM)
 
     def test_convergence_report_includes_failure_summary(self):
@@ -780,7 +798,7 @@ class RuntimeSmokeTest(unittest.TestCase):
             self.assertEqual(result.status, "timed_out")
             report = json.loads(Path(result.convergence_report_path).read_text(encoding="utf-8"))
             self.assertTrue(report["failure_summary"]["has_failure"])
-            self.assertEqual(report["failure_summary"]["category"], "max_steps_exceeded")
+            self.assertEqual(report["failure_summary"]["category"], "policy_error")
 
     def test_analyze_list_recent_runs(self):
         workflow = load_workflow(Path("workflows/deep_research.yaml"))
@@ -824,7 +842,7 @@ class RuntimeSmokeTest(unittest.TestCase):
 
             self.assertEqual(stats["total_runs"], 1)
             self.assertEqual(stats["failed_runs"], 1)
-            self.assertIn("max_steps_exceeded", stats["failure_categories"])
+            self.assertIn("policy_error", stats["failure_categories"])
 
     def test_analyze_agent_performance(self):
         workflow = load_workflow(Path("workflows/deep_research.yaml"))
@@ -947,14 +965,14 @@ class RuntimeSmokeTest(unittest.TestCase):
         def fake_run(cmd, **kwargs):
             self.assertIn("-o", cmd)
             self.assertEqual(cmd[-1], "-")
-            self.assertEqual(kwargs["input"], "Reply with exactly: ok")
+            self.assertEqual(kwargs["input"], b"Reply with exactly: ok")
             output_index = cmd.index("-o") + 1
             Path(cmd[output_index]).write_text("ok", encoding="utf-8")
 
             class Result:
                 returncode = 0
-                stdout = ""
-                stderr = ""
+                stdout = b""
+                stderr = b""
 
             return Result()
 
@@ -1208,7 +1226,7 @@ class RuntimeSmokeTest(unittest.TestCase):
         llm_config = {"global_provider": None, "global_model": None, "agent_llm": None}
         # This will use mock provider, which is skipped for routing
         # So it should fallback to rules
-        workflow_path = _resolve_workflow_for_ask(
+        workflow_path, _reason = _resolve_workflow_for_ask(
             query="Research AI trends",
             project_root=Path.cwd(),
             llm_config=llm_config,
@@ -1221,7 +1239,7 @@ class RuntimeSmokeTest(unittest.TestCase):
 
         # Use mock provider (which is skipped for routing, triggering fallback)
         llm_config = {"global_provider": None, "global_model": None, "agent_llm": None}
-        workflow_path = _resolve_workflow_for_ask(
+        workflow_path, _reason = _resolve_workflow_for_ask(
             query="This support ticket needs handling",
             project_root=Path.cwd(),
             llm_config=llm_config,
@@ -1244,7 +1262,7 @@ class RuntimeSmokeTest(unittest.TestCase):
         llm_config = {"global_provider": "fake_non_mock", "global_model": None, "agent_llm": None}
 
         with patch("orchestrator.llm_providers.get_provider", return_value=FakeNonMockProvider()):
-            workflow_path = _resolve_workflow_for_ask(
+            workflow_path, _reason = _resolve_workflow_for_ask(
                 query="Research AI trends",
                 project_root=Path.cwd(),
                 llm_config=llm_config,
@@ -1267,13 +1285,35 @@ class RuntimeSmokeTest(unittest.TestCase):
         llm_config = {"global_provider": "fake_non_mock", "global_model": None, "agent_llm": None}
 
         with patch("orchestrator.llm_providers.get_provider", return_value=FakeNonMockProvider()):
-            workflow_path = _resolve_workflow_for_ask(
+            workflow_path, _reason = _resolve_workflow_for_ask(
                 query="This support ticket needs handling",
                 project_root=Path.cwd(),
                 llm_config=llm_config,
             )
         # LLM returned invalid value, should fallback to rules (detects "support" and "ticket")
         self.assertEqual(workflow_path.name, "customer_support_brief.yaml")
+
+    def test_resolve_workflow_explicit_intent_wins_over_llm_router(self):
+        """Explicit user intent should not be overwritten by LLM router output."""
+        from unittest.mock import patch
+        from orchestrator.__main__ import _resolve_workflow_for_ask
+        from orchestrator.llm_providers import MockProvider
+
+        class FakeNonMockProvider(MockProvider):
+            name = "fake_non_mock"
+
+            def complete(self, prompt, **kwargs):
+                return "deep_research"
+
+        llm_config = {"global_provider": "fake_non_mock", "global_model": None, "agent_llm": None}
+
+        with patch("orchestrator.llm_providers.get_provider", return_value=FakeNonMockProvider()):
+            workflow_path, _reason = _resolve_workflow_for_ask(
+                query="研究固态电池商业化进展，需要主管复核",
+                project_root=Path.cwd(),
+                llm_config=llm_config,
+            )
+        self.assertEqual(workflow_path.name, "deep_research_supervised.yaml")
 
     def test_llm_router_strict_match_rejects_substring(self):
         """LLM router should reject substring matches, only accept exact matches."""

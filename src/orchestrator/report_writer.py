@@ -32,6 +32,7 @@ class ConvergenceReportWriter:
         final_node: str | None,
         memory_path: Path,
         failure_record: FailureRecord | None = None,
+        evidence_packs: list | None = None,
     ) -> Path:
         """生成并写入收敛报告"""
         report_dir = self.project_root / "outputs" / "reports"
@@ -45,6 +46,7 @@ class ConvergenceReportWriter:
             memory_path=memory_path,
             failure_record=failure_record,
             log_records=log_records,
+            evidence_packs=evidence_packs,
         )
 
         report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -58,6 +60,7 @@ class ConvergenceReportWriter:
         memory_path: Path,
         failure_record: FailureRecord | None,
         log_records: list[dict],
+        evidence_packs: list | None = None,
     ) -> dict[str, Any]:
         """构建报告结构"""
         event_counter = self._count_events(state.execution_trace)
@@ -86,7 +89,6 @@ class ConvergenceReportWriter:
         retrieved_memories = state.data_pool.intermediate.get("retrieved_memories", [])
         plan = state.data_pool.intermediate.get("plan", {})
         summary = state.data_pool.intermediate.get("summary", {})
-
         return {
             "task_id": state.metadata.task_id,
             "workflow_name": self.workflow.get("name"),
@@ -135,7 +137,11 @@ class ConvergenceReportWriter:
             ),
             "memory_summary": self._build_memory_summary(memory_bundle, retrieved_memories),
             "failure_summary": self._build_failure_summary(failure_record),
+            "evidence_summary": self._build_evidence_summary(evidence_packs or []),
         }
+
+    def load_log_records(self, state: StateCenter) -> list[dict]:
+        return self._load_log_records(state)
 
     def _load_log_records(self, state: StateCenter) -> list[dict]:
         log_path = self.project_root / "outputs" / "logs" / f"{state.metadata.task_id}.jsonl"
@@ -384,6 +390,27 @@ class ConvergenceReportWriter:
             if isinstance(memory_bundle, dict)
             else None,
             "retrieved_memory_count": len(retrieved_memories) if isinstance(retrieved_memories, list) else 0,
+        }
+
+    def _build_evidence_summary(self, evidence_packs: list) -> dict:
+        if not evidence_packs:
+            return {"steps_with_evidence": 0, "steps": []}
+        steps = []
+        for pack in evidence_packs:
+            p = pack.model_dump() if hasattr(pack, "model_dump") else pack
+            steps.append({
+                "step_name": p.get("step_name", ""),
+                "status": p.get("status", ""),
+                "duration_ms": p.get("duration_ms", 0),
+                "evaluation_passed": p.get("evaluation", {}).get("passed") if p.get("evaluation") else None,
+                "failure_reason": p.get("failure_reason", ""),
+                "output_summary": p.get("output_summary", ""),
+                "files_changed": len(p.get("files_changed", [])),
+                "commands_run": len(p.get("commands_run", [])),
+            })
+        return {
+            "steps_with_evidence": len(steps),
+            "steps": steps,
         }
 
     def _build_failure_summary(self, failure_record: FailureRecord | None) -> dict:
