@@ -10,9 +10,20 @@ except ImportError:  # pragma: no cover - optional dependency
 
 from . import agents as _agents  # noqa: F401
 from .analyze import RunAnalyzer, format_table
+from .cli_output import build_raw_payload, build_run_payload, format_run_text
 from .llm_providers import describe_providers, list_providers
 from .project_context import ProjectContext
+from .live_view import build_live_view, is_terminal, render_live_view
 from .regression_compare import RegressionCompare, RegressionSignal, format_regression_report
+from .sales_preview import build_sales_preview
+from .task_router import (
+    requires_future_runner,
+    route_task,
+    render_route_decision,
+    route_decision_to_dict,
+    should_execute_workflow,
+    should_only_log,
+)
 from .registry import REGISTRY, get_agent
 from .scheduler import Scheduler
 from .state_center import StateCenter
@@ -34,12 +45,26 @@ def main() -> None:
     ask_parser.add_argument("--llm", help="Optional global LLM provider override")
     ask_parser.add_argument("--model", help="Optional global model override")
     ask_parser.add_argument("--agent-llm", help="Optional per-agent LLM config, format: agent=provider:model")
+    ask_parser.add_argument("--raw", action="store_true", help="Print legacy internal result/state payload")
+    ask_parser.add_argument("--format", choices=["json", "text"], default="json", help="Output format (default: json)")
+    ask_parser.add_argument("--mode", choices=["off", "log", "controlled", "orchestrated"], help="Override the default run mode")
+    ask_parser.add_argument("--force-run", action="store_true", help="Force workflow execution even for log/off routes")
 
     review_parser = subparsers.add_parser("review", help="Approve or reject a paused human review task")
     review_parser.add_argument("--task-id", required=True, help="Task ID waiting for human review")
     review_parser.add_argument("--decision", required=True, choices=["approve", "reject"], help="Human review decision")
     review_parser.add_argument("--reason", default="", help="Optional human review reason")
     review_parser.add_argument("--workflow", help="Optional workflow path override")
+    review_parser.add_argument("--raw", action="store_true", help="Print legacy internal result/state payload")
+    review_parser.add_argument("--format", choices=["json", "text"], default="json", help="Output format (default: json)")
+
+    resume_parser = subparsers.add_parser("resume", help="Resume a paused human review task")
+    resume_parser.add_argument("--task-id", required=True, help="Task ID waiting for human review")
+    resume_parser.add_argument("--decision", required=True, choices=["approve", "reject"], help="Human review decision")
+    resume_parser.add_argument("--reason", default="", help="Optional human review reason")
+    resume_parser.add_argument("--workflow", help="Optional workflow path override")
+    resume_parser.add_argument("--raw", action="store_true", help="Print legacy internal result/state payload")
+    resume_parser.add_argument("--format", choices=["json", "text"], default="json", help="Output format (default: json)")
 
     run_parser = subparsers.add_parser("run", help="Run a workflow against a query")
     run_parser.add_argument("--workflow", required=True, help="Path to workflow yaml")
@@ -47,6 +72,10 @@ def main() -> None:
     run_parser.add_argument("--llm", help="LLM provider to use (glm/openai/anthropic/codex/deepseek/ollama)")
     run_parser.add_argument("--model", help="Model name to use")
     run_parser.add_argument("--agent-llm", help="Per-agent LLM config, format: agent=provider:model")
+    run_parser.add_argument("--raw", action="store_true", help="Print legacy internal result/state payload")
+    run_parser.add_argument("--format", choices=["json", "text"], default="json", help="Output format (default: json)")
+    run_parser.add_argument("--mode", choices=["off", "log", "controlled", "orchestrated"], help="Override the default run mode")
+    run_parser.add_argument("--force-run", action="store_true", help="Force workflow execution even for log/off routes")
 
     analyze_parser = subparsers.add_parser("analyze", help="Analyze historical runs")
     analyze_subparsers = analyze_parser.add_subparsers(dest="analyze_command", required=True)
@@ -100,11 +129,26 @@ def main() -> None:
     context_parser.add_argument("--extension", help="Filter by file extension")
     context_parser.add_argument("--max-depth", type=int, help="Maximum scan depth")
 
+    route_parser = subparsers.add_parser("route", help="Route a task without executing it")
+    route_parser.add_argument("query", help="Task request in natural language")
+    route_parser.add_argument("--mode", choices=["off", "log", "controlled", "orchestrated"], help="Override the default run mode")
+    route_parser.add_argument("--format", choices=["json", "text"], default="json", help="Output format (default: json)")
+
+    status_parser = subparsers.add_parser("status", help="Show live run status for a task")
+    status_parser.add_argument("--task-id", required=True, help="Task ID to show status for")
+
+    watch_parser = subparsers.add_parser("watch", help="Watch run status in real time (refreshes until terminal)")
+    watch_parser.add_argument("--task-id", required=True, help="Task ID to watch")
+    watch_parser.add_argument("--once", action="store_true", help="Render once and exit (no polling)")
+    watch_parser.add_argument("--interval", type=float, default=1.0, help="Refresh interval in seconds (default: 1.0)")
+
     args = parser.parse_args()
 
     if args.command == "ask":
         _handle_ask_command(args)
     elif args.command == "review":
+        _handle_review_command(args)
+    elif args.command == "resume":
         _handle_review_command(args)
     elif args.command == "run":
         _handle_run_command(args)
@@ -118,6 +162,12 @@ def main() -> None:
         _handle_providers_command(args)
     elif args.command == "project-context":
         _handle_project_context_command(args)
+    elif args.command == "route":
+        _handle_route_command(args)
+    elif args.command == "status":
+        _handle_status_command(args)
+    elif args.command == "watch":
+        _handle_watch_command(args)
 
 
 def _handle_analyze_command(args) -> None:
@@ -270,9 +320,48 @@ def _handle_analyze_command(args) -> None:
         print("Please specify --old/--new, --recent, or --find")
 
 
+def _handle_route_command(args) -> None:
+    """Route a task without executing it — prints the route decision."""
+    explicit_mode = getattr(args, "mode", None)
+    decision = route_task(args.query, explicit_mode=explicit_mode)
+
+    fmt = getattr(args, "format", "json")
+    if fmt == "text":
+        print(render_route_decision(decision))
+    else:
+        print(json.dumps(route_decision_to_dict(decision), ensure_ascii=False, indent=2))
+
+
 def _handle_ask_command(args) -> None:
     _load_optional_dotenv()
     project_root = Path.cwd()
+
+    # Phase 9: route the task before workflow selection
+    explicit_mode = getattr(args, "mode", None)
+    decision = route_task(args.query, explicit_mode=explicit_mode)
+
+    # Phase 9A: use shared mode semantics instead of ad-hoc checks
+    if should_only_log(decision) and not getattr(args, "force_run", False):
+        decision_dict = route_decision_to_dict(decision)
+        fmt = getattr(args, "format", "json")
+        if fmt == "text":
+            print(render_route_decision(decision))
+        else:
+            decision_dict["_note"] = "Route is log/off — no workflow executed. Use --force-run to run anyway."
+            print(json.dumps(decision_dict, ensure_ascii=False, indent=2))
+        return
+
+    # For orchestrated routes without an orchestrated runner, require --force-run
+    if requires_future_runner(decision) and not getattr(args, "force_run", False):
+        decision_dict = route_decision_to_dict(decision)
+        fmt = getattr(args, "format", "json")
+        if fmt == "text":
+            print(render_route_decision(decision))
+            print("\nOrchestrated runner is not implemented yet. Use --force-run to fall back to controlled mode.")
+        else:
+            decision_dict["_note"] = "Orchestrated runner is not implemented yet. Use --force-run to fall back to controlled mode."
+            print(json.dumps(decision_dict, ensure_ascii=False, indent=2))
+        return
 
     llm_config = _parse_llm_config(args)
     if llm_config.get("global_provider"):
@@ -280,7 +369,7 @@ def _handle_ask_command(args) -> None:
     if llm_config.get("global_model"):
         os.environ["LLM_DEFAULT_MODEL"] = llm_config["global_model"]
 
-    workflow_path = _resolve_workflow_for_ask(
+    workflow_path, routing_reason = _resolve_workflow_for_ask(
         query=args.query,
         project_root=project_root,
         llm_config=llm_config,
@@ -294,7 +383,29 @@ def _handle_ask_command(args) -> None:
         llm_overrides=llm_overrides,
     )
     state, result = scheduler.run(query=args.query)
-    print(json.dumps({"result": result.model_dump(), "state": state.metadata.to_dict()}, ensure_ascii=False, indent=2))
+
+    # Record route decision in state
+    state.record_route_decision(route_decision_to_dict(decision))
+
+    preview = build_sales_preview(state)
+    if args.raw:
+        payload = build_raw_payload(state=state, result=result, extra_preview=preview)
+    else:
+        payload = build_run_payload(
+            query=args.query,
+            workflow_name=str(workflow.get("name", workflow_path.stem)),
+            state=state,
+            result=result,
+            project_root=project_root,
+            extra_preview=preview,
+            routing_reason=routing_reason,
+            llm_overrides=llm_overrides,
+        )
+    fmt = getattr(args, "format", "json")
+    if fmt == "text":
+        print(format_run_text(payload))
+    else:
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
 
 
 def _handle_review_command(args) -> None:
@@ -318,7 +429,21 @@ def _handle_review_command(args) -> None:
         decision=args.decision,
         reason=args.reason,
     )
-    print(json.dumps({"result": result.model_dump(), "state": state.metadata.to_dict()}, ensure_ascii=False, indent=2))
+    if args.raw:
+        payload = build_raw_payload(state=state, result=result)
+    else:
+        payload = build_run_payload(
+            query=state.data_pool.query,
+            workflow_name=str(workflow.get("name", workflow_path.stem)),
+            state=state,
+            result=result,
+            project_root=project_root,
+        )
+    fmt = getattr(args, "format", "json")
+    if fmt == "text":
+        print(format_run_text(payload))
+    else:
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
 
 
 # Valid workflow names for LLM router
@@ -366,13 +491,20 @@ Category:"""
         return None
 
 
-def _resolve_workflow_for_ask(*, query: str, project_root: Path, llm_config: dict) -> Path:
-    """Resolve workflow path using LLM router with fallback to rules.
+def _resolve_workflow_for_ask(*, query: str, project_root: Path, llm_config: dict) -> tuple[Path, str]:
+    """Resolve workflow path using explicit rules, LLM router, then fallback rules.
+
+    Returns (workflow_path, routing_reason).
 
     Priority:
-    1. LLM router (if available)
-    2. Rule-based fallback (_infer_workflow_path)
+    1. Explicit rule-based intent (human review / supervisor / support)
+    2. LLM router (if available)
+    3. Rule-based default fallback
     """
+    explicit_workflow = _infer_workflow_path(query=query, project_root=project_root, include_default=False)
+    if explicit_workflow is not None:
+        return explicit_workflow, _build_routing_reason(query, str(explicit_workflow.stem), source="keyword_match")
+
     # Try LLM router first
     from .llm_client import LLMClient
 
@@ -391,15 +523,31 @@ def _resolve_workflow_for_ask(*, query: str, project_root: Path, llm_config: dic
         if llm_client.provider_name != "mock":
             workflow_name = _route_workflow_with_llm(query, llm_client)
             if workflow_name in _VALID_WORKFLOW_NAMES:
-                return (project_root / "workflows" / f"{workflow_name}.yaml").resolve()
+                wf_path = (project_root / "workflows" / f"{workflow_name}.yaml").resolve()
+                return wf_path, _build_routing_reason(query, workflow_name, source="llm_router")
     except Exception:
         pass  # Fall through to rule-based routing
 
     # Fallback to rule-based routing
-    return _infer_workflow_path(query=query, project_root=project_root)
+    fallback_path = _infer_workflow_path(query=query, project_root=project_root)
+    return fallback_path, _build_routing_reason(query, str(fallback_path.stem), source="fallback")
 
 
-def _infer_workflow_path(*, query: str, project_root: Path) -> Path:
+def _build_routing_reason(query: str, workflow_name: str, source: str) -> str:
+    """Build a human-readable routing reason."""
+    lowered = query.lower()
+    if workflow_name == "deep_research_human_review":
+        return "detected human-review intent in query"
+    if workflow_name == "deep_research_supervised":
+        return "detected supervisor-review intent in query"
+    if workflow_name == "customer_support_brief":
+        return "detected customer-support keywords in query"
+    if source == "llm_router":
+        return f"LLM classifier selected '{workflow_name}'"
+    return "default research workflow"
+
+
+def _infer_workflow_path(*, query: str, project_root: Path, include_default: bool = True) -> Path | None:
     """Infer the appropriate workflow based on query content.
 
     v1 uses simple keyword matching. Priority order:
@@ -435,6 +583,7 @@ def _infer_workflow_path(*, query: str, project_root: Path) -> Path:
         "require review",
         "manager approval",
         "需要复核",
+        "主管复核",
         "主管审核",
         "需要审核",
     ]
@@ -457,6 +606,9 @@ def _infer_workflow_path(*, query: str, project_root: Path) -> Path:
     ]
     if any(keyword in lowered for keyword in support_keywords):
         return (project_root / "workflows" / "customer_support_brief.yaml").resolve()
+
+    if not include_default:
+        return None
 
     # Default: research workflow
     return (project_root / "workflows" / "deep_research.yaml").resolve()
@@ -483,6 +635,23 @@ def _resolve_review_workflow_path(*, task_id: str, project_root: Path, explicit_
 
 def _handle_run_command(args) -> None:
     _load_optional_dotenv()
+
+    # Phase 9/9A: route first, enforce mode semantics before touching files/LLM
+    explicit_mode = getattr(args, "mode", None)
+    decision = route_task(args.query, explicit_mode=explicit_mode)
+
+    if should_only_log(decision) and not getattr(args, "force_run", False):
+        decision_dict = route_decision_to_dict(decision)
+        decision_dict["_note"] = "Route is log/off — no workflow executed. Use --force-run to run anyway."
+        print(json.dumps(decision_dict, ensure_ascii=False, indent=2))
+        return
+
+    if requires_future_runner(decision) and not getattr(args, "force_run", False):
+        decision_dict = route_decision_to_dict(decision)
+        decision_dict["_note"] = "Orchestrated runner is not implemented yet. Use --force-run to fall back to controlled mode."
+        print(json.dumps(decision_dict, ensure_ascii=False, indent=2))
+        return
+
     workflow_path = Path(args.workflow).resolve()
     workflow = load_workflow(workflow_path)
 
@@ -501,7 +670,25 @@ def _handle_run_command(args) -> None:
         llm_overrides=llm_overrides,
     )
     state, result = scheduler.run(query=args.query)
-    print(json.dumps({"result": result.model_dump(), "state": state.metadata.to_dict()}, ensure_ascii=False, indent=2))
+    state.record_route_decision(route_decision_to_dict(decision))
+    preview = build_sales_preview(state)
+    if args.raw:
+        payload = build_raw_payload(state=state, result=result, extra_preview=preview)
+    else:
+        payload = build_run_payload(
+            query=args.query,
+            workflow_name=str(workflow.get("name", workflow_path.stem)),
+            state=state,
+            result=result,
+            project_root=workflow_path.parent.parent,
+            extra_preview=preview,
+            llm_overrides=llm_overrides,
+        )
+    fmt = getattr(args, "format", "json")
+    if fmt == "text":
+        print(format_run_text(payload))
+    else:
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
 
 
 def _parse_llm_config(args) -> dict:
@@ -723,6 +910,84 @@ def _handle_project_context_command(args) -> None:
     for item in structure.top_level_items[:10]:
         type_str = "[DIR]" if item.is_directory else "[FILE]"
         print(f"  {type_str} {item.name}")
+
+
+
+def _read_report_paths(project_root: Path, task_id: str) -> tuple[str | None, str | None]:
+    """Extract report and evidence paths from the real report JSON structure.
+
+    The report written by ConvergenceReportWriter is a top-level dict with
+    ``artifact_summary.report_path`` — NOT ``{"result": {...}}``.
+    Evidence path follows the conventional location.
+    """
+    report_file = project_root / "outputs" / "reports" / f"{task_id}.json"
+    rp: str | None = None
+    if report_file.exists():
+        try:
+            report_data = json.loads(report_file.read_text(encoding="utf-8"))
+            artifacts = report_data.get("artifact_summary", {})
+            if isinstance(artifacts, dict):
+                raw = artifacts.get("report_path")
+                rp = raw if isinstance(raw, str) else None
+        except Exception:
+            rp = None
+
+    evidence_file = project_root / "outputs" / "evidence" / f"{task_id}.json"
+    ep: str | None = str(evidence_file) if evidence_file.exists() else None
+
+    return rp, ep
+
+
+def _handle_status_command(args) -> None:
+    """Show live run status for a task."""
+    project_root = Path.cwd()
+    state_path = project_root / "outputs" / "states" / f"{args.task_id}.json"
+    if not state_path.exists():
+        print(f"State not found for task: {args.task_id}")
+        return
+
+    state = StateCenter.load_from(state_path)
+
+    rp, ep = _read_report_paths(project_root, args.task_id)
+    workflow_total = getattr(state.metadata, "workflow_total", None)
+    view = build_live_view(state, workflow_total=workflow_total, report_path=rp, evidence_path=ep)
+    print(render_live_view(view))
+
+
+def _handle_watch_command(args) -> None:
+    """Watch run status — polls state file until terminal or --once."""
+    import time as _time
+
+    project_root = Path.cwd()
+    state_path = project_root / "outputs" / "states" / f"{args.task_id}.json"
+
+    if not state_path.exists():
+        print(f"State not found for task: {args.task_id}")
+        return
+
+    while True:
+        if not state_path.exists():
+            print(f"State file disappeared for task: {args.task_id}")
+            return
+
+        try:
+            state = StateCenter.load_from(state_path)
+        except Exception:
+            print(f"Failed to load state for task: {args.task_id}")
+            return
+
+        rp, ep = _read_report_paths(project_root, args.task_id)
+        workflow_total = getattr(state.metadata, "workflow_total", None)
+        view = build_live_view(state, workflow_total=workflow_total, report_path=rp, evidence_path=ep)
+        print(render_live_view(view))
+
+        status = state.metadata.status
+        if is_terminal(status) or args.once:
+            if not is_terminal(status) and args.once:
+                print("(run is still in progress; use watch without --once to keep watching)")
+            return
+
+        _time.sleep(max(0.1, args.interval))
 
 
 if __name__ == "__main__":

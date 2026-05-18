@@ -24,6 +24,10 @@ class StateMetadata:
         status: str = "running",
         failure_reason: str = "",
         completion_reason: str = "",
+        workflow_total: int | None = None,
+        run_mode: str = "controlled",
+        updated_at: str = "",
+        route_decision: dict[str, object] | None = None,
     ):
         self.task_id = task_id
         self.original_query = original_query
@@ -31,16 +35,27 @@ class StateMetadata:
         self.status = status
         self.failure_reason = failure_reason
         self.completion_reason = completion_reason
+        self.workflow_total = workflow_total
+        self.run_mode = run_mode
+        self.updated_at = updated_at or created_at
+        self.route_decision = route_decision
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        result: dict[str, Any] = {
             "task_id": self.task_id,
             "original_query": self.original_query,
             "created_at": self.created_at,
             "status": self.status,
             "failure_reason": self.failure_reason,
             "completion_reason": self.completion_reason,
+            "run_mode": self.run_mode,
+            "updated_at": self.updated_at,
         }
+        if self.workflow_total is not None:
+            result["workflow_total"] = self.workflow_total
+        if self.route_decision is not None:
+            result["route_decision"] = self.route_decision
+        return result
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "StateMetadata":
@@ -51,6 +66,10 @@ class StateMetadata:
             status=data.get("status", "running"),
             failure_reason=data.get("failure_reason", ""),
             completion_reason=data.get("completion_reason", ""),
+            workflow_total=data.get("workflow_total"),
+            run_mode=data.get("run_mode", "controlled"),
+            updated_at=data.get("updated_at", ""),
+            route_decision=data.get("route_decision"),
         )
 
 
@@ -290,8 +309,9 @@ class StateCenter:
         return state
 
     def set_status(self, status: str, reason: str = "") -> None:
-        """????????????????????"""
+        """设置运行状态，根据状态类型更新失败原因或完成原因"""
         self.metadata.status = status
+        self.metadata.updated_at = utc_now_iso()
         if status in {"failed", "timed_out", "guardrail_blocked"}:
             self.metadata.failure_reason = reason
             self.metadata.completion_reason = ""
@@ -301,6 +321,22 @@ class StateCenter:
         else:
             self.metadata.failure_reason = ""
             self.metadata.completion_reason = ""
+
+    def record_route_decision(self, decision: dict[str, object]) -> None:
+        """Record a task route decision in metadata and execution trace."""
+        self.metadata.route_decision = decision
+        self.metadata.run_mode = str(decision.get("run_mode", "controlled"))
+        self.execution_trace.append({
+            "event": "route_decision",
+            "task_size": decision.get("task_size", ""),
+            "run_mode": decision.get("run_mode", ""),
+            "risk_level": decision.get("risk_level", ""),
+            "task_type": decision.get("task_type", ""),
+            "reasons": decision.get("reasons", []),
+            "user_override": decision.get("user_override", False),
+            "runtime_support": decision.get("runtime_support", ""),
+            "timestamp": utc_now_iso(),
+        })
 
     def _trim_value(self, value: Any) -> Any:
         """截断大值用于视图"""

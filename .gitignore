@@ -2,6 +2,7 @@
 .env.*
 !.env.example
 
+.venv/
 outputs/
 .pytest_cache/
 __pycache__/
@@ -18,3 +19,10 @@ test_output.json
 
 .DS_Store
 Thumbs.db
+
+# .claude/ — phase-specs and project-skills are project assets (tracked);
+# projects/ and settings*.json are local session state (ignored).
+.claude/projects/
+.claude/settings*.json
+tmp/
+*.orig
