@@ -90,21 +90,6 @@ class RecoveryAttemptKey:
     step_name: str = ""
 
 
-# =============================================================================
-# Capability set
-# =============================================================================
-
-_RUNTIME_CAPABILITY_ACTIONS: frozenset[str] = frozenset({
-    "retry",
-    "retry_with_backoff",
-    "request_evidence",
-    "replan",
-    "compress_context",
-    "fallback_model_or_provider",
-    "human_review",
-    "fail",
-})
-
 
 # =============================================================================
 # Recovery matrix — max attempts per hint under controlled mode

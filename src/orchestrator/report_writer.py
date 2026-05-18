@@ -137,6 +137,7 @@ class ConvergenceReportWriter:
             ),
             "memory_summary": self._build_memory_summary(memory_bundle, retrieved_memories),
             "failure_summary": self._build_failure_summary(failure_record),
+            "recovery_summary": self._build_recovery_summary(state),
             "evidence_summary": self._build_evidence_summary(evidence_packs or []),
         }
 
@@ -428,4 +429,30 @@ class ConvergenceReportWriter:
             "severity": None,
             "agent_name": None,
             "reason": None,
+        }
+
+    def _build_recovery_summary(self, state: StateCenter) -> dict:
+        for e in reversed(state.execution_trace):
+            if e.get("event") == "recovery_decision":
+                return {
+                    "action": str(e.get("action", "")),
+                    "reason": str(e.get("reason", "")),
+                    "failure_category": str(e.get("failure_category", "")),
+                    "failure_reason": str(e.get("failure_reason", "")),
+                    "attempt_count": e.get("attempt_count", 0),
+                    "max_attempts": e.get("max_attempts", 0),
+                    "terminal": e.get("terminal"),
+                    "runtime_supported": e.get("runtime_supported"),
+                    "next_step_hint": str(e.get("next_step_hint", "")) or None,
+                }
+        return {
+            "action": None,
+            "reason": None,
+            "failure_category": None,
+            "failure_reason": None,
+            "attempt_count": None,
+            "max_attempts": None,
+            "terminal": None,
+            "runtime_supported": None,
+            "next_step_hint": None,
         }
