@@ -15,7 +15,7 @@ from .llm_providers import describe_providers, list_providers
 from .project_context import ProjectContext
 from .live_view import build_live_view, is_terminal, render_live_view
 from .regression_compare import RegressionCompare, RegressionSignal, format_regression_report
-from .sales_preview import build_sales_preview
+
 from .task_router import (
     requires_future_runner,
     route_task,
@@ -387,7 +387,7 @@ def _handle_ask_command(args) -> None:
     # Record route decision in state
     state.record_route_decision(route_decision_to_dict(decision))
 
-    preview = build_sales_preview(state)
+    preview = None
     if args.raw:
         payload = build_raw_payload(state=state, result=result, extra_preview=preview)
     else:
@@ -671,7 +671,7 @@ def _handle_run_command(args) -> None:
     )
     state, result = scheduler.run(query=args.query)
     state.record_route_decision(route_decision_to_dict(decision))
-    preview = build_sales_preview(state)
+    preview = None
     if args.raw:
         payload = build_raw_payload(state=state, result=result, extra_preview=preview)
     else:
