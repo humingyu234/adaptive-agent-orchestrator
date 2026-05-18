@@ -7,6 +7,7 @@ import subprocess
 import tempfile
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+from pathlib import PureWindowsPath
 from typing import Any
 
 
@@ -140,11 +141,26 @@ class CodexProvider(CLIProvider):
         self.timeout = timeout
 
     def _resolve_codex_command(self) -> list[str]:
-        for candidate in ("codex.exe", "codex.cmd", "codex"):
+        candidates = ("codex.exe", "codex.cmd", "codex")
+        for candidate in candidates:
             path = shutil.which(candidate)
             if path:
-                return [path]
+                return self._normalize_codex_command(path)
         return ["codex"]
+
+    def _normalize_codex_command(self, path: str) -> list[str]:
+        # On WSL, PATH may resolve to Windows launchers like /mnt/c/.../codex.cmd.
+        # Invoke them through cmd.exe so they remain executable from Linux.
+        if os.name != "nt" and path.lower().endswith((".cmd", ".bat")):
+            return ["cmd.exe", "/c", self._to_windows_path(path)]
+        return [path]
+
+    def _to_windows_path(self, path: str) -> str:
+        if path.startswith("/mnt/") and len(path) > 6:
+            drive = path[5]
+            remainder = path[6:].replace("/", "\\")
+            return str(PureWindowsPath(f"{drive}:{remainder}"))
+        return path
 
     def complete(
         self,
@@ -179,13 +195,14 @@ class CodexProvider(CLIProvider):
                     output_path,
                     "-",
                 ],
-                input=prompt,
+                input=prompt.encode("utf-8"),
                 capture_output=True,
-                text=True,
                 timeout=self.timeout,
             )
+            stdout = result.stdout.decode("utf-8", errors="replace").strip()
+            stderr = result.stderr.decode("utf-8", errors="replace").strip()
             if result.returncode != 0:
-                details = (result.stderr or result.stdout).strip()
+                details = stderr or stdout
                 raise RuntimeError(f"Codex CLI failed: {details}")
 
             file_output = ""
@@ -196,7 +213,6 @@ class CodexProvider(CLIProvider):
             if file_output:
                 return file_output
 
-            stdout = result.stdout.strip()
             if stdout:
                 return stdout
 
