@@ -1,4 +1,4 @@
-﻿# 项目日志
+# 项目日志
 
 ## 2026-04-11
 
@@ -625,6 +625,13 @@
   - Agent Health 追踪 ✅
   - LLM Provider 抽象 ✅
   - 真实工具集成 ✅
-- **整体完成度：约 98%**
-- **8 层架构基本完整**
+- **整体完成度：约 95%（核心 9 层中 8 层已实现，Execution Fabric 层设计已完成待实现）**
+- **9 层架构：8 层已实现 + Execution Fabric 层已完成系统设计**
 
+## 2026-04-30 架构风险约束记账
+- 根据辅助计划审阅，补充记录以下后续风险点；本次只记账，不进入立即实现：
+  - Planning Council 需要成本边界，简单任务应走规则 fast path，复杂任务再进入多模型规划讨论
+  - CC / 外部 Worker 长时间运行时，现有 LiveInterrupt 的 step 边界检查不足以处理中途暂停，需要在 Worker Contract 中补中断检查、超时和半成品处理约定
+  - 当前 checkpoint-backed replan 偏向计划内回滚，还缺进程崩溃后扫描未完成任务并从最近 checkpoint 恢复的 durable task state 入口
+  - parallel_batch_runner 第一阶段只做批量验证和 demo 样本生成，不做多 worker 并行结果合并；合并、冲突处理、缺失 worker 降级留给 Execution Router 后续阶段
+  - background queue / overnight summary 有长期价值，但不进入第一批；当前仍优先打穿 ask 输出、status / resume、review policy、planning_council 最小版和 demo 命令链

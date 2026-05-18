@@ -1,4 +1,4 @@
-﻿# 项目状态
+# 项目状态
 
 ## 当前主线
 
@@ -13,7 +13,7 @@
 - 类型：编排引擎 / 运行时内核
 - 重点：共享状态、显式契约、运行时评估、收敛控制、诚实降级
 - 长期目标：Human -> Supervisor Agent -> Worker Agents
-- 完整生态方向：8 层多智能体生态（Human / Supervisor / Runtime / Worker / Tools / Context / Memory / Feedback）
+- 完整生态方向：9 层多智能体生态（Human / Supervisor / Execution Fabric / Runtime / Worker / Tools / Context / Memory / Feedback）
 - 当前一周实现重点：先做可运行 runtime core
 - 运行形态：CLI 优先
 - 技术栈：Python + Pydantic + PyYAML
@@ -103,6 +103,7 @@
 
 - 当前设计基线：`docs/architecture.md`
 - 完整生态蓝图 v2：`docs/ecosystem_architecture_v2.md`
+- 并行执行分发层设计：`docs/design_execution_fabric.md`
 - 下一对话框衔接文档：`docs/next_session_handoff.md`
 - 工作方式路线：`docs/workflow_evolution.md`
 - 项目关系说明：`docs/project_relationships.md`
@@ -112,9 +113,9 @@
 - 历史推进记录：`PROJECT_LOG.md`
 
 ## 决策记录约定
-- 关键模块和关键取舍统一记录在：docs/decisions/ 
-- 索引文件：docs/decisions/README.md 
-- 模板文件：docs/decisions/000-template.md 
+- 关键模块和关键取舍统一记录在：docs/decisions/
+- 索引文件：docs/decisions/README.md
+- 模板文件：docs/decisions/000-template.md
 - 后续每做一个关键模块，都要同步沉淀一份设计与取舍记录。
 
 ## 当前最新进展
@@ -257,4 +258,18 @@
   - 后续需要在关键里程碑自动做 alignment check，确认当前方向是否仍符合原始目标
   - 可结合 supervisor 巡检、Evaluator、checkpoint、human review，在低置信度或高风险时暂停给人确认
   - 目标是减少长任务越跑越偏、最后产物不符合预期的问题
+- 核心主线偏差纠正（高优先级）
+  - 用户从一开始真正要的不是“只能挑已有 workflow 来跑”的系统，而是“给一个复杂任务，生态自己先理解、讨论、形成方案、让用户确认，再组织 agent / workflow / LLM 去执行”
+  - 用户需要能在一开始说明“做到哪一步先让我 review”，例如“技术方案后暂停”“写代码前先问我”“每完成一个阶段找我确认”
+  - 用户也需要能在任务进行中临时插入 review，而不是只能依赖 workflow 里预先写死的 human_review 节点
+  - 当前项目虽然已经具备 Scheduler、StateCenter、Evaluator、checkpoint、human_review、provider、analyze 等底座，但还没有完整打穿上述核心体验
+  - 后续不应继续被 README、展示材料、小路由修复、零散模块收敛带跑
+  - 下一阶段主线应该直接围绕 Execution Plan Preview、User Review Checkpoint Policy、Runtime Interrupt / Review Injection、Multi-Model Planning Council、Dynamic Workflow Composer 推进
+  - 这不是普通 TODO，而是项目从“已有 workflow runtime”走向“用户给任务，生态组织执行”的关键主线
+- 已识别但暂不执行的架构风险约束
+  - Planning Council 不能默认用于所有任务，否则简单任务会被多模型规划成本拖慢；后续需要先用规则做 simple / complex fast path 分流，再让复杂任务进入 council
+  - CC / 外部 Worker 作为长任务执行体时，当前 LiveInterrupt 只在 agent step 边界检查信号，无法天然中断长时间运行中的 worker；后续 Worker Contract 需要约定中断检查、超时和半成品处理策略
+  - 当前 checkpoint-backed replan 主要覆盖计划内回滚，还缺进程崩溃、机器重启、OOM 后扫描未完成任务并从最近 checkpoint 恢复的 durable task state 入口
+  - parallel_batch_runner 第一阶段只应做批量验证和 demo 样本生成，不做真正并行结果合并；多 worker 结果合并、冲突处理、缺失 worker 降级属于 Execution Router 后续阶段
+  - background queue / overnight summary 有长期价值，但当前不进入第一批实现；先把 ask / status / resume / review policy / demo 链路打穿
 

@@ -1,4 +1,4 @@
-﻿# 市场信号与能力积累方向
+# 市场信号与能力积累方向
 
 ## 1. 这份文档是做什么的
 
@@ -246,27 +246,27 @@
 
 以下是整理这份方向判断时参考的部分真实岗位：
 
-- RYZ Labs – Applied AI Engineer  
+- RYZ Labs – Applied AI Engineer
   https://jobs.lever.co/RyzLabs/f15d2e8b-31b6-4cff-837b-38aeed6c9791
-- Boson AI – Member of Technical Staff, Agent Platform (Agent OS)  
+- Boson AI – Member of Technical Staff, Agent Platform (Agent OS)
   https://jobs.lever.co/bosonai/35858631-de70-4ddf-b310-ea9417af3b29
-- Kumo – AI Engineer, Relational Foundation Models & Agentic Systems  
+- Kumo – AI Engineer, Relational Foundation Models & Agentic Systems
   https://jobs.lever.co/kumo/df6990cb-ce02-4be4-be3f-970a244fa0ea
-- Netomi – Senior Product Manager, Autonomous Agents  
+- Netomi – Senior Product Manager, Autonomous Agents
   https://jobs.lever.co/netomi/c83a8721-a18f-4e31-93b6-057b97d21e38
-- Tandems – AI Platform Engineer  
+- Tandems – AI Platform Engineer
   https://jobs.lever.co/tandems/f9674954-40c0-47cf-a7bf-e78dfe51e3b1
-- StackAdapt – Automation Engineer, Agentic Orchestration  
+- StackAdapt – Automation Engineer, Agentic Orchestration
   https://jobs.lever.co/stackadapt/3031d6fa-4f16-437c-8c9b-a9aae8e90f18
-- Anomali – Senior Agentic AI Engineer (Cybersecurity)  
+- Anomali – Senior Agentic AI Engineer (Cybersecurity)
   https://jobs.lever.co/anomali/c9f77f77-abc6-432e-bb12-531441f640a2
-- Anomali – Senior Engineer, AI Evaluation & Reliability (Agentic AI)  
+- Anomali – Senior Engineer, AI Evaluation & Reliability (Agentic AI)
   https://jobs.lever.co/anomali/35848707-2902-48ec-af8d-d7c22fb7eb6d
-- HighLevel – Staff Product Manager, AI Platform  
+- HighLevel – Staff Product Manager, AI Platform
   https://jobs.lever.co/gohighlevel/7ae588d7-b7fe-4e71-87b7-f411229efafc
-- CI&T – AI Quality Engineer Senior, QA  
+- CI&T – AI Quality Engineer Senior, QA
   https://jobs.lever.co/ciandt/1e06dadb-5342-470d-a9a1-cb42755381a2
-- Netomi – SDE II, Agentic Engineer  
+- Netomi – SDE II, Agentic Engineer
   https://jobs.lever.co/netomi/c81f4efa-21e8-4098-b8f5-e8f49673c5b8
 
 ---
