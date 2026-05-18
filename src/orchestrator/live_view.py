@@ -138,6 +138,23 @@ def build_live_view(
                 }
                 break
 
+    # ---- recovery decision ----------------------------------------------------
+    last_recovery_decision: dict[str, Any] | None = None
+    for e in reversed(trace):
+        if e.get("event") == "recovery_decision":
+            last_recovery_decision = {
+                "action": str(e.get("action", "")),
+                "reason": str(e.get("reason", "")),
+                "failure_category": str(e.get("failure_category", "")),
+                "failure_reason": str(e.get("failure_reason", "")),
+                "attempt_count": e.get("attempt_count", 0),
+                "max_attempts": e.get("max_attempts", 0),
+                "terminal": e.get("terminal"),
+                "runtime_supported": e.get("runtime_supported"),
+                "next_step_hint": str(e.get("next_step_hint", "")) or None,
+            }
+            break
+
     # ---- failure-derived fields ----------------------------------------------
     last_failure: dict[str, str] | None = None
     last_failure_origin: str | None = None
@@ -214,6 +231,7 @@ def build_live_view(
         "last_evaluator_decision": last_evaluator_decision,
         "last_guardrail_decision": last_guardrail_decision,
         "last_policy_decision": last_policy_decision,
+        "last_recovery_decision": last_recovery_decision,
         "last_failure": last_failure,
         "last_failure_origin": last_failure_origin,
         "last_recovery_hint": last_recovery_hint,
@@ -277,9 +295,20 @@ def render_live_view(view: dict[str, Any]) -> str:
     if policy_dec:
         lines.append(
             f"  Policy:     {policy_dec.get('action', '')}"
-            f" target={policy_dec.get('target', '')}"
+            + (f" type={policy_dec.get('type', '')}" if policy_dec.get('type') else "")
+            + (f" target={policy_dec.get('target', '')}" if policy_dec.get('target') else "")
             + (f" ({policy_dec.get('reason', '')})" if policy_dec.get('reason') else "")
         )
+
+    recovery_dec = view.get("last_recovery_decision")
+    if recovery_dec:
+        lines.append(
+            f"  Recovery:   {recovery_dec.get('action', '')}"
+            f" attempt={recovery_dec.get('attempt_count', 0)}/{recovery_dec.get('max_attempts', 0)}"
+            + (f" ({recovery_dec.get('reason', '')})" if recovery_dec.get('reason') else "")
+        )
+        if not recovery_dec.get("runtime_supported", True):
+            lines.append(f"             !! runtime does not support this action")
 
     # ---- last decision (legacy / summary) ------------------------------------
     decision = view.get("last_decision")

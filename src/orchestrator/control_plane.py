@@ -22,6 +22,7 @@ from .failure_taxonomy import (
 from .guardrails import GuardrailManager, GuardrailViolation, build_default_guardrail_manager
 from .models import EvalCriteriaItem, EvalResult
 from .policy import Policy
+from .recovery import RecoveryDecision, RecoveryPlaybook, build_default_playbook
 
 # EvalResult.action uses "re_plan" (with underscore); ControlAction uses "replan"
 _EVAL_ACTION_TO_CONTROL: dict[str, ControlAction] = {
@@ -58,14 +59,20 @@ class ControlPlane:
         evaluator: Evaluator | None = None,
         guardrail_manager: GuardrailManager | None = None,
         policy: Policy | None = None,
+        recovery_playbook: RecoveryPlaybook | None = None,
     ) -> None:
         self._evaluator = evaluator or Evaluator()
         self._guardrail = guardrail_manager or build_default_guardrail_manager()
         self._policy: Policy | None = policy
+        self._playbook = recovery_playbook or build_default_playbook()
 
     def set_policy(self, policy: Policy) -> None:
         """Set the active policy for runtime enforcement."""
         self._policy = policy
+
+    def set_playbook(self, playbook: RecoveryPlaybook) -> None:
+        """Set the active recovery playbook."""
+        self._playbook = playbook
 
     def _get_policy(self) -> Policy:
         """Return the active policy or a permissive default."""
@@ -368,6 +375,32 @@ class ControlPlane:
             failure_origin="policy",
             recovery_hint="request_evidence",
             evidence_required=True,
+        )
+
+    # ------------------------------------------------------------------
+    # recovery — bounded recovery decisions
+    # ------------------------------------------------------------------
+
+    def decide_recovery(
+        self,
+        failure_record: FailureRecord,
+        *,
+        attempt_count: int = 0,
+        run_mode: str = "controlled",
+        task_id: str = "",
+        step_name: str = "",
+    ) -> RecoveryDecision:
+        """Produce a bounded recovery decision from a FailureRecord.
+
+        Runner-agnostic entry point.  The playbook owns the matrix;
+        this method just routes.
+        """
+        return self._playbook.decide(
+            failure_record,
+            attempt_count=attempt_count,
+            run_mode=run_mode,
+            task_id=task_id,
+            step_name=step_name,
         )
 
     # ------------------------------------------------------------------

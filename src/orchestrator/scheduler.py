@@ -8,7 +8,7 @@ from time import perf_counter
 from .control_plane import ControlPlane
 from .evidence import evidence_packs_from_logs
 from .evaluator import Evaluator
-from .failure_taxonomy import FailureCategory, FailureRecord
+from .failure_taxonomy import FailureCategory, FailureOrigin, FailureRecord, FailureSeverity
 from .guardrails import GuardrailViolation
 from .live_interrupt import InterruptSignal, LiveInterruptController
 from .llm_client import LLMClient
@@ -16,6 +16,7 @@ from .llm_providers import get_provider
 from .memory_manager import MemoryManager
 from .models import EvalResult, RunResult
 from .policy import Policy, load_policy
+from .recovery import AttemptTracker, RecoveryAttemptKey, RecoveryDecision, RecoveryPlaybook
 from .registry import get_agent
 from .project_context import ProjectContext
 from .report_writer import ConvergenceReportWriter
@@ -57,10 +58,15 @@ class Scheduler:
         use_orchestrator: bool = True,
         llm_overrides: dict[str, dict[str, str | None]] | None = None,
         policy: Policy | None = None,
+        recovery_playbook: RecoveryPlaybook | None = None,
     ):
         self.workflow = workflow
         self.evaluator = Evaluator()
-        self.control_plane = ControlPlane(evaluator=self.evaluator, policy=policy)
+        self.control_plane = ControlPlane(
+            evaluator=self.evaluator,
+            policy=policy,
+            recovery_playbook=recovery_playbook,
+        )
         self.project_root = Path(project_root) if project_root else Path.cwd()
         self.memory_manager = MemoryManager(self.project_root)
         self.project_context = ProjectContext(self.project_root)
@@ -76,6 +82,8 @@ class Scheduler:
                 stall_threshold=3,
             )
         self._policy = policy or Policy.defaults()
+        self._attempt_tracker = AttemptTracker()
+        self._playbook = recovery_playbook or RecoveryPlaybook()
 
     def run(self, query: str) -> tuple[StateCenter, RunResult]:
         state = StateCenter(query=query, max_steps=self.workflow.get("max_steps", 10))
@@ -336,15 +344,27 @@ class Scheduler:
                             current_index = target_index
                             continue
 
-                return self._finalize_run(
+                recovery_result = self._handle_failure_with_recovery(
                     state=state,
-                    status="failed",
-                    final_node=agent_name,
-                    reason=error_message,
+                    agents=agents,
+                    current_index=current_index,
+                    agent_name=agent_name,
+                    output=None,
+                    error_message=error_message,
                     failure_category=FailureCategory.GUARDRAIL_BLOCKED
                     if status == "guardrail_blocked"
-                    else None,
+                    else FailureCategory.UNKNOWN,
+                    failure_reason="input_guardrail_blocked"
+                    if status == "guardrail_blocked"
+                    else "unknown",
+                    failure_origin="control_plane"
+                    if status == "guardrail_blocked"
+                    else "scheduler",
                 )
+                if isinstance(recovery_result, int):
+                    current_index = recovery_result
+                    continue
+                return recovery_result
 
             if self.orchestrator:
                 self.orchestrator.mark_agent_completed(agent_name, output)
@@ -520,26 +540,43 @@ class Scheduler:
                     state.set_status("failed", reason)
                     if self.orchestrator:
                         self.orchestrator.mark_agent_failed(agent_name, reason)
-                    return self._finalize_run(
+                    recovery_result = self._handle_failure_with_recovery(
                         state=state,
-                        status="failed",
-                        final_node=agent_name,
-                        reason=reason,
+                        agents=agents,
+                        current_index=current_index,
+                        agent_name=agent_name,
+                        output=output,
+                        error_message=reason,
                         failure_category=FailureCategory.TOOL_ERROR,
+                        failure_reason="tool_failed",
+                        failure_origin="scheduler",
                     )
+                    if isinstance(recovery_result, int):
+                        current_index = recovery_result
+                        continue
+                    return recovery_result
                 continue
 
             reason = eval_result.reason or f"{agent_name} 未通过评估"
             state.set_status("failed", reason)
             if self.orchestrator:
                 self.orchestrator.mark_agent_failed(agent_name, reason)
-            return self._finalize_run(
+            recovery_result = self._handle_failure_with_recovery(
                 state=state,
-                status="failed",
-                final_node=agent_name,
-                reason=reason,
+                agents=agents,
+                current_index=current_index,
+                agent_name=agent_name,
+                output=output,
+                error_message=reason,
                 failure_category=FailureCategory.TASK_QUALITY_ERROR,
+                failure_reason="evaluation_failed",
+                failure_origin="control_plane",
             )
+            if isinstance(recovery_result, int):
+                current_index = recovery_result
+                if current_index < len(agents):
+                    continue
+            return recovery_result
 
         final_node = agents[-1]["name"] if agents else None
         if agents and not self._can_complete_after_agent(
@@ -818,6 +855,142 @@ class Scheduler:
             state.execution_trace.append(event)
 
         return events
+
+    def _handle_failure_with_recovery(
+        self,
+        *,
+        state: StateCenter,
+        agents: list[dict],
+        current_index: int,
+        agent_name: str,
+        output: dict | None,
+        error_message: str,
+        failure_category: FailureCategory,
+        failure_reason: str = "",
+        failure_origin: FailureOrigin = "scheduler",
+    ) -> tuple[StateCenter, RunResult] | int:
+        """Handle a failure through the recovery playbook.
+
+        Returns:
+            A (state, result) tuple if the failure is terminal,
+            or a new agent index to jump to (retry/replan).
+        """
+        recovery_hint = None
+        try:
+            from .failure_taxonomy import FailureReason as _FR
+            reason_enum = _FR(failure_reason)
+            from .failure_taxonomy import RECOVERY_HINT_MAP as _RHM
+            recovery_hint = _RHM.get(reason_enum)
+        except (ValueError, TypeError):
+            pass
+
+        failure_record = self.control_plane.create_failure_record(
+            category=failure_category,
+            agent_name=agent_name,
+            reason=failure_reason or error_message,
+        )
+        if recovery_hint:
+            failure_record.recovery_hint = recovery_hint
+
+        attempt_key = RecoveryAttemptKey(
+            task_id=state.metadata.task_id,
+            agent_name=agent_name,
+            failure_category=failure_category.value,
+            failure_reason=failure_reason or error_message[:80],
+        )
+        attempt_count = self._attempt_tracker.record(attempt_key)
+
+        recovery = self.control_plane.decide_recovery(
+            failure_record,
+            attempt_count=attempt_count - 1,
+            run_mode=self._policy.mode,
+            task_id=state.metadata.task_id,
+            step_name=agent_name,
+        )
+
+        state.execution_trace.append(
+            {
+                "event": "recovery_decision",
+                "agent_name": agent_name,
+                "failure_category": recovery.failure_category,
+                "failure_reason": recovery.failure_reason,
+                "recovery_hint": recovery.recovery_hint,
+                "action": recovery.action,
+                "reason": recovery.reason,
+                "attempt_count": recovery.attempt_count,
+                "max_attempts": recovery.max_attempts,
+                "delay_seconds": recovery.delay_seconds,
+                "terminal": recovery.terminal,
+                "requires_human_review": recovery.requires_human_review,
+                "runtime_supported": recovery.runtime_supported,
+                "next_step_hint": recovery.next_step_hint,
+                "timestamp": utc_now_iso(),
+            }
+        )
+
+        if self._policy.mode == "log":
+            return self._finalize_run(
+                state=state,
+                status="failed",
+                final_node=agent_name,
+                reason=error_message,
+                failure_category=failure_category,
+            )
+
+        if recovery.action == "retry" and not recovery.terminal:
+            return current_index
+
+        if recovery.action == "retry_with_backoff" and not recovery.terminal:
+            return current_index
+
+        if recovery.action == "replan" and not recovery.terminal:
+            planner_index = next(
+                (i for i, node in enumerate(agents) if node["name"] == "planner"),
+                None,
+            )
+            if planner_index is not None:
+                self._prepare_replan(state)
+                state.execution_trace.append(
+                    {
+                        "event": "recovery_replan",
+                        "reason": recovery.reason,
+                        "timestamp": utc_now_iso(),
+                    }
+                )
+                return planner_index
+            return self._finalize_run(
+                state=state,
+                status="needs_human_review",
+                final_node=agent_name,
+                reason=f"Replan requested but no planner in workflow: {recovery.reason}",
+                failure_category=FailureCategory.POLICY_ERROR,
+            )
+
+        if recovery.action == "request_evidence":
+            return self._finalize_run(
+                state=state,
+                status="needs_human_review",
+                final_node=agent_name,
+                reason=error_message or recovery.reason,
+                failure_category=failure_category,
+            )
+
+        if recovery.action == "needs_human_review":
+            return self._finalize_run(
+                state=state,
+                status="needs_human_review",
+                final_node=agent_name,
+                reason=error_message or recovery.reason,
+                failure_category=failure_category,
+            )
+
+        return self._finalize_run(
+            state=state,
+            status="failed",
+            final_node=agent_name,
+            reason=error_message or recovery.reason,
+            failure_category=failure_category,
+        )
 
     def _run_input_guardrails(self, *, agent, agent_name: str, view: dict) -> None:
         """Run input-stage guardrails through ControlPlane."""

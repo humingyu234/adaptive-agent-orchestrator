@@ -547,13 +547,14 @@ class TestExplicitFailureCategory:
             state, result = self._run_with_mocked_infer(
                 workflow=workflow, query="test query", project_root=tmp
             )
-            assert result.status == "failed"
-            classified = [
+            # Phase 11: recovery replaces failure_classified with recovery_decision
+            assert result.status in ("failed", "needs_human_review")
+            recovery_events = [
                 e for e in state.execution_trace
-                if e.get("event") == "failure_classified"
+                if e.get("event") == "recovery_decision"
             ]
-            assert len(classified) == 1
-            assert classified[0]["category"] == "tool_error"
+            assert len(recovery_events) >= 1
+            assert recovery_events[0]["failure_category"] == "tool_error"
 
     def test_evaluation_failed_does_not_call_infer(self):
         """Evaluation failure must not call infer_failure_category."""
@@ -587,13 +588,14 @@ class TestExplicitFailureCategory:
             state, result = self._run_with_mocked_infer(
                 workflow=workflow, query="test query", project_root=tmp
             )
-            assert result.status == "failed"
-            classified = [
+            # Phase 11: recovery replaces failure_classified with recovery_decision
+            assert result.status in ("failed", "needs_human_review")
+            recovery_events = [
                 e for e in state.execution_trace
-                if e.get("event") == "failure_classified"
+                if e.get("event") == "recovery_decision"
             ]
-            assert len(classified) == 1
-            assert classified[0]["category"] == "task_quality_error"
+            assert len(recovery_events) >= 1
+            assert recovery_events[0]["failure_category"] == "task_quality_error"
 
     def test_unknown_runtime_error_still_may_use_infer_fallback(self):
         """Unknown exception path is allowed to call infer_failure_category."""
