@@ -1,141 +1,473 @@
-"""失败分类体系
+"""Failure taxonomy with four-layer structure.
 
-定义系统可能遇到的各种失败类型，让失败处理更精细、更有针对性。
+Layers:
+  origin   — where the failure was first observed or reported
+  category — broad failure family
+  reason   — concrete machine-readable cause
+  recovery — bounded next action
+
+ControlPlane does not directly call LLM providers.  Provider/API failures are
+reported by a worker or provider layer and classified here.  ControlPlane-
+originated failures come from control decisions (evaluator, guardrails, policy).
+
+Attribution:
+  Provider error pattern lists are adapted from Hermes Agent (MIT):
+    NousResearch/hermes-agent/agent/error_classifier.py
 """
 
+from __future__ import annotations
+
+import random
+import threading
+import time
 from enum import Enum
 from typing import Any
 
+from .control_models import FailureOrigin, RecoveryHint
+
+
+# =============================================================================
+# Failure category — broad failure family
+# =============================================================================
 
 class FailureCategory(str, Enum):
-    """失败类型分类"""
+    """Broad failure family."""
 
-    # 格式相关
-    FORMAT_ERROR = "format_error"  # 输出格式不符合要求
-    MISSING_FIELD = "missing_field"  # 缺少必要字段
-    INVALID_TYPE = "invalid_type"  # 类型错误
+    PROVIDER_ERROR = "provider_error"
+    TASK_QUALITY_ERROR = "task_quality_error"
+    GUARDRAIL_BLOCKED = "guardrail_blocked"
+    TOOL_ERROR = "tool_error"
+    POLICY_ERROR = "policy_error"
+    UNKNOWN = "unknown"
 
-    # 内容相关
-    INSUFFICIENT_CONTENT = "insufficient_content"  # 内容不足
-    EMPTY_OUTPUT = "empty_output"  # 输出为空
-    QUALITY_BELOW_THRESHOLD = "quality_below_threshold"  # 质量不达标
 
-    # 评估相关
-    EVALUATION_FAILED = "evaluation_failed"  # 评估未通过
-    RETRY_EXHAUSTED = "retry_exhausted"  # 重试次数耗尽
+# =============================================================================
+# Failure reason — concrete machine-readable cause
+# =============================================================================
 
-    # 安全相关
-    GUARDRAIL_BLOCKED = "guardrail_blocked"  # 护栏拦截
-    PERMISSION_DENIED = "permission_denied"  # 权限不足
-    TRUST_LEVEL_INSUFFICIENT = "trust_level_insufficient"  # 信任级别不够
+class FailureReason(str, Enum):
+    """Concrete machine-readable cause within a failure category."""
 
-    # 执行相关
-    TIMEOUT = "timeout"  # 超时
-    MAX_STEPS_EXCEEDED = "max_steps_exceeded"  # 超过最大步数
-    AGENT_ERROR = "agent_error"  # Agent 执行错误
+    # Provider reasons
+    AUTH = "auth"
+    AUTH_PERMANENT = "auth_permanent"
+    BILLING = "billing"
+    RATE_LIMIT = "rate_limit"
+    TIMEOUT = "timeout"
+    OVERLOADED = "overloaded"
+    SERVER_ERROR = "server_error"
+    CONTEXT_OVERFLOW = "context_overflow"
+    MODEL_NOT_FOUND = "model_not_found"
+    FORMAT_ERROR = "format_error"
 
-    # 控制相关
-    SUPERVISOR_REJECTED = "supervisor_rejected"  # Supervisor 拒绝
-    REPLAN_FAILED = "replan_failed"  # 重规划失败
-    CHECKPOINT_RESTORE_FAILED = "checkpoint_restore_failed"  # 检查点恢复失败
+    # Task quality reasons
+    EVALUATION_FAILED = "evaluation_failed"
+    LOW_QUALITY_OUTPUT = "low_quality_output"
+    MISSING_REQUIRED_FIELD = "missing_required_field"
+    MISSING_EVIDENCE = "missing_evidence"
 
-    # 外部相关
-    TOOL_ERROR = "tool_error"  # 工具执行错误
-    LLM_ERROR = "llm_error"  # LLM 调用错误
-    EXTERNAL_SERVICE_ERROR = "external_service_error"  # 外部服务错误
+    # Guardrail reasons
+    INPUT_GUARDRAIL_BLOCKED = "input_guardrail_blocked"
+    OUTPUT_GUARDRAIL_BLOCKED = "output_guardrail_blocked"
+    SENSITIVE_CONTENT = "sensitive_content"
+    PROTECTED_ACTION = "protected_action"
 
-    # 未知
-    UNKNOWN = "unknown"  # 未知错误
+    # Tool reasons
+    TOOL_FAILED = "tool_failed"
+    EXACT_REPEATED_TOOL_FAILURE = "exact_repeated_tool_failure"
+    SAME_TOOL_REPEATED_FAILURE = "same_tool_repeated_failure"
+    IDEMPOTENT_NO_PROGRESS = "idempotent_no_progress"
 
+    # Policy reasons
+    PROTECTED_FILE_CHANGE = "protected_file_change"
+    HIGH_RISK_TOOL = "high_risk_tool"
+    REVIEWER_WRITE_ATTEMPT = "reviewer_write_attempt"
+    MISSING_REQUIRED_CHECK = "missing_required_check"
+
+    # Fallback
+    UNKNOWN = "unknown"
+
+
+# =============================================================================
+# Recovery hint guidance (human-readable)
+# =============================================================================
+
+RECOVERY_HINT_GUIDANCE: dict[RecoveryHint, str] = {
+    "continue": "Step passed; proceed normally.",
+    "retry": "Retry the step with a bounded limit.",
+    "retry_with_backoff": "Wait with jittered backoff, then retry.",
+    "request_evidence": "Ask the worker to provide missing evidence.",
+    "compress_context": "Context too large; compress and retry with a smaller payload.",
+    "fallback_model_or_provider": "Switch to a fallback model or provider route if available.",
+    "replan": "Replan the step with a different strategy.",
+    "needs_human_review": "Pause and request human review.",
+    "fail": "Stop the task; recovery is not possible.",
+}
+
+
+# =============================================================================
+# Failure severity
+# =============================================================================
 
 class FailureSeverity(str, Enum):
-    """失败严重程度"""
-
-    LOW = "low"  # 低：可以重试
-    MEDIUM = "medium"  # 中：需要调整策略
-    HIGH = "high"  # 高：需要人工介入
-    CRITICAL = "critical"  # 严重：系统级问题
+    LOW = "low"
+    MEDIUM = "medium"
+    HIGH = "high"
+    CRITICAL = "critical"
 
 
-# 失败类型到严重程度的默认映射
+# =============================================================================
+# Default severity map (reason -> severity)
+# =============================================================================
+
+_DEFAULT_REASON_SEVERITY: dict[FailureReason, FailureSeverity] = {
+    # Provider — transient
+    FailureReason.RATE_LIMIT: FailureSeverity.LOW,
+    FailureReason.TIMEOUT: FailureSeverity.LOW,
+    FailureReason.OVERLOADED: FailureSeverity.LOW,
+    FailureReason.SERVER_ERROR: FailureSeverity.LOW,
+    # Provider — hard
+    FailureReason.AUTH: FailureSeverity.HIGH,
+    FailureReason.AUTH_PERMANENT: FailureSeverity.CRITICAL,
+    FailureReason.BILLING: FailureSeverity.HIGH,
+    FailureReason.CONTEXT_OVERFLOW: FailureSeverity.LOW,
+    FailureReason.MODEL_NOT_FOUND: FailureSeverity.HIGH,
+    FailureReason.FORMAT_ERROR: FailureSeverity.HIGH,
+    # Quality
+    FailureReason.EVALUATION_FAILED: FailureSeverity.MEDIUM,
+    FailureReason.LOW_QUALITY_OUTPUT: FailureSeverity.MEDIUM,
+    FailureReason.MISSING_REQUIRED_FIELD: FailureSeverity.MEDIUM,
+    FailureReason.MISSING_EVIDENCE: FailureSeverity.MEDIUM,
+    # Guardrail
+    FailureReason.INPUT_GUARDRAIL_BLOCKED: FailureSeverity.HIGH,
+    FailureReason.OUTPUT_GUARDRAIL_BLOCKED: FailureSeverity.HIGH,
+    FailureReason.SENSITIVE_CONTENT: FailureSeverity.HIGH,
+    FailureReason.PROTECTED_ACTION: FailureSeverity.HIGH,
+    # Tool
+    FailureReason.TOOL_FAILED: FailureSeverity.MEDIUM,
+    FailureReason.EXACT_REPEATED_TOOL_FAILURE: FailureSeverity.MEDIUM,
+    FailureReason.SAME_TOOL_REPEATED_FAILURE: FailureSeverity.MEDIUM,
+    FailureReason.IDEMPOTENT_NO_PROGRESS: FailureSeverity.MEDIUM,
+    # Policy
+    FailureReason.PROTECTED_FILE_CHANGE: FailureSeverity.HIGH,
+    FailureReason.HIGH_RISK_TOOL: FailureSeverity.HIGH,
+    FailureReason.REVIEWER_WRITE_ATTEMPT: FailureSeverity.CRITICAL,
+    FailureReason.MISSING_REQUIRED_CHECK: FailureSeverity.MEDIUM,
+    # Fallback
+    FailureReason.UNKNOWN: FailureSeverity.MEDIUM,
+}
+
+
+# =============================================================================
+# Recovery action mapping (reason -> hint)
+# =============================================================================
+# A recovery hint is NOT the same thing as implemented runtime capability.
+# fallback_model_or_provider means "safe to solve by provider fallback IF such
+# a route exists."  If AAO does not yet have provider fallback wired, return
+# the hint clearly but do not pretend the runtime actually switched providers.
+
+RECOVERY_HINT_MAP: dict[FailureReason, RecoveryHint] = {
+    # Transient provider -> retry with backoff
+    FailureReason.RATE_LIMIT: "retry_with_backoff",
+    FailureReason.TIMEOUT: "retry_with_backoff",
+    FailureReason.OVERLOADED: "retry_with_backoff",
+    FailureReason.SERVER_ERROR: "retry_with_backoff",
+    # Context -> compress
+    FailureReason.CONTEXT_OVERFLOW: "compress_context",
+    # Model / routing
+    FailureReason.MODEL_NOT_FOUND: "fallback_model_or_provider",
+    FailureReason.AUTH: "fallback_model_or_provider",
+    # Hard failures -> do NOT retry
+    FailureReason.AUTH_PERMANENT: "fail",
+    FailureReason.BILLING: "fail",
+    FailureReason.FORMAT_ERROR: "fail",
+    # Quality
+    FailureReason.EVALUATION_FAILED: "retry",
+    FailureReason.LOW_QUALITY_OUTPUT: "retry",
+    FailureReason.MISSING_REQUIRED_FIELD: "retry",
+    FailureReason.MISSING_EVIDENCE: "request_evidence",
+    # Guardrail -> do NOT retry
+    FailureReason.INPUT_GUARDRAIL_BLOCKED: "fail",
+    FailureReason.OUTPUT_GUARDRAIL_BLOCKED: "fail",
+    FailureReason.SENSITIVE_CONTENT: "fail",
+    FailureReason.PROTECTED_ACTION: "needs_human_review",
+    # Tool loop -> replan, not retry
+    FailureReason.TOOL_FAILED: "retry",
+    FailureReason.EXACT_REPEATED_TOOL_FAILURE: "replan",
+    FailureReason.SAME_TOOL_REPEATED_FAILURE: "replan",
+    FailureReason.IDEMPOTENT_NO_PROGRESS: "replan",
+    # Policy
+    FailureReason.PROTECTED_FILE_CHANGE: "needs_human_review",
+    FailureReason.HIGH_RISK_TOOL: "needs_human_review",
+    FailureReason.REVIEWER_WRITE_ATTEMPT: "fail",
+    FailureReason.MISSING_REQUIRED_CHECK: "request_evidence",
+    # Fallback
+    FailureReason.UNKNOWN: "fail",
+}
+
+# Reasons that must never be blindly retried
+_NON_RETRYABLE_REASONS: frozenset[FailureReason] = frozenset({
+    FailureReason.AUTH_PERMANENT,
+    FailureReason.BILLING,
+    FailureReason.FORMAT_ERROR,
+    FailureReason.INPUT_GUARDRAIL_BLOCKED,
+    FailureReason.OUTPUT_GUARDRAIL_BLOCKED,
+    FailureReason.SENSITIVE_CONTENT,
+    FailureReason.EXACT_REPEATED_TOOL_FAILURE,
+    FailureReason.SAME_TOOL_REPEATED_FAILURE,
+    FailureReason.IDEMPOTENT_NO_PROGRESS,
+    FailureReason.REVIEWER_WRITE_ATTEMPT,
+    FailureReason.UNKNOWN,
+})
+
+
+# =============================================================================
+# Backward-compatible severity map (category -> severity)
+# =============================================================================
+
 DEFAULT_SEVERITY_MAP: dict[FailureCategory, FailureSeverity] = {
-    FailureCategory.FORMAT_ERROR: FailureSeverity.LOW,
-    FailureCategory.MISSING_FIELD: FailureSeverity.LOW,
-    FailureCategory.INVALID_TYPE: FailureSeverity.LOW,
-    FailureCategory.INSUFFICIENT_CONTENT: FailureSeverity.MEDIUM,
-    FailureCategory.EMPTY_OUTPUT: FailureSeverity.MEDIUM,
-    FailureCategory.QUALITY_BELOW_THRESHOLD: FailureSeverity.MEDIUM,
-    FailureCategory.EVALUATION_FAILED: FailureSeverity.MEDIUM,
-    FailureCategory.RETRY_EXHAUSTED: FailureSeverity.MEDIUM,
+    FailureCategory.PROVIDER_ERROR: FailureSeverity.MEDIUM,
+    FailureCategory.TASK_QUALITY_ERROR: FailureSeverity.MEDIUM,
     FailureCategory.GUARDRAIL_BLOCKED: FailureSeverity.HIGH,
-    FailureCategory.PERMISSION_DENIED: FailureSeverity.HIGH,
-    FailureCategory.TRUST_LEVEL_INSUFFICIENT: FailureSeverity.HIGH,
-    FailureCategory.TIMEOUT: FailureSeverity.MEDIUM,
-    FailureCategory.MAX_STEPS_EXCEEDED: FailureSeverity.MEDIUM,
-    FailureCategory.AGENT_ERROR: FailureSeverity.HIGH,
-    FailureCategory.SUPERVISOR_REJECTED: FailureSeverity.MEDIUM,
-    FailureCategory.REPLAN_FAILED: FailureSeverity.HIGH,
-    FailureCategory.CHECKPOINT_RESTORE_FAILED: FailureSeverity.HIGH,
     FailureCategory.TOOL_ERROR: FailureSeverity.MEDIUM,
-    FailureCategory.LLM_ERROR: FailureSeverity.HIGH,
-    FailureCategory.EXTERNAL_SERVICE_ERROR: FailureSeverity.HIGH,
+    FailureCategory.POLICY_ERROR: FailureSeverity.HIGH,
     FailureCategory.UNKNOWN: FailureSeverity.MEDIUM,
 }
 
 
+# =============================================================================
+# Provider error pattern lists
+# Adapted from Hermes Agent (MIT): agent/error_classifier.py
+# =============================================================================
+
+_BILLING_PATTERNS: list[str] = [
+    "insufficient credits",
+    "insufficient_quota",
+    "insufficient balance",
+    "credit balance",
+    "credits have been exhausted",
+    "top up your credits",
+    "payment required",
+    "billing hard limit",
+    "exceeded your current quota",
+    "account is deactivated",
+    "plan does not include",
+]
+
+_RATE_LIMIT_PATTERNS: list[str] = [
+    "rate limit",
+    "rate_limit",
+    "too many requests",
+    "throttled",
+    "requests per minute",
+    "tokens per minute",
+    "requests per day",
+    "try again in",
+    "please retry after",
+    "resource_exhausted",
+    "rate increased too quickly",
+    "throttlingexception",
+    "too many concurrent requests",
+    "servicequotaexceededexception",
+]
+
+
+# =============================================================================
+# FailureRecord
+# =============================================================================
+
 class FailureRecord:
-    """失败记录"""
+    """Structured failure record with origin, category, reason, and recovery."""
 
     def __init__(
         self,
         category: FailureCategory,
-        agent_name: str | None = None,
+        *,
+        origin: FailureOrigin = "unknown",
         reason: str = "",
+        recovery_hint: RecoveryHint | None = None,
+        agent_name: str | None = None,
         severity: FailureSeverity | None = None,
         context: dict[str, Any] | None = None,
     ):
+        self.origin: FailureOrigin = origin
         self.category = category
-        self.agent_name = agent_name
         self.reason = reason
-        self.severity = severity or DEFAULT_SEVERITY_MAP.get(category, FailureSeverity.MEDIUM)
+        self.recovery_hint = recovery_hint or _resolve_recovery_hint(category, reason)
+        self.agent_name = agent_name
+        self.severity = severity or _resolve_severity(category, reason)
         self.context = context or {}
 
     def to_dict(self) -> dict[str, Any]:
         return {
+            "origin": self.origin,
             "category": self.category.value,
-            "agent_name": self.agent_name,
             "reason": self.reason,
+            "recovery_hint": self.recovery_hint,
+            "agent_name": self.agent_name,
             "severity": self.severity.value,
             "context": self.context,
         }
 
+    @property
+    def is_retryable(self) -> bool:
+        """Whether this failure is safe to retry (even with backoff).
+
+        Judge by recovery_hint so the system is self-consistent: whatever the
+        hint map prescribes, is_retryable follows.
+        """
+        return self.recovery_hint in {"retry", "retry_with_backoff"}
+
+
+# =============================================================================
+# Classification helpers
+# =============================================================================
+
+def classify_provider_error(
+    error_message: str, status_code: int | None = None
+) -> FailureReason:
+    """Classify a provider/API error message into a concrete FailureReason."""
+    lowered = error_message.lower()
+
+    # Billing — check before rate_limit (some billing messages contain "quota")
+    for pattern in _BILLING_PATTERNS:
+        if pattern in lowered:
+            return FailureReason.BILLING
+
+    # Rate limit
+    for pattern in _RATE_LIMIT_PATTERNS:
+        if pattern in lowered:
+            return FailureReason.RATE_LIMIT
+
+    # Auth
+    if status_code in {401, 403}:
+        return FailureReason.AUTH
+    if "unauthorized" in lowered or "forbidden" in lowered or "invalid api key" in lowered:
+        return FailureReason.AUTH
+
+    # Context overflow
+    if "context" in lowered and (
+        "too large" in lowered
+        or "overflow" in lowered
+        or "exceed" in lowered
+        or "maximum" in lowered
+    ):
+        return FailureReason.CONTEXT_OVERFLOW
+
+    # Server errors
+    if status_code in {500, 502}:
+        return FailureReason.SERVER_ERROR
+    if status_code in {503, 529}:
+        return FailureReason.OVERLOADED
+
+    # Timeout
+    if "timeout" in lowered or "timed out" in lowered:
+        return FailureReason.TIMEOUT
+
+    # Model not found
+    if "model" in lowered and (
+        "not found" in lowered
+        or "does not exist" in lowered
+        or "not available" in lowered
+        or "not supported" in lowered
+    ):
+        return FailureReason.MODEL_NOT_FOUND
+
+    # Format error
+    if status_code == 400:
+        return FailureReason.FORMAT_ERROR
+
+    return FailureReason.UNKNOWN
+
+
+def _resolve_recovery_hint(
+    category: FailureCategory, reason: str
+) -> RecoveryHint:
+    """Resolve a recovery hint from category and reason string."""
+    try:
+        reason_enum = FailureReason(reason)
+    except (ValueError, TypeError):
+        reason_enum = FailureReason.UNKNOWN
+    return RECOVERY_HINT_MAP.get(reason_enum, "fail")
+
+
+def _resolve_severity(
+    category: FailureCategory, reason: str
+) -> FailureSeverity:
+    """Resolve severity from category and reason string."""
+    try:
+        reason_enum = FailureReason(reason)
+    except (ValueError, TypeError):
+        return DEFAULT_SEVERITY_MAP.get(category, FailureSeverity.MEDIUM)
+    return _DEFAULT_REASON_SEVERITY.get(
+        reason_enum, DEFAULT_SEVERITY_MAP.get(category, FailureSeverity.MEDIUM)
+    )
+
+
+# =============================================================================
+# Jittered backoff
+# Adapted from Hermes Agent (MIT): agent/retry_utils.py jittered_backoff
+# =============================================================================
+
+_jitter_counter: int = 0
+_jitter_lock = threading.Lock()
+
+
+def jittered_backoff(
+    attempt: int,
+    *,
+    base_delay: float = 5.0,
+    max_delay: float = 120.0,
+    jitter_ratio: float = 0.5,
+) -> float:
+    """Compute a jittered exponential backoff delay.
+
+    Only use for transient failures (rate_limit, timeout, overloaded,
+    server_error).  Never use for guardrail_blocked, billing, auth_permanent,
+    format_error, or protected_file_change.
+    """
+    global _jitter_counter
+    with _jitter_lock:
+        _jitter_counter += 1
+        tick = _jitter_counter
+
+    exponent = max(0, attempt - 1)
+    if exponent >= 63 or base_delay <= 0:
+        delay = max_delay
+    else:
+        delay = min(base_delay * (2 ** exponent), max_delay)
+
+    seed = (time.time_ns() ^ (tick * 0x9E3779B9)) & 0xFFFFFFFF
+    rng = random.Random(seed)
+    jitter = rng.uniform(0, jitter_ratio * delay)
+
+    return delay + jitter
+
+
+# =============================================================================
+# Backward-compatible creation helpers
+# =============================================================================
 
 def create_failure_record(
     *,
     category: FailureCategory,
-    agent_name: str | None = None,
+    origin: FailureOrigin = "unknown",
     reason: str = "",
+    recovery_hint: RecoveryHint | None = None,
+    agent_name: str | None = None,
     severity: FailureSeverity | None = None,
     context: dict[str, Any] | None = None,
 ) -> FailureRecord:
-    """创建失败记录
+    """Create a FailureRecord with an explicit, caller-known category.
 
-    这是推荐的创建 FailureRecord 的方式，让失败源头显式传入 category。
-
-    Args:
-        category: 失败类型
-        agent_name: 失败的 agent 名称
-        reason: 失败原因
-        severity: 严重程度（可选，默认根据 category 映射）
-        context: 额外上下文
-
-    Returns:
-        FailureRecord: 失败记录
+    This is the recommended creation path.  It does NOT call infer.
     """
     return FailureRecord(
         category=category,
-        agent_name=agent_name,
+        origin=origin,
         reason=reason,
+        recovery_hint=recovery_hint,
+        agent_name=agent_name,
         severity=severity,
         context=context,
     )
@@ -148,60 +480,26 @@ def infer_failure_category(
     event_type: str | None = None,
     eval_action: str | None = None,
 ) -> FailureCategory:
-    """根据运行时信息推断失败类型
+    """Fallback: infer broad failure category from runtime signals.
 
-    这是一个 fallback 函数，当失败源头没有显式传入 category 时使用。
-    优先使用 create_failure_record() 让失败源头显式指定 category。
-
-    Args:
-        status: 运行状态（failed, timed_out, guardrail_blocked 等）
-        reason: 失败原因
-        event_type: 事件类型（从 execution_trace 获取）
-        eval_action: 评估动作（retry, fail 等）
-
-    Returns:
-        FailureCategory: 推断的失败类型
+    Prefer create_failure_record() when the failure source already knows
+    the category.  Use this only for unknown fallback paths.
     """
-    # 护栏触发
     if status == "guardrail_blocked" or event_type == "guardrail_violation":
         return FailureCategory.GUARDRAIL_BLOCKED
-
-    # 超时
     if status == "timed_out":
-        if "最大步数" in reason or "max_steps" in reason.lower():
-            return FailureCategory.MAX_STEPS_EXCEEDED
-        return FailureCategory.TIMEOUT
-
-    # 权限相关
+        return FailureCategory.PROVIDER_ERROR
     if "trust_level" in reason.lower() or "risk_level" in reason.lower():
-        return FailureCategory.TRUST_LEVEL_INSUFFICIENT
-
-    if "permission" in reason.lower() or "权限" in reason:
-        return FailureCategory.PERMISSION_DENIED
-
-    # 重试耗尽
-    if "重试" in reason or "retry" in reason.lower():
-        return FailureCategory.RETRY_EXHAUSTED
-
-    # 评估失败
-    if eval_action in ("retry", "fail") or event_type == "evaluation":
-        if "必须输出" in reason or "缺少" in reason:
-            return FailureCategory.MISSING_FIELD
-        if "类型" in reason or "type" in reason.lower():
-            return FailureCategory.INVALID_TYPE
-        if "数量" in reason or "至少" in reason:
-            return FailureCategory.INSUFFICIENT_CONTENT
-        return FailureCategory.EVALUATION_FAILED
-
-    # 工具错误
-    if "tool" in reason.lower() or "工具" in reason:
+        return FailureCategory.POLICY_ERROR
+    if "permission" in reason.lower():
+        return FailureCategory.POLICY_ERROR
+    if "tool" in reason.lower():
         return FailureCategory.TOOL_ERROR
+    if eval_action in ("retry", "fail"):
+        return FailureCategory.TASK_QUALITY_ERROR
+    return FailureCategory.UNKNOWN
 
-    # Agent 错误
-    return FailureCategory.AGENT_ERROR
 
-
-# 保持向后兼容
 def classify_failure(
     *,
     status: str,
@@ -210,29 +508,18 @@ def classify_failure(
     event_type: str | None = None,
     eval_action: str | None = None,
 ) -> FailureRecord:
-    """根据失败信息自动分类
+    """Legacy classify_failure — uses infer for backward compatibility.
 
-    已废弃：优先使用 create_failure_record() 让失败源头显式指定 category。
-    此函数保留用于向后兼容和 fallback。
-
-    Args:
-        status: 运行状态（failed, timed_out, guardrail_blocked 等）
-        reason: 失败原因
-        agent_name: 失败的 agent 名称
-        event_type: 事件类型（从 execution_trace 获取）
-        eval_action: 评估动作（retry, fail 等）
-
-    Returns:
-        FailureRecord: 分类后的失败记录
+    Deprecated: prefer create_failure_record() with an explicit category.
+    This function is retained for backward compatibility and unknown
+    fallback paths ONLY.
     """
     category = infer_failure_category(
-        status=status,
-        reason=reason,
-        event_type=event_type,
-        eval_action=eval_action,
+        status=status, reason=reason, event_type=event_type, eval_action=eval_action
     )
     return FailureRecord(
         category=category,
-        agent_name=agent_name,
+        origin="unknown",
         reason=reason,
+        agent_name=agent_name,
     )
