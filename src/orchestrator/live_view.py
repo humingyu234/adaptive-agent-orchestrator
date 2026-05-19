@@ -39,6 +39,7 @@ def build_live_view(
     report_path: str | None = None,
     evidence_path: str | None = None,
     worker_evidence: WorkerEvidenceStatus | None = None,
+    planning_summary: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build a structured live-view dictionary from runtime state.
 
@@ -239,6 +240,7 @@ def build_live_view(
         "last_recovery_hint": last_recovery_hint,
         "evidence_status": evidence_status,
         "worker_evidence": _format_worker_evidence(worker_evidence),
+        "planning_summary": planning_summary,
         "human_review_required": human_review_required,
         "human_review_state": human_review_state,
         "report_path": _report_path,
@@ -362,6 +364,19 @@ def render_live_view(view: dict[str, Any]) -> str:
         summary = worker_evidence.get("reported_summary", "")
         if summary:
             lines.append(f"  Summary: {summary[:120]}")
+
+    # ---- planning summary (Phase 13) ------------------------------------------
+    plan_sum = view.get("planning_summary")
+    if plan_sum:
+        lines.append("")
+        lines.append("Planning Council")
+        lines.append(f"  Plan ID:      {plan_sum.get('plan_id', '-')}")
+        lines.append(f"  Status:       {plan_sum.get('approval_status', '-')}")
+        lines.append(f"  Steps:        {plan_sum.get('number_of_steps', 0)}")
+        lines.append(f"  Evidence:     {plan_sum.get('required_evidence_count', 0)} items")
+        top_risks = plan_sum.get("top_risks", [])
+        if top_risks:
+            lines.append(f"  Top risks:    {', '.join(top_risks[:3])}")
 
     # ---- human review --------------------------------------------------------
     hr_state = view.get("human_review_state", "none")

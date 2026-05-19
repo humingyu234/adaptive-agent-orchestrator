@@ -484,6 +484,169 @@ class ControlPlane:
         )
 
     # ------------------------------------------------------------------
+    # plan verification — Planning Council gate (Phase 13)
+    # ------------------------------------------------------------------
+
+    def verify_plan(self, plan: object) -> ControlDecision:
+        """Verify a PlanContract before execution.
+
+        Catches: unresolved blocking concerns, missing steps, missing success
+        criteria, missing evidence for code-changing work, empty non-goals for
+        broad tasks, high-risk without human review gate, planned worker task
+        without boundaries.
+
+        A plan with blocking_concerns MUST NOT execute — it returns
+        needs_human_review regardless of other checks.
+        """
+        # Import here to avoid circular dependency at module level
+        from .planning import PlanContract, PlannedWorkerTask
+
+        if not isinstance(plan, PlanContract):
+            return ControlDecision(
+                passed=False,
+                action="fail",
+                reason="Invalid plan: not a PlanContract",
+                severity="high",
+                failure_category="task_quality_error",
+                failure_origin="control_plane",
+                recovery_hint="replan",
+            )
+
+        policy = self._get_policy()
+        if policy.mode == "off":
+            return ControlDecision(passed=True, action="continue",
+                                   reason="Plan verification bypassed (run_mode=off)")
+
+        is_large = plan.task_size == "large"
+        has_code = _plan_has_code_changes(plan)
+        is_high_risk = _plan_is_high_risk(plan)
+
+        # --- unresolved blocking concerns (MUST be checked first) ---
+        if plan.has_blocking_concerns:
+            decision = ControlDecision(
+                passed=False,
+                action="needs_human_review",
+                reason=(
+                    f"Plan has {len(plan.blocking_concerns)} unresolved blocking concern(s): "
+                    + "; ".join(plan.blocking_concerns[:3])
+                ),
+                severity="high",
+                failure_category="policy_error",
+                failure_origin="control_plane",
+                recovery_hint="needs_human_review",
+            )
+            if policy.mode == "log":
+                decision.passed = True
+                decision.action = "continue"
+            return decision
+
+        # --- missing steps ---
+        if not plan.steps:
+            decision = ControlDecision(
+                passed=False,
+                action="replan",
+                reason="Plan has no steps — cannot execute",
+                severity="high",
+                failure_category="task_quality_error",
+                failure_origin="control_plane",
+                recovery_hint="replan",
+            )
+            if policy.mode == "log":
+                decision.passed = True
+                decision.action = "continue"
+            return decision
+
+        # --- missing success criteria ---
+        if not plan.success_criteria:
+            decision = ControlDecision(
+                passed=False,
+                action="replan",
+                reason="Plan has no success criteria — cannot judge completion",
+                severity="high",
+                failure_category="task_quality_error",
+                failure_origin="control_plane",
+                recovery_hint="replan",
+            )
+            if policy.mode == "log":
+                decision.passed = True
+                decision.action = "continue"
+            return decision
+
+        # --- missing required evidence for code-changing work ---
+        if has_code and not plan.required_evidence:
+            decision = ControlDecision(
+                passed=False,
+                action="replan",
+                reason="Code-changing plan has no required evidence",
+                severity="medium",
+                failure_category="evidence_error",
+                failure_origin="control_plane",
+                recovery_hint="request_evidence",
+                evidence_required=True,
+            )
+            if policy.mode == "log":
+                decision.passed = True
+                decision.action = "continue"
+            return decision
+
+        # --- empty non-goals for broad tasks ---
+        if is_large and not plan.non_goals:
+            decision = ControlDecision(
+                passed=False,
+                action="replan",
+                reason="Large task plan has no non-goals — scope may drift",
+                severity="medium",
+                failure_category="task_quality_error",
+                failure_origin="control_plane",
+                recovery_hint="replan",
+            )
+            if policy.mode == "log":
+                decision.passed = True
+                decision.action = "continue"
+            return decision
+
+        # --- high-risk task without human review gate ---
+        if is_high_risk and not plan.human_review_gates:
+            decision = ControlDecision(
+                passed=False,
+                action="needs_human_review",
+                reason="High-risk plan has no human review gate",
+                severity="high",
+                failure_category="policy_error",
+                failure_origin="control_plane",
+                recovery_hint="needs_human_review",
+            )
+            if policy.mode == "log":
+                decision.passed = True
+                decision.action = "continue"
+            return decision
+
+        # --- planned worker task without boundaries ---
+        for wt in plan.planned_worker_tasks:
+            if not isinstance(wt, PlannedWorkerTask):
+                continue
+            if not wt.allowed_files and not wt.denied_files:
+                decision = ControlDecision(
+                    passed=False,
+                    action="replan",
+                    reason=f"Planned worker task '{wt.title}' has no file boundaries",
+                    severity="medium",
+                    failure_category="task_quality_error",
+                    failure_origin="control_plane",
+                    recovery_hint="replan",
+                )
+                if policy.mode == "log":
+                    decision.passed = True
+                    decision.action = "continue"
+                return decision
+
+        return ControlDecision(
+            passed=True,
+            action="continue",
+            reason="Plan verified",
+        )
+
+    # ------------------------------------------------------------------
     # recovery — bounded recovery decisions
     # ------------------------------------------------------------------
 
@@ -571,3 +734,39 @@ class ControlPlane:
             guardrail_name=violation.guardrail_name,
             stage=violation.stage,  # type: ignore[arg-type]
         )
+
+
+# =============================================================================
+# Plan verification helpers (Phase 13)
+# =============================================================================
+
+def _plan_has_code_changes(plan: object) -> bool:
+    """Heuristic: check whether a plan involves code changes."""
+    from .planning import PlanContract
+
+    if not isinstance(plan, PlanContract):
+        return False
+    combined = " ".join(plan.steps + plan.required_evidence + [plan.objective])
+    lowered = combined.lower()
+    code_signals = [
+        "implement", "add", "fix", "refactor", "change", "modify", "update",
+        "create", "build", "write", "rewrite", "remove", "delete",
+        "diff.patch", "test_output", "code change", "code",
+    ]
+    return any(s in lowered for s in code_signals)
+
+
+def _plan_is_high_risk(plan: object) -> bool:
+    """Heuristic: check whether a plan is high-risk."""
+    from .planning import PlanContract
+
+    if not isinstance(plan, PlanContract):
+        return False
+    combined = " ".join(plan.risks + plan.steps + [plan.objective])
+    lowered = combined.lower()
+    high_risk_signals = [
+        "high-risk", "high risk", "destructive", "security",
+        "delete", "migrate", "deploy", "production", "database",
+        "credentials", "secret", ".env", "payment", "auth",
+    ]
+    return any(s in lowered for s in high_risk_signals)

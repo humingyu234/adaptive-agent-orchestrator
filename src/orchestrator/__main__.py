@@ -16,6 +16,13 @@ from .project_context import ProjectContext
 from .live_view import build_live_view, is_terminal, render_live_view
 from .regression_compare import RegressionCompare, RegressionSignal, format_regression_report
 
+from .planning import (
+    PlanningCouncil,
+    PlanContract,
+    build_default_council,
+    plan_contract_to_dict,
+    render_plan_contract,
+)
 from .task_router import (
     requires_future_runner,
     route_task,
@@ -49,6 +56,7 @@ def main() -> None:
     ask_parser.add_argument("--format", choices=["json", "text"], default="json", help="Output format (default: json)")
     ask_parser.add_argument("--mode", choices=["off", "log", "controlled", "orchestrated"], help="Override the default run mode")
     ask_parser.add_argument("--force-run", action="store_true", help="Force workflow execution even for log/off routes")
+    ask_parser.add_argument("--approve", action="store_true", help="Auto-approve plan for complex/orchestrated tasks")
 
     review_parser = subparsers.add_parser("review", help="Approve or reject a paused human review task")
     review_parser.add_argument("--task-id", required=True, help="Task ID waiting for human review")
@@ -76,6 +84,7 @@ def main() -> None:
     run_parser.add_argument("--format", choices=["json", "text"], default="json", help="Output format (default: json)")
     run_parser.add_argument("--mode", choices=["off", "log", "controlled", "orchestrated"], help="Override the default run mode")
     run_parser.add_argument("--force-run", action="store_true", help="Force workflow execution even for log/off routes")
+    run_parser.add_argument("--approve", action="store_true", help="Auto-approve plan for complex/orchestrated tasks")
 
     analyze_parser = subparsers.add_parser("analyze", help="Analyze historical runs")
     analyze_subparsers = analyze_parser.add_subparsers(dest="analyze_command", required=True)
@@ -134,6 +143,13 @@ def main() -> None:
     route_parser.add_argument("--mode", choices=["off", "log", "controlled", "orchestrated"], help="Override the default run mode")
     route_parser.add_argument("--format", choices=["json", "text"], default="json", help="Output format (default: json)")
 
+    plan_parser = subparsers.add_parser("plan", help="Generate a plan contract for a complex task")
+    plan_parser.add_argument("query", help="Task request in natural language")
+    plan_parser.add_argument("--mode", choices=["off", "log", "controlled", "orchestrated"], help="Override the default run mode")
+    plan_parser.add_argument("--format", choices=["json", "text"], default="json", help="Output format (default: json)")
+    plan_parser.add_argument("--approve", action="store_true", help="Auto-approve the plan (skip approval prompt)")
+    plan_parser.add_argument("--reject", action="store_true", help="Reject the plan")
+
     status_parser = subparsers.add_parser("status", help="Show live run status for a task")
     status_parser.add_argument("--task-id", required=True, help="Task ID to show status for")
 
@@ -183,6 +199,8 @@ def main() -> None:
         _handle_project_context_command(args)
     elif args.command == "route":
         _handle_route_command(args)
+    elif args.command == "plan":
+        _handle_plan_command(args)
     elif args.command == "status":
         _handle_status_command(args)
     elif args.command == "watch":
@@ -353,6 +371,35 @@ def _handle_route_command(args) -> None:
         print(json.dumps(route_decision_to_dict(decision), ensure_ascii=False, indent=2))
 
 
+def _handle_plan_command(args) -> None:
+    """Generate a plan contract for a task — no execution."""
+    explicit_mode = getattr(args, "mode", None)
+    decision = route_task(args.query, explicit_mode=explicit_mode)
+
+    council = build_default_council()
+    plan = council.create_plan(
+        args.query,
+        task_size=decision.task_size,
+        run_mode=decision.run_mode,
+        risk_level=decision.risk_level,
+        task_type=decision.task_type,
+    )
+
+    # Apply approval/rejection if requested
+    if getattr(args, "approve", False):
+        plan.approve()
+    elif getattr(args, "reject", False):
+        plan.reject()
+
+    fmt = getattr(args, "format", "json")
+    if fmt == "text":
+        print(render_plan_contract(plan))
+    else:
+        output = plan_contract_to_dict(plan)
+        output["route_decision"] = route_decision_to_dict(decision)
+        print(json.dumps(output, ensure_ascii=False, indent=2))
+
+
 def _handle_ask_command(args) -> None:
     _load_optional_dotenv()
     project_root = Path.cwd()
@@ -383,6 +430,60 @@ def _handle_ask_command(args) -> None:
             decision_dict["_note"] = "Orchestrated runner is not implemented yet. Use --force-run to fall back to controlled mode."
             print(json.dumps(decision_dict, ensure_ascii=False, indent=2))
         return
+
+    # Phase 13: Planning Council for complex/orchestrated tasks
+    plan: PlanContract | None = None
+    if decision.task_size == "large" and decision.run_mode in ("orchestrated", "controlled"):
+        council = build_default_council()
+        plan = council.create_plan(
+            args.query,
+            task_size=decision.task_size,
+            run_mode=decision.run_mode,
+            risk_level=decision.risk_level,
+            task_type=decision.task_type,
+        )
+
+        from .control_plane import ControlPlane
+        cp = ControlPlane()
+        verification = cp.verify_plan(plan)
+
+        if not verification.passed:
+            decision_dict = route_decision_to_dict(decision)
+            decision_dict["plan"] = plan_contract_to_dict(plan)
+            decision_dict["plan_verification"] = {
+                "passed": verification.passed,
+                "action": verification.action,
+                "reason": verification.reason,
+                "recovery_hint": verification.recovery_hint,
+            }
+            decision_dict["_note"] = "Plan verification failed — execution blocked."
+            fmt = getattr(args, "format", "json")
+            if fmt == "text":
+                print(render_plan_contract(plan))
+                print(f"\nPlan verification FAILED: {verification.reason}")
+            else:
+                print(json.dumps(decision_dict, ensure_ascii=False, indent=2))
+            return
+
+        if not getattr(args, "approve", False):
+            decision_dict = route_decision_to_dict(decision)
+            decision_dict["plan"] = plan_contract_to_dict(plan)
+            decision_dict["plan_verification"] = {
+                "passed": True,
+                "action": "needs_human_review",
+                "reason": "Complex task requires plan approval",
+            }
+            decision_dict["_note"] = "Plan is ready but needs approval. Use --approve to proceed, or use 'plan' command to review first."
+            fmt = getattr(args, "format", "json")
+            if fmt == "text":
+                print(render_plan_contract(plan))
+                print("\nPlan is ready. Use --approve to proceed with execution.")
+            else:
+                print(json.dumps(decision_dict, ensure_ascii=False, indent=2))
+            return
+
+        # Plan approved — continue to execution
+        plan.approve()
 
     llm_config = _parse_llm_config(args)
     if llm_config.get("global_provider"):
@@ -672,6 +773,53 @@ def _handle_run_command(args) -> None:
         decision_dict["_note"] = "Orchestrated runner is not implemented yet. Use --force-run to fall back to controlled mode."
         print(json.dumps(decision_dict, ensure_ascii=False, indent=2))
         return
+
+    # Phase 13: Planning Council for complex/orchestrated tasks
+    plan: PlanContract | None = None
+    if decision.task_size == "large" and decision.run_mode in ("orchestrated", "controlled"):
+        council = build_default_council()
+        plan = council.create_plan(
+            args.query,
+            task_size=decision.task_size,
+            run_mode=decision.run_mode,
+            risk_level=decision.risk_level,
+            task_type=decision.task_type,
+        )
+
+        from .control_plane import ControlPlane
+        cp = ControlPlane()
+        verification = cp.verify_plan(plan)
+
+        if not verification.passed:
+            decision_dict = route_decision_to_dict(decision)
+            decision_dict["plan"] = plan_contract_to_dict(plan)
+            decision_dict["plan_verification"] = {
+                "passed": verification.passed,
+                "action": verification.action,
+                "reason": verification.reason,
+            }
+            decision_dict["_note"] = "Plan verification failed — execution blocked."
+            print(json.dumps(decision_dict, ensure_ascii=False, indent=2))
+            return
+
+        if not getattr(args, "approve", False):
+            decision_dict = route_decision_to_dict(decision)
+            decision_dict["plan"] = plan_contract_to_dict(plan)
+            decision_dict["plan_verification"] = {
+                "passed": True,
+                "action": "needs_human_review",
+                "reason": "Complex task requires plan approval",
+            }
+            decision_dict["_note"] = "Plan is ready but needs approval. Use --approve to proceed."
+            fmt = getattr(args, "format", "json")
+            if fmt == "text":
+                print(render_plan_contract(plan))
+                print("\nPlan is ready. Use --approve to proceed with execution.")
+            else:
+                print(json.dumps(decision_dict, ensure_ascii=False, indent=2))
+            return
+
+        plan.approve()
 
     workflow_path = Path(args.workflow).resolve()
     workflow = load_workflow(workflow_path)

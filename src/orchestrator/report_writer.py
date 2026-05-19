@@ -35,6 +35,7 @@ class ConvergenceReportWriter:
         failure_record: FailureRecord | None = None,
         evidence_packs: list | None = None,
         worker_evidence: WorkerEvidenceStatus | None = None,
+        planning_summary: dict[str, Any] | None = None,
     ) -> Path:
         """生成并写入收敛报告"""
         report_dir = self.project_root / "outputs" / "reports"
@@ -50,6 +51,7 @@ class ConvergenceReportWriter:
             log_records=log_records,
             evidence_packs=evidence_packs,
             worker_evidence=worker_evidence,
+            planning_summary=planning_summary,
         )
 
         report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -65,6 +67,7 @@ class ConvergenceReportWriter:
         log_records: list[dict],
         evidence_packs: list | None = None,
         worker_evidence: WorkerEvidenceStatus | None = None,
+        planning_summary: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """构建报告结构"""
         event_counter = self._count_events(state.execution_trace)
@@ -144,6 +147,7 @@ class ConvergenceReportWriter:
             "recovery_summary": self._build_recovery_summary(state),
             "evidence_summary": self._build_evidence_summary(evidence_packs or []),
             "worker_evidence_summary": self._build_worker_evidence_summary(worker_evidence),
+            "planning_summary": planning_summary or {},
         }
 
     def load_log_records(self, state: StateCenter) -> list[dict]:
