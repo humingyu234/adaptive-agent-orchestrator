@@ -600,3 +600,52 @@ class TestMemoryItemIds:
         item = MemoryItem(id="custom-123", kind="run_summary",
                           source_type="observed", title="T", content="C")
         assert item.id == "custom-123"
+
+
+# =============================================================================
+# Phase 14.5 — canonical vs legacy memory boundary
+# =============================================================================
+
+class TestCanonicalMemoryBoundary:
+    """Verify .aao/memory is canonical, outputs/memory is legacy artifact."""
+
+    def test_memory_store_is_canonical_project_memory(self):
+        """MemoryStore writes to .aao/memory/, the canonical project memory."""
+        with tempfile.TemporaryDirectory() as tmp:
+            store = MemoryStore(tmp)
+            item = store.create(MemoryItem(
+                kind="project_constraint",
+                source_type="observed",
+                title="Canonical test",
+                content="This lives in .aao/memory/",
+            ))
+            # Verify the file was written under .aao/memory/
+            aao_dir = Path(tmp) / ".aao" / "memory"
+            assert aao_dir.exists()
+            # The index is at .aao/memory/index.json
+            index_path = aao_dir / "index.json"
+            assert index_path.exists()
+            # The item file is somewhere under .aao/memory/
+            item_files = list(aao_dir.rglob(f"{item.id}.json"))
+            assert len(item_files) >= 1
+
+    def test_legacy_memory_manager_does_not_upgrade_reported_to_observed(self):
+        """Source type boundaries are enforced: reported stays reported."""
+        item = MemoryItem(
+            kind="failure_lesson",
+            source_type="reported",
+            title="Reported failure",
+            content="Worker said something failed but we didn't observe it.",
+        )
+        assert item.source_type == "reported"
+        # Serialize and reload — source_type must not change
+        reloaded = MemoryItem.from_dict(item.to_dict())
+        assert reloaded.source_type == "reported"
+        # Creating through MemoryStore must preserve source_type
+        with tempfile.TemporaryDirectory() as tmp:
+            store = MemoryStore(tmp)
+            stored = store.create(item)
+            loaded = store.load(stored.id)
+            assert loaded is not None
+            assert loaded.source_type == "reported"
+            assert loaded.source_type != "observed"

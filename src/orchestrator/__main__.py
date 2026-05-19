@@ -400,6 +400,78 @@ def _handle_plan_command(args) -> None:
         print(json.dumps(output, ensure_ascii=False, indent=2))
 
 
+def _prepare_approved_plan_for_command(
+    args,
+    decision,
+    *,
+    support_text_format: bool = False,
+) -> PlanContract | None:
+    """Planning Council gate for complex/orchestrated tasks.
+
+    Returns an approved PlanContract if the plan passes verification AND the
+    user has provided --approve.  Returns None if execution is blocked
+    (verification failed or plan awaiting approval), after printing the
+    relevant output.
+
+    Phase 14.5: extracted from duplicate logic in _handle_ask_command and
+    _handle_run_command.
+    """
+    if not (decision.task_size == "large" and decision.run_mode in ("orchestrated", "controlled")):
+        return None
+
+    council = build_default_council()
+    plan = council.create_plan(
+        args.query,
+        task_size=decision.task_size,
+        run_mode=decision.run_mode,
+        risk_level=decision.risk_level,
+        task_type=decision.task_type,
+    )
+
+    from .control_plane import ControlPlane
+    cp = ControlPlane()
+    verification = cp.verify_plan(plan)
+
+    if not verification.passed:
+        decision_dict = route_decision_to_dict(decision)
+        decision_dict["plan"] = plan_contract_to_dict(plan)
+        decision_dict["plan_verification"] = {
+            "passed": verification.passed,
+            "action": verification.action,
+            "reason": verification.reason,
+            "recovery_hint": verification.recovery_hint,
+        }
+        decision_dict["_note"] = "Plan verification failed — execution blocked."
+        if support_text_format and getattr(args, "format", "json") == "text":
+            print(render_plan_contract(plan))
+            print(f"\nPlan verification FAILED: {verification.reason}")
+        else:
+            print(json.dumps(decision_dict, ensure_ascii=False, indent=2))
+        return None
+
+    if not getattr(args, "approve", False):
+        decision_dict = route_decision_to_dict(decision)
+        decision_dict["plan"] = plan_contract_to_dict(plan)
+        decision_dict["plan_verification"] = {
+            "passed": True,
+            "action": "needs_human_review",
+            "reason": "Complex task requires plan approval",
+        }
+        decision_dict["_note"] = (
+            "Plan is ready but needs approval. Use --approve to proceed, "
+            "or use 'plan' command to review first."
+        )
+        if support_text_format and getattr(args, "format", "json") == "text":
+            print(render_plan_contract(plan))
+            print("\nPlan is ready. Use --approve to proceed with execution.")
+        else:
+            print(json.dumps(decision_dict, ensure_ascii=False, indent=2))
+        return None
+
+    plan.approve()
+    return plan
+
+
 def _handle_ask_command(args) -> None:
     _load_optional_dotenv()
     project_root = Path.cwd()
@@ -431,59 +503,10 @@ def _handle_ask_command(args) -> None:
             print(json.dumps(decision_dict, ensure_ascii=False, indent=2))
         return
 
-    # Phase 13: Planning Council for complex/orchestrated tasks
-    plan: PlanContract | None = None
-    if decision.task_size == "large" and decision.run_mode in ("orchestrated", "controlled"):
-        council = build_default_council()
-        plan = council.create_plan(
-            args.query,
-            task_size=decision.task_size,
-            run_mode=decision.run_mode,
-            risk_level=decision.risk_level,
-            task_type=decision.task_type,
-        )
-
-        from .control_plane import ControlPlane
-        cp = ControlPlane()
-        verification = cp.verify_plan(plan)
-
-        if not verification.passed:
-            decision_dict = route_decision_to_dict(decision)
-            decision_dict["plan"] = plan_contract_to_dict(plan)
-            decision_dict["plan_verification"] = {
-                "passed": verification.passed,
-                "action": verification.action,
-                "reason": verification.reason,
-                "recovery_hint": verification.recovery_hint,
-            }
-            decision_dict["_note"] = "Plan verification failed — execution blocked."
-            fmt = getattr(args, "format", "json")
-            if fmt == "text":
-                print(render_plan_contract(plan))
-                print(f"\nPlan verification FAILED: {verification.reason}")
-            else:
-                print(json.dumps(decision_dict, ensure_ascii=False, indent=2))
-            return
-
-        if not getattr(args, "approve", False):
-            decision_dict = route_decision_to_dict(decision)
-            decision_dict["plan"] = plan_contract_to_dict(plan)
-            decision_dict["plan_verification"] = {
-                "passed": True,
-                "action": "needs_human_review",
-                "reason": "Complex task requires plan approval",
-            }
-            decision_dict["_note"] = "Plan is ready but needs approval. Use --approve to proceed, or use 'plan' command to review first."
-            fmt = getattr(args, "format", "json")
-            if fmt == "text":
-                print(render_plan_contract(plan))
-                print("\nPlan is ready. Use --approve to proceed with execution.")
-            else:
-                print(json.dumps(decision_dict, ensure_ascii=False, indent=2))
-            return
-
-        # Plan approved — continue to execution
-        plan.approve()
+    # Phase 13: Planning Council gate
+    plan = _prepare_approved_plan_for_command(args, decision, support_text_format=True)
+    if plan is None and decision.task_size == "large" and decision.run_mode in ("orchestrated", "controlled"):
+        return  # blocked by planning gate — message already printed
 
     llm_config = _parse_llm_config(args)
     if llm_config.get("global_provider"):
@@ -774,52 +797,10 @@ def _handle_run_command(args) -> None:
         print(json.dumps(decision_dict, ensure_ascii=False, indent=2))
         return
 
-    # Phase 13: Planning Council for complex/orchestrated tasks
-    plan: PlanContract | None = None
-    if decision.task_size == "large" and decision.run_mode in ("orchestrated", "controlled"):
-        council = build_default_council()
-        plan = council.create_plan(
-            args.query,
-            task_size=decision.task_size,
-            run_mode=decision.run_mode,
-            risk_level=decision.risk_level,
-            task_type=decision.task_type,
-        )
-
-        from .control_plane import ControlPlane
-        cp = ControlPlane()
-        verification = cp.verify_plan(plan)
-
-        if not verification.passed:
-            decision_dict = route_decision_to_dict(decision)
-            decision_dict["plan"] = plan_contract_to_dict(plan)
-            decision_dict["plan_verification"] = {
-                "passed": verification.passed,
-                "action": verification.action,
-                "reason": verification.reason,
-            }
-            decision_dict["_note"] = "Plan verification failed — execution blocked."
-            print(json.dumps(decision_dict, ensure_ascii=False, indent=2))
-            return
-
-        if not getattr(args, "approve", False):
-            decision_dict = route_decision_to_dict(decision)
-            decision_dict["plan"] = plan_contract_to_dict(plan)
-            decision_dict["plan_verification"] = {
-                "passed": True,
-                "action": "needs_human_review",
-                "reason": "Complex task requires plan approval",
-            }
-            decision_dict["_note"] = "Plan is ready but needs approval. Use --approve to proceed."
-            fmt = getattr(args, "format", "json")
-            if fmt == "text":
-                print(render_plan_contract(plan))
-                print("\nPlan is ready. Use --approve to proceed with execution.")
-            else:
-                print(json.dumps(decision_dict, ensure_ascii=False, indent=2))
-            return
-
-        plan.approve()
+    # Phase 13: Planning Council gate
+    plan = _prepare_approved_plan_for_command(args, decision, support_text_format=True)
+    if plan is None and decision.task_size == "large" and decision.run_mode in ("orchestrated", "controlled"):
+        return  # blocked by planning gate — message already printed
 
     workflow_path = Path(args.workflow).resolve()
     workflow = load_workflow(workflow_path)

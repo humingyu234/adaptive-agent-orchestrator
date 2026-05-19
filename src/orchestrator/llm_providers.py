@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import tempfile
@@ -73,11 +74,59 @@ class MockProvider(LLMProvider):
 
 
 class CLIProvider(LLMProvider):
+    """Run an external CLI command as an LLM provider.
+
+    The command string is parsed with shlex.split() so that ``"codex --model gpt-5"``
+    becomes ``["codex", "--model", "gpt-5"]``.  Shell metacharacters (``;``, ``|``,
+    ``&&`` etc.) are treated as literal arguments — they do NOT execute shell
+    commands.
+
+    ``shell=False`` is always used to prevent command injection via the
+    ``LLM_CLI_COMMAND`` environment variable.
+    """
+
     name = "cli"
 
     def __init__(self, command: str | None = None, timeout: int = 120):
-        self.command = command or os.environ.get("LLM_CLI_COMMAND", "codex")
+        if command is not None:
+            raw = command.strip()
+        else:
+            raw = os.environ.get("LLM_CLI_COMMAND", "codex").strip()
+        if not raw:
+            raise ValueError("CLIProvider command must not be empty")
+        self.command_str = raw
+        self._argv = self._parse_command(raw)
         self.timeout = timeout
+
+    @staticmethod
+    def _parse_command(raw: str) -> list[str]:
+        """Parse a command string into argv list.  Shell metacharacters are literal."""
+        try:
+            argv = shlex.split(raw)
+        except ValueError as exc:
+            raise ValueError(
+                f"CLIProvider: cannot parse command {raw!r}: {exc}"
+            ) from exc
+        if not argv:
+            raise ValueError("CLIProvider: command resolved to empty argv")
+        if not argv[0].strip():
+            raise ValueError(f"CLIProvider: command has empty executable: {raw!r}")
+        return argv
+
+    def _build_argv(self, model: str | None = None) -> list[str]:
+        """Return the argv list for a subprocess call.
+
+        If the user already specified ``--model`` in the command string we keep it.
+        Otherwise ``--model <model>`` is appended when *model* is non-empty.
+        """
+        argv = list(self._argv)
+        has_model_flag = any(
+            arg in ("-m", "--model")
+            for arg in argv
+        )
+        if not has_model_flag and model:
+            argv.extend(["--model", model])
+        return argv
 
     def complete(
         self,
@@ -87,20 +136,28 @@ class CLIProvider(LLMProvider):
         temperature: float = 0.7,
         max_tokens: int = 2000,
     ) -> str:
+        argv = self._build_argv(model)
         try:
             result = subprocess.run(
-                self.command,
-                shell=True,
+                argv,
+                shell=False,
                 input=prompt,
                 capture_output=True,
                 text=True,
                 timeout=self.timeout,
             )
             if result.returncode != 0:
-                raise RuntimeError(f"CLI command failed: {result.stderr}")
+                raise RuntimeError(
+                    f"CLI command failed (exit {result.returncode}): {result.stderr.strip()}"
+                )
             return result.stdout.strip()
         except subprocess.TimeoutExpired:
             raise RuntimeError(f"CLI command timed out after {self.timeout}s")
+        except FileNotFoundError:
+            raise RuntimeError(
+                f"CLI command not found: {argv[0]!r}. "
+                f"Install it or set LLM_CLI_COMMAND."
+            )
 
     def complete_json(
         self,

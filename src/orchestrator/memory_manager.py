@@ -15,11 +15,23 @@ from .state_center import StateCenter
 
 
 class MemoryManager:
-    """Memory facade — legacy capture + new MemoryStore delegate.
+    """Memory facade — **canonical** MemoryStore + **legacy** run capture.
 
-    Legacy: capture() / retrieve() write to outputs/memory/ for run bundles.
-    New:    create_item() / retrieve_context() / record_failure_lesson() etc.
-            delegate to MemoryStore (.aao/memory/).
+    CANONICAL (Phase 14):
+        create_item() / retrieve_context() / record_failure_lesson() etc.
+        delegate to MemoryStore which persists to **.aao/memory/**.
+        This is the canonical project memory.  Reports and handoffs MUST
+        reference this as the source of remembered knowledge.
+
+    LEGACY (pre-Phase 14):
+        capture() / retrieve() write to **outputs/memory/** for per-run
+        bundles.  These are runtime artifacts, NOT canonical project memory.
+        They exist for backward compatibility with existing tests and
+        should not be extended with new features.
+
+    Do NOT confuse the two:
+      - .aao/memory/  = canonical project memory (MemoryStore)
+      - outputs/memory/ = legacy runtime artifact (MemoryManager.capture)
     """
 
     def __init__(self, project_root: str | Path):

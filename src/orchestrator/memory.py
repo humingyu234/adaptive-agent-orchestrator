@@ -1,5 +1,13 @@
 """Memory layer — lightweight, inspectable project memory.
 
+**CANONICAL memory lives in ``.aao/memory/``.**  This is the source of truth
+for project constraints, architecture decisions, failure lessons, review
+decisions, run summaries, user preferences, and worker lessons.
+
+``outputs/memory/`` is a **LEGACY runtime artifact** (captured by the old
+MemoryManager.capture path).  It is NOT canonical project memory.  Reports and
+handoffs MUST NOT call it "memory" without disambiguation.
+
 Memory is a hint with provenance, not evidence for the current run.
 Every memory item declares where it came from and how confident we are.
 """
