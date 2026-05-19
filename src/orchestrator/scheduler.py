@@ -14,6 +14,7 @@ from .live_interrupt import InterruptSignal, LiveInterruptController
 from .llm_client import LLMClient
 from .llm_providers import get_provider
 from .memory_manager import MemoryManager
+from .memory import MemoryItem
 from .models import EvalResult, RunResult
 from .policy import Policy, load_policy
 from .recovery import AttemptTracker, RecoveryAttemptKey, RecoveryDecision, RecoveryPlaybook
@@ -91,6 +92,8 @@ class Scheduler:
         state.metadata.workflow_total = len(agents)
         retrieved_memories = self.memory_manager.retrieve(query=query, top_k=3)
         state.write("retrieved_memories", retrieved_memories, "memory_manager")
+        memory_context = self.memory_manager.retrieve_context(query=query)
+        state.write("memory_context", memory_context.to_summary(), "memory_manager")
 
         workflow_agents = [node["name"] for node in agents]
         if self.orchestrator:
@@ -1249,6 +1252,40 @@ class Scheduler:
 
         memory_bundle, memory_path = self.memory_manager.capture(state=state, final_node=final_node)
         state.write("memory_bundle", memory_bundle, "memory_manager")
+
+        # Phase 14: record failure lesson for durable classified failures
+        if failure_record is not None and status in ("failed", "timed_out", "guardrail_blocked"):
+            try:
+                recovery_event = None
+                for e in reversed(state.execution_trace):
+                    if e.get("event") == "recovery_decision":
+                        recovery_event = e
+                        break
+                self.memory_manager.record_failure_lesson(
+                    failure_category=failure_record.category.value,
+                    reason=failure_record.reason,
+                    recovery_hint=recovery_event.get("recovery_hint", "") if recovery_event else "",
+                    source_type="observed",
+                    evidence_path=str(self.project_root / "outputs" / "evidence" / f"{state.metadata.task_id}.json"),
+                    run_id="",
+                    task_id=state.metadata.task_id,
+                )
+            except Exception:
+                pass  # Memory recording must never crash a run
+
+        # Phase 14: record run summary for completed or failed runs
+        try:
+            self.memory_manager.create_item(MemoryItem(
+                kind="run_summary",
+                source_type="observed",
+                title=f"Run {state.metadata.task_id[:12]}: {status}",
+                content=f"Status: {status}\nFinal node: {final_node}\nReason: {reason}\nSteps: {state.convergence.global_step}",
+                task_id=state.metadata.task_id,
+                tags=[status, "run"],
+                confidence=0.9,
+            ))
+        except Exception:
+            pass
 
         # Phase 4: compute report_path first, then build evidence packs
         report_path = (

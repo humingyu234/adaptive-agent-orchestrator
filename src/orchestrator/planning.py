@@ -3,6 +3,9 @@
 Creates a reviewed, bounded, user-approved plan before complex tasks execute.
 Deterministic advisors produce candidates; the council merges one PlanContract.
 
+Phase 14: Memory hints are accepted as advisory context but never replace
+fresh evidence or plan validation.
+
 BOUNDARY RULES (Phase 13 hard constraints):
   - AutoGen / Microsoft Agent Framework / LangGraph may only serve as advisor
     implementations or runner implementations in future phases.  They MUST NOT
@@ -79,6 +82,10 @@ class PlanContract:
     This is the authoritative output of the Planning Council.  Scheduler,
     worker bridge, and report writer read these structured fields.
     render_plan_contract() is human-facing display only.
+
+    Phase 14: memory_hints are advisory only — they record what memory
+    context was available during planning, but do NOT replace fresh
+    evidence or validation.
     """
 
     objective: str = ""
@@ -98,6 +105,7 @@ class PlanContract:
     disagreements: list[str] = field(default_factory=list)
     blocking_concerns: list[str] = field(default_factory=list)
     non_blocking_concerns: list[str] = field(default_factory=list)
+    memory_hints: list[str] = field(default_factory=list)
 
     @property
     def has_blocking_concerns(self) -> bool:
@@ -544,14 +552,33 @@ class PlanningCouncil:
         run_mode: str = "controlled",
         risk_level: str = "low",
         task_type: str = "unknown",
+        memory_context: object | None = None,  # MemoryContext from Phase 14
     ) -> PlanContract:
         """Create a PlanContract from advisor candidates.
 
         Collects blocking_concerns from ALL candidates.  The resulting contract
         carries them forward; approve() will raise if they are not resolved.
+
+        Phase 14: memory_context provides advisory memory hints (project
+        constraints, failure lessons, etc.) that may enrich the plan but do
+        NOT replace fresh validation.
         """
         candidates: list[PlanCandidate] = []
         disagreements: list[str] = []
+        memory_hints: list[str] = []
+
+        # ---- Phase 14: extract advisory hints from memory context --------------
+        if memory_context is not None:
+            mc = memory_context
+            if hasattr(mc, "project_constraints"):
+                for item in getattr(mc, "project_constraints", []):
+                    memory_hints.append(f"project constraint: {item.title}")
+            if hasattr(mc, "failure_lessons"):
+                for item in getattr(mc, "failure_lessons", []):
+                    memory_hints.append(f"failure lesson: {item.title}")
+            if hasattr(mc, "relevant_decisions"):
+                for item in getattr(mc, "relevant_decisions", []):
+                    memory_hints.append(f"architecture decision: {item.title}")
 
         for advisor in self._advisors[: self._max_candidates]:
             candidate = advisor.advise(
@@ -681,6 +708,7 @@ class PlanningCouncil:
             disagreements=disagreements,
             blocking_concerns=all_blocking,
             non_blocking_concerns=all_non_blocking,
+            memory_hints=memory_hints,
         )
 
     def revise_plan(
@@ -835,6 +863,12 @@ def render_plan_contract(plan: PlanContract) -> str:
         for d in plan.disagreements:
             lines.append(f"    ! {d}")
 
+    if plan.memory_hints:
+        lines.append("")
+        lines.append(f"  Memory Hints Considered ({len(plan.memory_hints)}):")
+        for mh in plan.memory_hints[:5]:
+            lines.append(f"    - {mh}")
+
     lines.append(sep)
     return "\n".join(lines)
 
@@ -860,6 +894,7 @@ def plan_contract_to_dict(plan: PlanContract) -> dict[str, object]:
         "stop_conditions": plan.stop_conditions,
         "blocking_concerns": plan.blocking_concerns,
         "non_blocking_concerns": plan.non_blocking_concerns,
+        "memory_hints": plan.memory_hints,
         "planned_worker_tasks": [
             {
                 "title": wt.title,

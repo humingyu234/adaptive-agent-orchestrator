@@ -3,16 +3,126 @@ import re
 from datetime import datetime, timezone
 from pathlib import Path
 
+from .memory import (
+    MemoryContext,
+    MemoryItem,
+    MemoryKind,
+    MemorySourceType,
+    MemoryStore,
+    utc_now_iso,
+)
 from .state_center import StateCenter
 
 
-def utc_now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
-
 class MemoryManager:
+    """Memory facade — legacy capture + new MemoryStore delegate.
+
+    Legacy: capture() / retrieve() write to outputs/memory/ for run bundles.
+    New:    create_item() / retrieve_context() / record_failure_lesson() etc.
+            delegate to MemoryStore (.aao/memory/).
+    """
+
     def __init__(self, project_root: str | Path):
         self.project_root = Path(project_root)
+        self._store = MemoryStore(self.project_root)
+
+    # ======================================================================
+    # New API — delegates to MemoryStore
+    # ======================================================================
+
+    def create_item(self, item: MemoryItem) -> MemoryItem:
+        """Store a memory item through MemoryStore."""
+        return self._store.create(item)
+
+    def load_item(self, item_id: str) -> MemoryItem | None:
+        """Load a single memory item by id."""
+        return self._store.load(item_id)
+
+    def list_items(
+        self,
+        *,
+        kind: MemoryKind | None = None,
+        source_type: MemorySourceType | None = None,
+    ) -> list[MemoryItem]:
+        """List memory items, optionally filtered."""
+        return self._store.list_items(kind=kind, source_type=source_type)
+
+    def retrieve_items(
+        self,
+        *,
+        query: str = "",
+        tags: list[str] | None = None,
+        kind: MemoryKind | None = None,
+        source_type: MemorySourceType | None = None,
+        top_k: int = 10,
+    ) -> list[MemoryItem]:
+        """Deterministic retrieval by keyword/tag/kind/source_type."""
+        return self._store.retrieve(
+            query=query, tags=tags, kind=kind,
+            source_type=source_type, top_k=top_k,
+        )
+
+    def retrieve_context(
+        self,
+        *,
+        query: str = "",
+        task_size: str = "medium",
+        top_k_per_kind: int = 3,
+    ) -> MemoryContext:
+        """Build a bounded MemoryContext for planning/control."""
+        return self._store.retrieve_context(
+            query=query, task_size=task_size, top_k_per_kind=top_k_per_kind,
+        )
+
+    def record_failure_lesson(
+        self,
+        *,
+        failure_category: str,
+        reason: str,
+        recovery_hint: str = "",
+        what_prevents_repeat: str = "",
+        source_type: MemorySourceType = "observed",
+        evidence_path: str = "",
+        run_id: str = "",
+        task_id: str = "",
+    ) -> MemoryItem:
+        """Record a durable failure lesson through MemoryStore."""
+        return self._store.record_failure_lesson(
+            failure_category=failure_category,
+            reason=reason,
+            recovery_hint=recovery_hint,
+            what_prevents_repeat=what_prevents_repeat,
+            source_type=source_type,
+            evidence_path=evidence_path,
+            run_id=run_id,
+            task_id=task_id,
+        )
+
+    def record_decision(
+        self,
+        *,
+        title: str,
+        content: str,
+        kind: MemoryKind = "architecture_decision",
+        source_type: MemorySourceType = "observed",
+        task_id: str = "",
+        tags: list[str] | None = None,
+    ) -> MemoryItem:
+        """Record an architecture or review decision."""
+        item = MemoryItem(
+            kind=kind,
+            source_type=source_type,
+            title=title,
+            content=content,
+            task_id=task_id,
+            tags=tags or [],
+            confidence=0.8,
+        )
+        return self._store.create(item)
+
+    # ======================================================================
+    # Legacy API — run bundle capture (outputs/memory/)
+    # ======================================================================
 
     def capture(
         self,

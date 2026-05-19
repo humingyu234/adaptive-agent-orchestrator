@@ -94,6 +94,7 @@ class ConvergenceReportWriter:
         supervisor_report = state.data_pool.intermediate.get("supervisor_report", {})
         memory_bundle = state.data_pool.intermediate.get("memory_bundle", {})
         retrieved_memories = state.data_pool.intermediate.get("retrieved_memories", [])
+        memory_context = state.data_pool.intermediate.get("memory_context")
         plan = state.data_pool.intermediate.get("plan", {})
         summary = state.data_pool.intermediate.get("summary", {})
         return {
@@ -142,7 +143,7 @@ class ConvergenceReportWriter:
                 checkpoint_replans,
                 guardrail_violations,
             ),
-            "memory_summary": self._build_memory_summary(memory_bundle, retrieved_memories),
+            "memory_summary": self._build_memory_summary(memory_bundle, retrieved_memories, memory_context),
             "failure_summary": self._build_failure_summary(failure_record),
             "recovery_summary": self._build_recovery_summary(state),
             "evidence_summary": self._build_evidence_summary(evidence_packs or []),
@@ -390,8 +391,9 @@ class ConvergenceReportWriter:
             ],
         }
 
-    def _build_memory_summary(self, memory_bundle: dict, retrieved_memories: list) -> dict:
-        return {
+    def _build_memory_summary(self, memory_bundle: dict, retrieved_memories: list,
+                              memory_context: dict | None = None) -> dict:
+        result: dict[str, object] = {
             "memory_version": memory_bundle.get("memory_version") if isinstance(memory_bundle, dict) else None,
             "short_term_status": memory_bundle.get("short_term", {}).get("status")
             if isinstance(memory_bundle, dict)
@@ -401,6 +403,10 @@ class ConvergenceReportWriter:
             else None,
             "retrieved_memory_count": len(retrieved_memories) if isinstance(retrieved_memories, list) else 0,
         }
+        # Phase 14: include new memory context summary if available
+        if isinstance(memory_context, dict):
+            result["phase14_memory"] = memory_context
+        return result
 
     def _build_evidence_summary(self, evidence_packs: list) -> dict:
         if not evidence_packs:
