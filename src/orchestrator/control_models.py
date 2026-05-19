@@ -138,3 +138,40 @@ class EvidencePack(BaseModel):
     test_results: dict[str, Any] = Field(default_factory=dict)
     diff_summary: str = ""
     notes: str = ""
+
+
+# =============================================================================
+# Worker evidence classification
+# =============================================================================
+
+class WorkerEvidenceItem(BaseModel):
+    """A single piece of evidence from a worker task — observed or missing."""
+
+    key: str
+    status: Literal["observed", "reported", "missing", "invalid"] = "missing"
+    path: str = ""
+    description: str = ""
+
+
+class WorkerEvidenceStatus(BaseModel):
+    """Classified evidence from a completed worker task.
+
+    Separates what the worker claims (reported) from what AAO can inspect
+    (observed).  Missing required evidence blocks completion.
+    """
+
+    task_id: str
+    worker_kind: str = "claude_code"
+    worker_status: str = ""
+    items: list[WorkerEvidenceItem] = Field(default_factory=list)
+    reported_summary: str = ""
+    changed_files: list[str] = Field(default_factory=list)
+    denied_files_changed: list[str] = Field(default_factory=list)
+
+    @property
+    def has_missing_required(self) -> bool:
+        return any(i.status == "missing" for i in self.items)
+
+    @property
+    def is_malformed(self) -> bool:
+        return self.worker_status in ("", "unknown", "malformed")

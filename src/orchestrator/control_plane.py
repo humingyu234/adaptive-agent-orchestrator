@@ -7,7 +7,12 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-from .control_models import ControlAction, ControlDecision, RecoveryHint
+from .control_models import (
+    ControlAction,
+    ControlDecision,
+    RecoveryHint,
+    WorkerEvidenceStatus,
+)
 from .evaluator import Evaluator
 from .failure_taxonomy import (
     DEFAULT_SEVERITY_MAP,
@@ -375,6 +380,107 @@ class ControlPlane:
             failure_origin="policy",
             recovery_hint="request_evidence",
             evidence_required=True,
+        )
+
+    # ------------------------------------------------------------------
+    # worker evidence verification
+    # ------------------------------------------------------------------
+
+    def verify_worker_evidence(
+        self,
+        evidence_status: WorkerEvidenceStatus,
+        *,
+        allow_denied_file_changes: bool = False,
+    ) -> ControlDecision:
+        """Verify worker evidence and produce a control decision.
+
+        Turns a WorkerEvidenceStatus (from classify_worker_evidence) into a
+        ControlDecision that follows the same recovery paths as Phase 11.
+
+        Rules:
+        - Missing required evidence → needs_human_review / request_evidence
+        - Denied files changed → policy violation → needs_human_review
+        - Malformed result → format_error → fail
+        - All evidence observed, no violations → continue
+        """
+        policy = self._get_policy()
+
+        # --- off mode: skip verification ---
+        if policy.mode == "off":
+            return ControlDecision(passed=True, action="continue",
+                                   reason="Worker evidence verification bypassed (run_mode=off)")
+
+        # --- malformed result ---
+        if evidence_status.is_malformed:
+            decision = ControlDecision(
+                passed=False,
+                action="fail",
+                reason="Worker result is malformed or missing status",
+                severity="high",
+                failure_category="task_quality_error",
+                failure_origin="worker",
+                recovery_hint="request_evidence",
+            )
+            if policy.mode == "log":
+                decision.passed = True
+                decision.action = "continue"
+            return decision
+
+        # --- denied file changes ---
+        if evidence_status.denied_files_changed and not allow_denied_file_changes:
+            decision = ControlDecision(
+                passed=False,
+                action="needs_human_review",
+                reason=f"Worker changed denied files: {evidence_status.denied_files_changed}",
+                severity="high",
+                failure_category="policy_error",
+                failure_origin="worker",
+                recovery_hint="needs_human_review",
+            )
+            if policy.mode == "log":
+                decision.passed = True
+                decision.action = "continue"
+            return decision
+
+        # --- missing required evidence ---
+        if evidence_status.has_missing_required:
+            missing_keys = [i.key for i in evidence_status.items if i.status == "missing"]
+            decision = ControlDecision(
+                passed=False,
+                action="needs_human_review",
+                reason=f"Missing required evidence: {missing_keys}",
+                severity="medium",
+                failure_category="task_quality_error",
+                failure_origin="worker",
+                recovery_hint="request_evidence",
+                evidence_required=True,
+            )
+            if policy.mode == "log":
+                decision.passed = True
+                decision.action = "continue"
+            return decision
+
+        # --- worker reported failure ---
+        if evidence_status.worker_status == "failed":
+            decision = ControlDecision(
+                passed=False,
+                action="fail",
+                reason=f"Worker reported failure: {evidence_status.reported_summary[:200]}",
+                severity="medium",
+                failure_category="task_quality_error",
+                failure_origin="worker",
+                recovery_hint="retry",
+            )
+            if policy.mode == "log":
+                decision.passed = True
+                decision.action = "continue"
+            return decision
+
+        # --- success ---
+        return ControlDecision(
+            passed=True,
+            action="continue",
+            reason="Worker evidence verified",
         )
 
     # ------------------------------------------------------------------

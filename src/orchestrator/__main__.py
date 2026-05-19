@@ -142,6 +142,25 @@ def main() -> None:
     watch_parser.add_argument("--once", action="store_true", help="Render once and exit (no polling)")
     watch_parser.add_argument("--interval", type=float, default=1.0, help="Refresh interval in seconds (default: 1.0)")
 
+    worker_parser = subparsers.add_parser("worker", help="Create and inspect worker task packets")
+    worker_subparsers = worker_parser.add_subparsers(dest="worker_command", required=True)
+
+    worker_create_parser = worker_subparsers.add_parser("create", help="Create a worker task packet")
+    worker_create_parser.add_argument("--objective", required=True, help="Task objective")
+    worker_create_parser.add_argument("--title", help="Task title (defaults to objective prefix)")
+    worker_create_parser.add_argument("--allowed", nargs="*", default=[], help="Allowed file paths")
+    worker_create_parser.add_argument("--denied", nargs="*", default=[], help="Denied file paths")
+    worker_create_parser.add_argument("--protected", nargs="*", default=[], help="Protected file paths")
+    worker_create_parser.add_argument("--check", nargs="*", default=[], dest="checks", help="Required check commands")
+    worker_create_parser.add_argument("--evidence", nargs="*", default=[], help="Expected evidence keys")
+    worker_create_parser.add_argument("--risk", choices=["low", "medium", "high"], default="low", help="Risk level")
+    worker_create_parser.add_argument("--mode", choices=["off", "log", "controlled", "orchestrated"], default="controlled", help="Run mode")
+    worker_create_parser.add_argument("--run-id", default="", help="Run ID (auto-generated if omitted)")
+    worker_create_parser.add_argument("--task-id", default="", help="Task ID (auto-generated if omitted)")
+
+    worker_inspect_parser = worker_subparsers.add_parser("inspect", help="Inspect a completed worker task packet")
+    worker_inspect_parser.add_argument("path", help="Path to the packet directory (.aao/tasks/<run_id>/<task_id>)")
+
     args = parser.parse_args()
 
     if args.command == "ask":
@@ -168,6 +187,8 @@ def main() -> None:
         _handle_status_command(args)
     elif args.command == "watch":
         _handle_watch_command(args)
+    elif args.command == "worker":
+        _handle_worker_command(args)
 
 
 def _handle_analyze_command(args) -> None:
@@ -988,6 +1009,84 @@ def _handle_watch_command(args) -> None:
             return
 
         _time.sleep(max(0.1, args.interval))
+
+
+def _handle_worker_command(args) -> None:
+    """Handle worker create/inspect commands."""
+    from .worker_protocol import (
+        WorkerTaskPacket,
+        classify_worker_evidence,
+        load_manifest,
+        list_observed_files,
+        load_worker_result_text,
+        load_worker_status,
+    )
+
+    if args.worker_command == "create":
+        packet = WorkerTaskPacket.create(
+            project_root=".",
+            run_id=args.run_id,
+            task_id=args.task_id,
+            title=args.title or "",
+            objective=args.objective,
+            allowed_files=args.allowed,
+            denied_files=args.denied,
+            protected_files=args.protected,
+            required_checks=args.checks,
+            expected_evidence=args.evidence,
+            risk_level=args.risk,
+            run_mode=args.mode,
+        )
+        packet_dir = packet.write()
+        print(json.dumps({
+            "status": "created",
+            "packet_dir": str(packet_dir),
+            "run_id": packet.run_id,
+            "task_id": packet.task_id,
+            "title": packet.title,
+            "objective": packet.objective,
+            "files": [
+                "manifest.json",
+                "task.md",
+                "constraints.md",
+                "expected_evidence.md",
+            ],
+        }, ensure_ascii=False, indent=2))
+
+    elif args.worker_command == "inspect":
+        packet_path = Path(args.path).resolve()
+        if not packet_path.is_dir():
+            print(json.dumps({"status": "error", "reason": f"Not a directory: {packet_path}"}, ensure_ascii=False, indent=2))
+            return
+
+        manifest = load_manifest(packet_path)
+        status_data = load_worker_status(packet_path)
+        result_text = load_worker_result_text(packet_path)
+        observed = list_observed_files(packet_path)
+
+        expected = manifest.get("expected_evidence", [])
+        evidence_status = classify_worker_evidence(
+            packet_path=packet_path,
+            expected_evidence=expected,
+            worker_kind=manifest.get("worker_kind", "claude_code"),
+            denied_files=manifest.get("denied_files", []),
+        )
+
+        print(json.dumps({
+            "packet_dir": str(packet_path),
+            "manifest": manifest,
+            "worker_status": status_data.get("status", "unknown"),
+            "result_summary": result_text[:300] if result_text else "",
+            "observed_files": observed,
+            "evidence_items": [
+                {"key": i.key, "status": i.status, "path": i.path, "description": i.description}
+                for i in evidence_status.items
+            ],
+            "has_missing_required": evidence_status.has_missing_required,
+            "is_malformed": evidence_status.is_malformed,
+            "changed_files": evidence_status.changed_files,
+            "denied_files_changed": evidence_status.denied_files_changed,
+        }, ensure_ascii=False, indent=2))
 
 
 if __name__ == "__main__":

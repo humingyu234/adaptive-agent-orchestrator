@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from .control_models import WorkerEvidenceStatus
 from .failure_taxonomy import FailureRecord
 from .registry import get_agent
 from .state_center import StateCenter
@@ -33,6 +34,7 @@ class ConvergenceReportWriter:
         memory_path: Path,
         failure_record: FailureRecord | None = None,
         evidence_packs: list | None = None,
+        worker_evidence: WorkerEvidenceStatus | None = None,
     ) -> Path:
         """生成并写入收敛报告"""
         report_dir = self.project_root / "outputs" / "reports"
@@ -47,6 +49,7 @@ class ConvergenceReportWriter:
             failure_record=failure_record,
             log_records=log_records,
             evidence_packs=evidence_packs,
+            worker_evidence=worker_evidence,
         )
 
         report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -61,6 +64,7 @@ class ConvergenceReportWriter:
         failure_record: FailureRecord | None,
         log_records: list[dict],
         evidence_packs: list | None = None,
+        worker_evidence: WorkerEvidenceStatus | None = None,
     ) -> dict[str, Any]:
         """构建报告结构"""
         event_counter = self._count_events(state.execution_trace)
@@ -139,6 +143,7 @@ class ConvergenceReportWriter:
             "failure_summary": self._build_failure_summary(failure_record),
             "recovery_summary": self._build_recovery_summary(state),
             "evidence_summary": self._build_evidence_summary(evidence_packs or []),
+            "worker_evidence_summary": self._build_worker_evidence_summary(worker_evidence),
         }
 
     def load_log_records(self, state: StateCenter) -> list[dict]:
@@ -412,6 +417,25 @@ class ConvergenceReportWriter:
         return {
             "steps_with_evidence": len(steps),
             "steps": steps,
+        }
+
+    def _build_worker_evidence_summary(self, worker_evidence: WorkerEvidenceStatus | None) -> dict:
+        if worker_evidence is None:
+            return {"available": False, "task_id": None}
+        return {
+            "available": True,
+            "task_id": worker_evidence.task_id,
+            "worker_kind": worker_evidence.worker_kind,
+            "worker_status": worker_evidence.worker_status,
+            "has_missing_required": worker_evidence.has_missing_required,
+            "is_malformed": worker_evidence.is_malformed,
+            "items": [
+                {"key": i.key, "status": i.status, "path": i.path, "description": i.description}
+                for i in worker_evidence.items
+            ],
+            "changed_files": worker_evidence.changed_files,
+            "denied_files_changed": worker_evidence.denied_files_changed,
+            "reported_summary": worker_evidence.reported_summary[:500] if worker_evidence.reported_summary else "",
         }
 
     def _build_failure_summary(self, failure_record: FailureRecord | None) -> dict:

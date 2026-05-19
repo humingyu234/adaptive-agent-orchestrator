@@ -10,6 +10,7 @@ import time
 from datetime import datetime, timezone
 from typing import Any
 
+from .control_models import WorkerEvidenceStatus
 from .models import RunResult
 from .state_center import StateCenter
 
@@ -37,6 +38,7 @@ def build_live_view(
     workflow_total: int | None = None,
     report_path: str | None = None,
     evidence_path: str | None = None,
+    worker_evidence: WorkerEvidenceStatus | None = None,
 ) -> dict[str, Any]:
     """Build a structured live-view dictionary from runtime state.
 
@@ -236,6 +238,7 @@ def build_live_view(
         "last_failure_origin": last_failure_origin,
         "last_recovery_hint": last_recovery_hint,
         "evidence_status": evidence_status,
+        "worker_evidence": _format_worker_evidence(worker_evidence),
         "human_review_required": human_review_required,
         "human_review_state": human_review_state,
         "report_path": _report_path,
@@ -334,6 +337,32 @@ def render_live_view(view: dict[str, Any]) -> str:
     lines.append("")
     lines.append(f"  Evidence:   {view.get('evidence_status', '-')}")
 
+    # ---- worker evidence -----------------------------------------------------
+    worker_evidence = view.get("worker_evidence")
+    if worker_evidence:
+        lines.append("")
+        lines.append("Worker Evidence")
+        lines.append(f"  Task:       {worker_evidence.get('task_id', '-')}")
+        lines.append(f"  Kind:       {worker_evidence.get('worker_kind', '-')}")
+        lines.append(f"  Status:     {worker_evidence.get('worker_status', '-')}")
+        if worker_evidence.get("is_malformed"):
+            lines.append("  !! MALFORMED result")
+        if worker_evidence.get("has_missing_required"):
+            lines.append("  !! MISSING required evidence")
+        if worker_evidence.get("denied_files_changed"):
+            lines.append(f"  !! DENIED files changed: {worker_evidence['denied_files_changed']}")
+        items = worker_evidence.get("items", [])
+        if items:
+            for item in items:
+                marker = {"observed": "[+]", "reported": "[?]", "missing": "[-]", "invalid": "[!]"}.get(item["status"], "[ ]")
+                lines.append(f"  {marker} {item['key']}: {item['status']}")
+        changed = worker_evidence.get("changed_files", [])
+        if changed:
+            lines.append(f"  Files changed: {', '.join(changed)}")
+        summary = worker_evidence.get("reported_summary", "")
+        if summary:
+            lines.append(f"  Summary: {summary[:120]}")
+
     # ---- human review --------------------------------------------------------
     hr_state = view.get("human_review_state", "none")
     if hr_state and hr_state != "none":
@@ -385,6 +414,26 @@ def _status_label(status: str) -> str:
     if status == "human_rejected":
         return "!! REJECTED (human)"
     return status
+
+
+def _format_worker_evidence(worker_evidence: WorkerEvidenceStatus | None) -> dict[str, Any] | None:
+    """Format WorkerEvidenceStatus into a live-view-friendly dict."""
+    if worker_evidence is None:
+        return None
+    return {
+        "task_id": worker_evidence.task_id,
+        "worker_kind": worker_evidence.worker_kind,
+        "worker_status": worker_evidence.worker_status,
+        "has_missing_required": worker_evidence.has_missing_required,
+        "is_malformed": worker_evidence.is_malformed,
+        "items": [
+            {"key": i.key, "status": i.status, "path": i.path, "description": i.description}
+            for i in worker_evidence.items
+        ],
+        "changed_files": worker_evidence.changed_files,
+        "denied_files_changed": worker_evidence.denied_files_changed,
+        "reported_summary": worker_evidence.reported_summary[:200] if worker_evidence.reported_summary else "",
+    }
 
 
 def _compute_elapsed(started_at: str, updated_at: str) -> str:
