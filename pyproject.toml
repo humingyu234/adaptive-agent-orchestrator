@@ -13,9 +13,11 @@ dependencies = [
 [project.optional-dependencies]
 search = ["ddgs>=6.0", "httpx>=0.25"]
 llm = ["httpx>=0.25"]
+orchestrated = ["langgraph>=1.0"]
 all = [
   "ddgs>=6.0",
   "httpx>=0.25",
+  "langgraph>=1.0",
 ]
 
 [build-system]

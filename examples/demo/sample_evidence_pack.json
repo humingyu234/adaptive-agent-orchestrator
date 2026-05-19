@@ -1,0 +1,88 @@
+{
+  "task_id": "plan-1de9a60c5eef",
+  "step_name": "code_refactor",
+  "worker_status": "completed",
+  "test_output": "14 passed, 0 failed",
+  "files_changed": [
+    "src/errors.py",
+    "src/middleware.py",
+    "tests/test_errors.py"
+  ],
+  "tools_called": [
+    "read_file",
+    "edit_file",
+    "run_tests",
+    "run_lint"
+  ],
+  "evidence_items": [
+    {
+      "key": "test_output",
+      "status": "observed",
+      "path": "test_results.json",
+      "description": "14 passed, 0 failed"
+    },
+    {
+      "key": "diff_patch",
+      "status": "observed",
+      "path": "diff.patch",
+      "description": "Unified diff of 3 files"
+    },
+    {
+      "key": "lint_output",
+      "status": "observed",
+      "path": "lint.log",
+      "description": "Linter output — no issues found"
+    }
+  ],
+  "plan_verification": {
+    "plan_id": "plan-1de9a60c5eef",
+    "task_size": "large",
+    "steps_count": 12,
+    "has_success_criteria": true,
+    "has_required_evidence": true,
+    "blocking_concerns": [],
+    "approved": true,
+    "verification_passed": true
+  },
+  "control_decisions": [
+    {
+      "action": "continue",
+      "passed": true,
+      "reason": "Plan verified",
+      "severity": null,
+      "failure_category": null,
+      "failure_origin": null,
+      "recovery_hint": null,
+      "evidence_required": false,
+      "next_step_hint": null,
+      "guardrail_name": null,
+      "stage": null
+    },
+    {
+      "action": "continue",
+      "passed": true,
+      "reason": "Worker evidence verified",
+      "severity": null,
+      "failure_category": null,
+      "failure_origin": null,
+      "recovery_hint": null,
+      "evidence_required": false,
+      "next_step_hint": null,
+      "guardrail_name": null,
+      "stage": null
+    },
+    {
+      "action": "continue",
+      "passed": true,
+      "reason": "",
+      "severity": null,
+      "failure_category": null,
+      "failure_origin": null,
+      "recovery_hint": null,
+      "evidence_required": false,
+      "next_step_hint": null,
+      "guardrail_name": null,
+      "stage": null
+    }
+  ]
+}

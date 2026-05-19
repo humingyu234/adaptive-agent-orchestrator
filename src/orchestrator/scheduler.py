@@ -113,6 +113,88 @@ class Scheduler:
             start_index=0,
         )
 
+    def run_orchestrated(
+        self,
+        *,
+        plan: Any,
+        query: str = "",
+        worker_registry: dict | None = None,
+    ) -> tuple[StateCenter, RunResult]:
+        """Execute an approved PlanContract via the LangGraph runner.
+
+        Requires LangGraph to be installed.  Callers should check
+        _LANGGRAPH_AVAILABLE before calling, or catch RuntimeError.
+        Returns the standard (StateCenter, RunResult) tuple for compatibility.
+        """
+        from .runners.langgraph_runner import LangGraphRunner, _LANGGRAPH_AVAILABLE
+
+        if not _LANGGRAPH_AVAILABLE:
+            raise RuntimeError(
+                "run_orchestrated() requires langgraph to be installed. "
+                "Install with: pip install langgraph"
+            )
+
+        state = StateCenter(query=query, max_steps=self.workflow.get("max_steps", 10))
+        steps = getattr(plan, "steps", [])
+        state.metadata.workflow_total = len(steps)
+        memory_context = self.memory_manager.retrieve_context(query=query)
+        state.write("memory_context", memory_context.to_summary(), "memory_manager")
+
+        self._create_runtime_checkpoint(
+            state=state,
+            created_by="scheduler",
+            reason="initial_state_orchestrated",
+            node_name="plan_contract",
+            node_index=-1,
+        )
+
+        runner = LangGraphRunner(project_root=str(self.project_root))
+        result = runner.run(
+            plan=plan,
+            control_plane=self.control_plane,
+            memory_manager=self.memory_manager,
+            project_root=str(self.project_root),
+            policy=self._policy,
+            recovery_playbook=self._playbook,
+            state_center=state,
+            worker_registry=worker_registry or {},
+        )
+
+        # Map RunnerResult -> RunResult
+        run_result = RunResult(
+            task_id=result.run_id,
+            status=result.status,
+            final_node=result.last_node,
+            reason=result.reason,
+            failure_reason=result.failure_record.get("reason", "") if result.failure_record else "",
+            state_version=state.version,
+            checkpoint_dir=str(self._checkpoint_dir(state)),
+            convergence_report_path=result.report_path,
+            evidence_path=result.evidence_paths[0] if result.evidence_paths else None,
+            memory_path=None,
+        )
+
+        # Record control events in state trace
+        for event in result.control_events:
+            state.execution_trace.append(event)
+
+        # Phase 15: attach runner summary for report/live-view
+        runner_summary = {
+            "runner": "langgraph",
+            "checkpoint_id": result.checkpoint_id,
+            "last_node": result.last_node,
+            "node_count": len(steps),
+            "control_decisions": len(result.control_events),
+            "human_review_state": result.human_review_state,
+            "evidence_count": len(result.evidence_paths),
+        }
+        state.write("runner_summary", runner_summary, "scheduler")
+
+        state.set_status(result.status, result.reason)
+        state.save_to(self._state_path(state))
+
+        return state, run_result
+
     def resume_human_review(
         self,
         *,
@@ -1298,12 +1380,14 @@ class Scheduler:
             report_path=str(report_path),
         )
 
+        runner_summary = state.data_pool.intermediate.get("runner_summary")
         report_path = self.report_writer.write(
             state=state,
             final_node=final_node,
             memory_path=memory_path,
             failure_record=failure_record,
             evidence_packs=evidence_packs,
+            runner_summary=runner_summary if isinstance(runner_summary, dict) else None,
         )
 
         evidence_path = self._write_evidence(

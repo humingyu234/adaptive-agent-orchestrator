@@ -40,6 +40,7 @@ def build_live_view(
     evidence_path: str | None = None,
     worker_evidence: WorkerEvidenceStatus | None = None,
     planning_summary: dict[str, Any] | None = None,
+    runner_summary: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build a structured live-view dictionary from runtime state.
 
@@ -54,7 +55,16 @@ def build_live_view(
     *report_path* and *evidence_path*, when provided, override paths derived
     from *result*.  Use these when reading a real report JSON that does not
     contain a serialised RunResult.
+
+    *runner_summary*, when provided, includes LangGraph/orchestrated fields
+    such as runner name, checkpoint_id, node_count, control_decisions, and
+    human_review_state.
     """
+    # Auto-detect runner_summary from state if not explicitly provided
+    if runner_summary is None:
+        runner_summary = state.data_pool.intermediate.get("runner_summary")
+    if not isinstance(runner_summary, dict):
+        runner_summary = None
     trace = state.execution_trace
 
     # ---- evaluation-derived fields -------------------------------------------
@@ -241,6 +251,7 @@ def build_live_view(
         "evidence_status": evidence_status,
         "worker_evidence": _format_worker_evidence(worker_evidence),
         "planning_summary": planning_summary,
+        "runner_summary": runner_summary,
         "human_review_required": human_review_required,
         "human_review_state": human_review_state,
         "report_path": _report_path,
@@ -278,6 +289,21 @@ def render_live_view(view: dict[str, Any]) -> str:
     worker = view.get("current_worker")
     if worker:
         lines.append(f"  Worker:     {worker}")
+
+    # ---- runner (Phase 15) ----------------------------------------------------
+    runner = view.get("runner_summary")
+    if runner and isinstance(runner, dict):
+        lines.append("")
+        lines.append("Runner")
+        lines.append(f"  type:       {runner.get('runner', '-')}")
+        ckpt = runner.get("checkpoint_id")
+        if ckpt:
+            lines.append(f"  checkpoint: {ckpt}")
+        lines.append(f"  nodes:      {runner.get('node_count', 0)}")
+        lines.append(f"  controls:   {runner.get('control_decisions', 0)}")
+        lines.append(f"  evidence:   {runner.get('evidence_count', 0)}")
+        if runner.get("human_review_state"):
+            lines.append(f"  review:     {runner.get('human_review_state')}")
 
     # ---- control decisions ---------------------------------------------------
     eval_dec = view.get("last_evaluator_decision")

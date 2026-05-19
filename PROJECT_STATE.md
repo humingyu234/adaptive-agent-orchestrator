@@ -273,3 +273,26 @@
   - parallel_batch_runner 第一阶段只应做批量验证和 demo 样本生成，不做真正并行结果合并；多 worker 结果合并、冲突处理、缺失 worker 降级属于 Execution Router 后续阶段
   - background queue / overnight summary 有长期价值，但当前不进入第一批实现；先把 ask / status / resume / review policy / demo 链路打穿
 
+
+## Phase 17 完成 — Demo, README, and Release Proof Pack (2026-05-20)
+
+### 新增能力
+- **README 首页** — 30 秒内可理解：What / Who / Problem / Demo / Proof / Scope
+- **3 个确定性 Demo** — missing_evidence, protected_file, full_control_loop
+  - 0 LLM, 0 网络, 0 文件系统，调用真实 AAO 控制代码
+  - 每个 demo 自动生成 sample outputs
+- **Proof Pack** — 22 条 claim→proof 映射表 + 工程决策 + 运行命令
+- **Demo 录制脚本** — 3-5 分钟，含时间戳和话术（docs/demo.md）
+- **已知限制** — 诚实的边界声明（docs/known_limitations.md）
+- **58 新测试** — test_demo_scripts.py (32) + test_readme_examples.py (26)
+
+### 全量测试
+901 passed, 1 skipped, 0 failures — 无回归
+
+### 下一步
+Phase 17 是 v1 product-release 计划的最后一个 phase。AAO 现在具备：
+- 完整的控制层（ControlPlane, Policy, Recovery, Evidence, Guardrails）
+- 22 个 golden scenarios 证明 5 个 control contracts
+- 3 个确定性 demo 展示核心价值
+- 清晰的 README / Proof Pack / Demo Script / Known Limitations
+- 用户可直接录制 demo 视频并用于 interview/outreach

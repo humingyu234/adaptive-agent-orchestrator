@@ -1,0 +1,7 @@
+{
+  "action": "request_evidence",
+  "reason": "Missing evidence: missing_evidence",
+  "attempt_count": 0,
+  "max_attempts": 1,
+  "recovery_hint": "request_evidence"
+}

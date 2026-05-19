@@ -183,7 +183,8 @@ class RouterUnitTest(unittest.TestCase):
         decision = route_task("do research", explicit_workflow="deep_research")
         self.assertEqual(decision.workflow_hint, "deep_research")
 
-    def test_orchestrated_shows_future_runtime_support(self):
+    @patch("orchestrator.task_router._langgraph_available", return_value=False)
+    def test_orchestrated_shows_future_runtime_support(self, _mock):
         decision = route_task("implement full phase with multi-step architecture")
         self.assertEqual(decision.run_mode, "orchestrated")
         self.assertEqual(decision.runtime_support, "future_orchestrated")
@@ -365,8 +366,9 @@ class AskRouteIntegrationTest(unittest.TestCase):
         output = captured.getvalue()
         self.assertNotIn("log/off", output)
 
+    @patch("orchestrator.task_router._langgraph_available", return_value=False)
     @patch("orchestrator.__main__.Path.cwd")
-    def test_ask_orchestrated_route_requires_force_run(self, mock_cwd):
+    def test_ask_orchestrated_route_requires_force_run(self, mock_cwd, _mock_lg):
         """Orchestrated route without --force-run exits with a note."""
         import io
         import sys
@@ -690,7 +692,8 @@ class BoundaryTest(unittest.TestCase):
         decision = route_task("resume from checkpoint and audit the full workflow")
         self.assertEqual(decision.task_size, "large")
 
-    def test_orchestrated_route_does_not_fake_langgraph_support(self):
+    @patch("orchestrator.task_router._langgraph_available", return_value=False)
+    def test_orchestrated_route_does_not_fake_langgraph_support(self, _mock):
         decision = route_task("implement full workflow with parallel agents")
         self.assertEqual(decision.run_mode, "orchestrated")
         self.assertEqual(decision.runtime_support, "future_orchestrated")
@@ -720,7 +723,8 @@ class RunModeSemanticsTest(unittest.TestCase):
         d = route_task("fix the bug", explicit_mode="controlled")
         self.assertTrue(should_execute_workflow(d))
 
-    def test_should_execute_workflow_orchestrated_future_returns_false(self):
+    @patch("orchestrator.task_router._langgraph_available", return_value=False)
+    def test_should_execute_workflow_orchestrated_future_returns_false(self, _mock):
         d = route_task("implement full phase architecture migration")
         self.assertEqual(d.runtime_support, "future_orchestrated")
         self.assertFalse(should_execute_workflow(d))
@@ -753,7 +757,8 @@ class RunModeSemanticsTest(unittest.TestCase):
         d = route_task("fix bug", explicit_mode="controlled")
         self.assertFalse(should_only_log(d))
 
-    def test_requires_future_runner_orchestrated_future_returns_true(self):
+    @patch("orchestrator.task_router._langgraph_available", return_value=False)
+    def test_requires_future_runner_orchestrated_future_returns_true(self, _mock):
         d = route_task("implement full phase architecture migration")
         self.assertTrue(requires_future_runner(d))
 
@@ -761,12 +766,15 @@ class RunModeSemanticsTest(unittest.TestCase):
         d = route_task("fix bug", explicit_mode="controlled")
         self.assertFalse(requires_future_runner(d))
 
-    def test_requires_future_runner_orchestrated_override_returns_false(self):
+    @patch("orchestrator.task_router._langgraph_available", return_value=False)
+    def test_requires_future_runner_orchestrated_override_returns_true(self, _mock):
         d = route_task("explain this", explicit_mode="orchestrated")
-        # User override still gets future_orchestrated on a small task
+        # User override still gets future_orchestrated on a small task when
+        # langgraph is not available
         self.assertTrue(requires_future_runner(d))
 
-    def test_effective_run_mode_orchestrated_future_falls_back(self):
+    @patch("orchestrator.task_router._langgraph_available", return_value=False)
+    def test_effective_run_mode_orchestrated_future_falls_back(self, _mock):
         d = route_task("implement full phase architecture migration")
         self.assertEqual(effective_run_mode(d), "controlled")
 
@@ -855,8 +863,9 @@ class RunModeEnforcementTest(unittest.TestCase):
         self.assertIn("_note", data)
         self.assertIn("log/off", data["_note"])
 
+    @patch("orchestrator.task_router._langgraph_available", return_value=False)
     @patch("orchestrator.__main__.Path.cwd")
-    def test_run_with_future_orchestrated_requires_force_run(self, mock_cwd):
+    def test_run_with_future_orchestrated_requires_force_run(self, mock_cwd, _mock_lg):
         """run --mode orchestrated on a large task requires --force-run."""
         from orchestrator.__main__ import _handle_run_command
 

@@ -1,0 +1,9 @@
+{
+  "origin": "policy",
+  "category": "policy_error",
+  "reason": "protected_file_change",
+  "recovery_hint": "needs_human_review",
+  "agent_name": "demo_worker",
+  "severity": "high",
+  "context": {}
+}

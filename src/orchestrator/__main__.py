@@ -819,7 +819,18 @@ def _handle_run_command(args) -> None:
         project_root=workflow_path.parent.parent,
         llm_overrides=llm_overrides,
     )
-    state, result = scheduler.run(query=args.query)
+
+    # Phase 15: orchestrated mode with LangGraph runner
+    if plan is not None and decision.run_mode == "orchestrated":
+        from .runners.langgraph_runner import _LANGGRAPH_AVAILABLE
+        if _LANGGRAPH_AVAILABLE:
+            state, result = scheduler.run_orchestrated(
+                plan=plan, query=args.query,
+            )
+        else:
+            state, result = scheduler.run(query=args.query)
+    else:
+        state, result = scheduler.run(query=args.query)
     state.record_route_decision(route_decision_to_dict(decision))
     preview = None
     if args.raw:

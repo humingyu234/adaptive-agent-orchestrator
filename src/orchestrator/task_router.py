@@ -259,8 +259,12 @@ def route_task(
 
     # ---- runtime support -----------------------------------------------------
     if run_mode == "orchestrated":
-        runtime_support: RuntimeSupport = "future_orchestrated"
-        reasons.append("orchestrated runner is not implemented yet")
+        if _langgraph_available():
+            runtime_support: RuntimeSupport = "native"
+            reasons.append("orchestrated runner (langgraph) available")
+        else:
+            runtime_support = "future_orchestrated"
+            reasons.append("orchestrated runner is not implemented yet")
     elif run_mode == "off":
         runtime_support = "route_only"
     elif run_mode == "log":
@@ -398,11 +402,14 @@ def should_only_log(decision: TaskRouteDecision) -> bool:
 
 
 def requires_future_runner(decision: TaskRouteDecision) -> bool:
-    """Return True if the run mode requires a runner that does not exist yet."""
-    return (
-        decision.run_mode == "orchestrated"
-        and decision.runtime_support == "future_orchestrated"
-    )
+    """Return True if the run mode requires a runner that does not exist yet.
+
+    When LangGraph is installed, orchestrated mode is supported natively
+    by the LangGraphRunner, so future_orchestrated becomes False.
+    """
+    if decision.run_mode != "orchestrated":
+        return False
+    return decision.runtime_support == "future_orchestrated"
 
 
 def effective_run_mode(decision: TaskRouteDecision) -> RunMode:
@@ -424,3 +431,22 @@ def effective_run_mode(decision: TaskRouteDecision) -> RunMode:
 def route_and_check(query: str, *, explicit_mode: RunMode | None = None) -> TaskRouteDecision:
     """Route a task and return the decision.  Pure convenience wrapper."""
     return route_task(query, explicit_mode=explicit_mode)
+
+
+# =============================================================================
+# LangGraph availability — cached so we only try the import once
+# =============================================================================
+
+_LANGGRAPH_CACHE: bool | None = None
+
+
+def _langgraph_available() -> bool:
+    """Return True if the LangGraph runner can be imported."""
+    global _LANGGRAPH_CACHE
+    if _LANGGRAPH_CACHE is None:
+        try:
+            from orchestrator.runners.langgraph_runner import _LANGGRAPH_AVAILABLE
+            _LANGGRAPH_CACHE = _LANGGRAPH_AVAILABLE
+        except ImportError:
+            _LANGGRAPH_CACHE = False
+    return _LANGGRAPH_CACHE
