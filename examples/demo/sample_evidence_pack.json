@@ -1,5 +1,5 @@
 {
-  "task_id": "plan-d83861310db2",
+  "task_id": "plan-223d537fbb4e",
   "step_name": "code_refactor",
   "worker_status": "completed",
   "test_output": "14 passed, 0 failed",
@@ -35,7 +35,7 @@
     }
   ],
   "plan_verification": {
-    "plan_id": "plan-d83861310db2",
+    "plan_id": "plan-223d537fbb4e",
     "task_size": "large",
     "steps_count": 12,
     "has_success_criteria": true,

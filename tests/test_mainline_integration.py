@@ -287,7 +287,7 @@ class TestTestFailure:
         # Worker may report failures but evidence is still collected
         items = result.evidence_status["items"]
         observed_keys = [i["key"] for i in items if i["status"] == "observed"]
-        assert len(observed_keys) >= 0  # evidence collection itself works
+        assert len(observed_keys) >= 1  # test failure still produces evidence
 
 
 # ---------------------------------------------------------------------------

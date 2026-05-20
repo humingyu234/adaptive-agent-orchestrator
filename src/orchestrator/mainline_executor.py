@@ -182,7 +182,24 @@ class MainlineExecutor:
             task_size=task_size,
             run_mode=run_mode,
         )
-        plan.approve()
+        try:
+            plan.approve()
+        except ValueError:
+            return MainlineResult(
+                run_id="",
+                task_id="",
+                plan_id=plan.plan_id,
+                status="blocked_needs_review",
+                worker_mode=worker_mode,
+                worker_result={"behaviour": "blocked", "summary": "Plan has blocking concerns"},
+                evidence_status=None,
+                control_decisions=[{
+                    "action": "needs_human_review",
+                    "passed": False,
+                    "reason": f"Plan has {len(plan.blocking_concerns)} blocking concern(s)",
+                }],
+                summary=f"Plan blocked: {plan.blocking_concerns[0] if plan.blocking_concerns else 'unknown'}",
+            )
         return self.execute(plan, worker_mode=worker_mode)
 
     # ------------------------------------------------------------------

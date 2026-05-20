@@ -44,11 +44,11 @@ def _pick_behaviour(packet: WorkerTaskPacket, explicit: str | None) -> str:
         return explicit
     # Default: detect from packet title / objective keywords
     combined = f"{packet.title} {packet.objective}".lower()
-    if "missing" in combined or "no evidence" in combined:
+    if "missing evidence" in combined or "no evidence" in combined or "skip evidence" in combined:
         return BEHAVIOUR_MISSING_EVIDENCE
-    if "protected" in combined or "secret" in combined or "credential" in combined:
+    if "protected file" in combined or "secrets" in combined or "credential" in combined:
         return BEHAVIOUR_PROTECTED_FILE
-    if "fail" in combined or "broken" in combined or "error" in combined:
+    if "fail test" in combined or "broken test" in combined or "test failure" in combined:
         return BEHAVIOUR_TEST_FAILURE
     return BEHAVIOUR_SUCCESS
 

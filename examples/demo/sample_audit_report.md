@@ -1,4 +1,4 @@
-# Audit Report — plan-d83861310db2
+# Audit Report — plan-223d537fbb4e
 
 ## Task
 Refactor error handling in src/errors.py, src/middleware.py, and tests/test_errors.py to use structured error types
