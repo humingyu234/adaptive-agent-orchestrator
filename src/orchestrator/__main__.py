@@ -16,6 +16,7 @@ from .project_context import ProjectContext
 from .live_view import build_live_view, is_terminal, render_live_view
 from .regression_compare import RegressionCompare, RegressionSignal, format_regression_report
 
+from .mainline_executor import MainlineExecutor
 from .planning import (
     PlanningCouncil,
     PlanContract,
@@ -57,6 +58,7 @@ def main() -> None:
     ask_parser.add_argument("--mode", choices=["off", "log", "controlled", "orchestrated"], help="Override the default run mode")
     ask_parser.add_argument("--force-run", action="store_true", help="Force workflow execution even for log/off routes")
     ask_parser.add_argument("--approve", action="store_true", help="Auto-approve plan for complex/orchestrated tasks")
+    ask_parser.add_argument("--worker-mode", choices=["fake", "packet"], help="Use mainline executor with specified worker (skips legacy YAML workflow)")
 
     review_parser = subparsers.add_parser("review", help="Approve or reject a paused human review task")
     review_parser.add_argument("--task-id", required=True, help="Task ID waiting for human review")
@@ -472,6 +474,72 @@ def _prepare_approved_plan_for_command(
     return plan
 
 
+def _handle_ask_mainline(args, decision, plan: PlanContract | None) -> None:
+    """Execute the ask command through the mainline executor path.
+
+    When *plan* is not None it was approved by the Planning Council gate.
+    When *plan* is None the task was not large enough to trigger the gate,
+    so we build a plan directly from the query.
+    """
+    worker_mode = getattr(args, "worker_mode", "fake")
+    executor = MainlineExecutor(Path.cwd())
+
+    if plan is not None:
+        result = executor.execute(plan, worker_mode=worker_mode)
+    else:
+        result = executor.execute_from_query(
+            args.query,
+            worker_mode=worker_mode,
+            run_mode=decision.run_mode,
+            task_size=decision.task_size,
+        )
+
+    output = result.to_dict()
+    output["route_decision"] = route_decision_to_dict(decision)
+
+    fmt = getattr(args, "format", "json")
+    if fmt == "text":
+        _print_mainline_result_text(result)
+    else:
+        print(json.dumps(output, ensure_ascii=False, indent=2))
+
+
+def _print_mainline_result_text(result) -> None:
+    """Print MainlineResult in human-readable text format."""
+    sep = "=" * 64
+    print(sep)
+    print("AAO Mainline Execution Result")
+    print(sep)
+    print(f"  Status:       {result.status}")
+    print(f"  Worker Mode:  {result.worker_mode}")
+    print(f"  Run ID:       {result.run_id}")
+    print(f"  Task ID:      {result.task_id}")
+    print(f"  Plan ID:      {result.plan_id}")
+    print()
+    if result.evidence_status:
+        es = result.evidence_status
+        print("Evidence:")
+        for item in es.get("items", []):
+            marker = {"observed": "[OBSERVED]", "reported": "[REPORTED]", "missing": "[MISSING]"}.get(
+                item["status"], "[?]"
+            )
+            print(f"  {marker} {item['key']}")
+        print(f"  Changed files: {result.changed_files}")
+    print()
+    print("Control Decisions:")
+    for d in result.control_decisions:
+        status = "PASS" if d["passed"] else "BLOCK"
+        print(f"  [{status}] {d['action']}: {d['reason']}")
+    print()
+    print(f"  Summary: {result.summary}")
+    print()
+    print("Artifacts:")
+    print(f"  Report:   {result.report_path}")
+    print(f"  Evidence: {result.evidence_path}")
+    print(f"  Worker:   {result.worker_packet_path}")
+    print(sep)
+
+
 def _handle_ask_command(args) -> None:
     _load_optional_dotenv()
     project_root = Path.cwd()
@@ -507,6 +575,12 @@ def _handle_ask_command(args) -> None:
     plan = _prepare_approved_plan_for_command(args, decision, support_text_format=True)
     if plan is None and decision.task_size == "large" and decision.run_mode in ("orchestrated", "controlled"):
         return  # blocked by planning gate — message already printed
+
+    # Mainline executor path (--worker-mode fake|packet)
+    worker_mode = getattr(args, "worker_mode", None)
+    if worker_mode is not None:
+        _handle_ask_mainline(args, decision, plan)
+        return
 
     llm_config = _parse_llm_config(args)
     if llm_config.get("global_provider"):
