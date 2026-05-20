@@ -14,6 +14,7 @@ dependencies = [
 search = ["ddgs>=6.0", "httpx>=0.25"]
 llm = ["httpx>=0.25"]
 orchestrated = ["langgraph>=1.0"]
+dev = ["pytest>=8", "ruff>=0.3"]
 all = [
   "ddgs>=6.0",
   "httpx>=0.25",

@@ -97,6 +97,7 @@ def main() -> None:
         task_size="large",
         run_mode="controlled",
     )
+    plan.plan_id = "demo-full-control-loop-001"
 
     print_section("Plan ID", plan.plan_id)
     print_section("Task size", plan.task_size)

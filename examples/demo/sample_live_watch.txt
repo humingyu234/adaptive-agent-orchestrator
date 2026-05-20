@@ -1,8 +1,8 @@
-AAO Live Watch — plan-223d537fbb4e
+AAO Live Watch — demo-full-control-loop-001
 ───────────────────────────────────────────
   Status:       PASSED
   Task:         Refactor error handling in src/errors.py, src/middleware.py, and tests/test_errors.py to use structured error types
-  Plan:         plan-223d537fbb4e (large, 12 steps)
+  Plan:         demo-full-control-loop-001 (large, 12 steps)
   Progress:     3/3 steps complete
   Current step: audit_report
   Last decision: continue — all checks passed

@@ -431,17 +431,16 @@ class TestAuditReport:
         """Report must be honest — if evidence is missing, don't claim success."""
         executor = MainlineExecutor(REPO_ROOT)
         plan = _build_plan(
-            "Fix something quickly",
-            required_evidence=["test_output.txt", "diff.patch"],
+            "Fix quickly with missing evidence and no proof of work",
         )
-        result = executor.execute(plan, worker_mode="packet")
+        result = executor.execute(plan, worker_mode="fake")
 
         report_data = json.loads(Path(result.report_path).read_text())
         summary = report_data["execution_summary"]
         has_missing = report_data["evidence_summary"]["missing"] > 0
 
-        if has_missing:
-            assert summary["has_missing_evidence"] is True
+        assert has_missing, "Expected missing evidence in report"
+        assert summary["has_missing_evidence"] is True
 
     def test_evidence_pack_is_valid_json(self) -> None:
         executor = MainlineExecutor(REPO_ROOT)

@@ -10,6 +10,7 @@ YAML-workflow path through Scheduler is preserved for legacy/native mode.
 from __future__ import annotations
 
 import json
+import re
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -17,8 +18,11 @@ from pathlib import Path
 from typing import Any
 
 from .control_models import ControlDecision, WorkerEvidenceStatus
+from .control_plane import ControlPlane
 from .planning import PlanContract, PlannedWorkerTask, plan_contract_to_dict
+from .policy import Policy
 from .worker_protocol import (
+    PacketFiles,
     WorkerTaskPacket,
     classify_worker_evidence,
     classify_worker_evidence_from_packet,
@@ -49,7 +53,7 @@ class MainlineResult:
     run_id: str = ""
     task_id: str = ""
     plan_id: str = ""
-    status: str = "unknown"  # completed, blocked, failed
+    status: str = "unknown"  # completed, blocked_needs_review, blocked_failed, pending_external
     worker_mode: str = "fake"
     worker_result: dict[str, Any] = field(default_factory=dict)
     evidence_status: dict[str, Any] | None = None
@@ -87,16 +91,43 @@ class MainlineExecutor:
     """Drives the full AAO control chain for a plan.
 
     Takes a PlanContract and a worker_mode, then:
-    1. Converts plan to WorkerTaskPacket(s)
+    0. Enforces plan approval status
+    1. Converts plan to WorkerTaskPacket (with policy-derived boundaries)
     2. Executes worker (fake writes files; packet writes to disk)
     3. Classifies evidence
-    4. Runs ControlPlane checks (evidence, policy, guardrails)
-    5. Generates audit report
-    6. Returns MainlineResult
+    4. Checks test results for failures
+    5. Runs ControlPlane checks (evidence, policy, guardrails)
+    6. Generates audit report
+    7. Returns MainlineResult
     """
 
-    def __init__(self, project_root: Path | None = None) -> None:
+    def __init__(
+        self,
+        project_root: Path | None = None,
+        *,
+        policy: Policy | None = None,
+    ) -> None:
         self.project_root = project_root or Path.cwd()
+        self._policy = policy or self._load_policy()
+
+    @staticmethod
+    def _load_policy() -> Policy:
+        """Load policy from the standard location, falling back to defaults."""
+        policy_path = Path.cwd() / "examples" / "policy.yaml"
+        if policy_path.exists():
+            return Policy.from_dict(
+                json.loads(policy_path.read_text(encoding="utf-8")) if policy_path.suffix == ".json"
+                else _load_yaml_policy(policy_path)
+            )
+        # Try YAML load
+        try:
+            import yaml as _yaml
+            if policy_path.exists():
+                with open(policy_path, encoding="utf-8") as fh:
+                    return Policy.from_dict(_yaml.safe_load(fh) or {})
+        except Exception:
+            pass
+        return Policy.defaults()
 
     # ------------------------------------------------------------------
     # Public entry points
@@ -111,13 +142,32 @@ class MainlineExecutor:
         """Execute a plan through the mainline chain.
 
         Args:
-            plan: An approved PlanContract.
+            plan: An **approved** PlanContract.  execute() enforces this —
+                  unapproved plans are rejected.
             worker_mode: "fake" (deterministic, writes files) or "packet" (writes
                          packet to disk for external worker).
 
         Returns:
             MainlineResult with all paths, decisions, and status.
         """
+        # 0. Enforce plan approval
+        if plan.approval_status != "approved":
+            try:
+                plan.approve()
+            except ValueError:
+                return MainlineResult(
+                    plan_id=plan.plan_id,
+                    status="blocked_needs_review",
+                    worker_mode=worker_mode,
+                    worker_result={"behaviour": "blocked", "summary": "Plan not approved"},
+                    control_decisions=[{
+                        "action": "needs_human_review",
+                        "passed": False,
+                        "reason": f"Plan approval_status={plan.approval_status} — must be approved",
+                    }],
+                    summary=f"Blocked: plan not approved (status={plan.approval_status})",
+                )
+
         run_id = _utc_now_compact() + "-" + uuid.uuid4().hex[:6]
         task_id = f"task-{run_id}"
 
@@ -127,13 +177,31 @@ class MainlineExecutor:
         # 2. Execute worker
         worker_result = self._execute_worker(packet, worker_mode=worker_mode)
 
+        # 2b. Packet mode: stop here — awaiting external worker
+        if worker_mode == "packet":
+            return MainlineResult(
+                run_id=run_id,
+                task_id=task_id,
+                plan_id=plan.plan_id,
+                status="pending_external",
+                worker_mode="packet",
+                worker_result=worker_result,
+                worker_packet_path=str(packet.packet_root),
+                summary="Packet written to disk — awaiting external worker execution",
+            )
+
         # 3. Classify evidence
         evidence_status = classify_worker_evidence_from_packet(packet)
 
-        # 4. Run ControlPlane checks
-        control_decisions = self._run_control_checks(packet, evidence_status, worker_result)
+        # 4. Check test results for failures
+        test_decisions = self._check_test_results(packet)
 
-        # 5. Generate audit report
+        # 5. Run ControlPlane checks
+        control_decisions = test_decisions + self._run_control_checks(
+            packet, evidence_status, worker_result,
+        )
+
+        # 6. Generate audit report
         report_path, evidence_path = self._generate_report(
             plan=plan,
             packet=packet,
@@ -142,7 +210,7 @@ class MainlineExecutor:
             control_decisions=control_decisions,
         )
 
-        # 6. Determine overall status
+        # 7. Determine overall status
         overall_status = self._determine_status(control_decisions, evidence_status)
 
         return MainlineResult(
@@ -174,7 +242,7 @@ class MainlineExecutor:
         For small/medium tasks that don't go through Planning Council but the
         user still wants the mainline path (--worker-mode flag).
         """
-        from .planning import PlanningCouncil, build_default_council
+        from .planning import build_default_council
 
         council = build_default_council()
         plan = council.create_plan(
@@ -186,13 +254,10 @@ class MainlineExecutor:
             plan.approve()
         except ValueError:
             return MainlineResult(
-                run_id="",
-                task_id="",
                 plan_id=plan.plan_id,
                 status="blocked_needs_review",
                 worker_mode=worker_mode,
                 worker_result={"behaviour": "blocked", "summary": "Plan has blocking concerns"},
-                evidence_status=None,
                 control_decisions=[{
                     "action": "needs_human_review",
                     "passed": False,
@@ -213,7 +278,9 @@ class MainlineExecutor:
         run_id: str = "",
         task_id: str = "",
     ) -> WorkerTaskPacket:
-        """Convert a PlanContract to a WorkerTaskPacket."""
+        """Convert a PlanContract to a WorkerTaskPacket, using policy for boundaries."""
+
+        policy = self._policy
 
         # Gather file boundaries from planned_worker_tasks or extract from steps
         allowed_files: list[str] = []
@@ -237,6 +304,14 @@ class MainlineExecutor:
         if not expected_evidence:
             expected_evidence = ["test_output.txt", "diff.patch"]
 
+        # Policy-driven: protected files from the loaded policy, not hardcoded
+        protected_files = list(policy.protected_files)
+        # Policy-driven: required checks from policy
+        policy_checks = policy.get_required_checks()
+        for check in policy_checks:
+            if check not in required_checks:
+                required_checks.append(check)
+
         # Filter out standard packet outputs — these live at the packet root
         # and are verified via load_worker_status/load_worker_result_text, not
         # the observed/ evidence classifier.
@@ -258,7 +333,7 @@ class MainlineExecutor:
             worker_kind="claude_code",
             allowed_files=allowed_files,
             denied_files=denied_files,
-            protected_files=[],
+            protected_files=protected_files,
             required_checks=required_checks,
             expected_evidence=expected_evidence,
             risk_level=risk_level,
@@ -304,6 +379,46 @@ class MainlineExecutor:
         }
 
     # ------------------------------------------------------------------
+    # Test result checking (P1.2)
+    # ------------------------------------------------------------------
+
+    _TEST_FAILURE_RE = re.compile(r"(\d+)\s+failed", re.IGNORECASE)
+    _TEST_FAILED_LINE = re.compile(r"\bFAILED\b")
+
+    def _check_test_results(self, packet: WorkerTaskPacket) -> list[ControlDecision]:
+        """Parse test_output.txt for failures. Returns blocking decision if found."""
+        decisions: list[ControlDecision] = []
+
+        test_output_path = packet.packet_root / PacketFiles.TEST_OUTPUT
+        if not test_output_path.exists():
+            return decisions
+
+        content = test_output_path.read_text(encoding="utf-8", errors="replace")
+
+        # Check for FAILED lines
+        if self._TEST_FAILED_LINE.search(content):
+            # Count failures
+            match = self._TEST_FAILURE_RE.search(content)
+            failed_count = int(match.group(1)) if match else 1
+            decisions.append(ControlDecision(
+                passed=False,
+                action="needs_human_review" if self._policy.mode == "controlled" else "fail",
+                reason=f"Test failure detected: {failed_count} test(s) failed",
+                severity="medium",
+                failure_category="task_quality_error",
+                failure_origin="worker",
+                recovery_hint="retry",
+            ))
+        else:
+            decisions.append(ControlDecision(
+                passed=True,
+                action="continue",
+                reason="Test output verified — no failures detected",
+            ))
+
+        return decisions
+
+    # ------------------------------------------------------------------
     # Control checks
     # ------------------------------------------------------------------
 
@@ -313,17 +428,15 @@ class MainlineExecutor:
         evidence_status: WorkerEvidenceStatus,
         worker_result: dict[str, Any],
     ) -> list[ControlDecision]:
-        """Run all relevant ControlPlane checks."""
-        from .control_plane import ControlPlane
-
-        cp = ControlPlane()
+        """Run all relevant ControlPlane checks using the loaded policy."""
+        cp = ControlPlane(policy=self._policy)
         decisions: list[ControlDecision] = []
 
         # 1. Worker evidence verification
         evidence_decision = cp.verify_worker_evidence(evidence_status)
         decisions.append(evidence_decision)
 
-        # 2. Policy check for file changes
+        # 2. Policy check for file changes (uses loaded policy with protected files)
         changed_files = evidence_status.changed_files
         if changed_files:
             policy_decision = cp.check_policy_for_file_changes(files_changed=changed_files)
@@ -455,8 +568,6 @@ class MainlineExecutor:
 
     def _extract_files_from_plan(self, plan: PlanContract) -> list[str]:
         """Extract file references from plan objective and steps."""
-        import re
-
         combined = plan.objective + " " + " ".join(plan.steps)
         pattern = re.compile(r"`([^`]+\.[a-zA-Z0-9]+)`|([\w\-/]+\.[a-z]{1,10})")
         seen: set[str] = set()
@@ -478,8 +589,18 @@ class MainlineExecutor:
 
 
 # =============================================================================
-# Serialization helpers
+# Helpers
 # =============================================================================
+
+
+def _load_yaml_policy(path: Path) -> dict[str, Any]:
+    """Load a YAML policy file, returning empty dict on failure."""
+    try:
+        import yaml
+        with open(path, encoding="utf-8") as fh:
+            return yaml.safe_load(fh) or {}
+    except Exception:
+        return {}
 
 
 def _evidence_status_to_dict(es: WorkerEvidenceStatus) -> dict[str, Any]:
