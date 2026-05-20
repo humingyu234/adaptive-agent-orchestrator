@@ -150,23 +150,20 @@ class MainlineExecutor:
         Returns:
             MainlineResult with all paths, decisions, and status.
         """
-        # 0. Enforce plan approval
+        # 0. Enforce plan approval — must be pre-approved, no auto-approve
         if plan.approval_status != "approved":
-            try:
-                plan.approve()
-            except ValueError:
-                return MainlineResult(
-                    plan_id=plan.plan_id,
-                    status="blocked_needs_review",
-                    worker_mode=worker_mode,
-                    worker_result={"behaviour": "blocked", "summary": "Plan not approved"},
-                    control_decisions=[{
-                        "action": "needs_human_review",
-                        "passed": False,
-                        "reason": f"Plan approval_status={plan.approval_status} — must be approved",
-                    }],
-                    summary=f"Blocked: plan not approved (status={plan.approval_status})",
-                )
+            return MainlineResult(
+                plan_id=plan.plan_id,
+                status="blocked_needs_review",
+                worker_mode=worker_mode,
+                worker_result={"behaviour": "blocked", "summary": "Plan not approved"},
+                control_decisions=[{
+                    "action": "needs_human_review",
+                    "passed": False,
+                    "reason": f"Plan approval_status={plan.approval_status} — must be explicitly approved before execution",
+                }],
+                summary=f"Blocked: plan not approved (status={plan.approval_status})",
+            )
 
         run_id = _utc_now_compact() + "-" + uuid.uuid4().hex[:6]
         task_id = f"task-{run_id}"

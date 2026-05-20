@@ -10,6 +10,8 @@ files:
   protected:
     - .env
     - secrets/**
+    - config/secrets.yaml
+    - config/credentials.*
     - outputs/**
 
 checks:

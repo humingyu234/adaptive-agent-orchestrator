@@ -455,6 +455,97 @@ class TestAuditReport:
 
 
 # ---------------------------------------------------------------------------
+# Test 7 — Plan approval gate (non-auto-approve)
+# ---------------------------------------------------------------------------
+
+
+class TestPlanApprovalGate:
+    def test_draft_plan_blocked_from_execution(self) -> None:
+        """A plan with approval_status=draft must be blocked by execute()."""
+        plan = PlanContract(
+            objective="Do something",
+            run_mode="controlled",
+            task_size="medium",
+            steps=["Implement"],
+            required_evidence=["test_output.txt"],
+            success_criteria=["Works"],
+        )
+        # Never call plan.approve() — stays "draft"
+        assert plan.approval_status == "draft"
+
+        executor = MainlineExecutor(REPO_ROOT)
+        result = executor.execute(plan, worker_mode="fake")
+
+        assert result.status == "blocked_needs_review"
+        assert any(
+            "explicitly approved" in d["reason"]
+            for d in result.control_decisions
+        )
+
+    def test_clean_plan_without_blocking_concerns_still_blocked_if_not_approved(self) -> None:
+        """Even a well-formed plan without blocking concerns must be blocked
+        if it hasn't been explicitly approved before reaching execute()."""
+        plan = PlanContract(
+            objective="Minor refactor in src/utils.py",
+            run_mode="controlled",
+            task_size="medium",
+            steps=["Refactor", "Test"],
+            required_evidence=["test_output.txt"],
+            success_criteria=["Tests pass"],
+            blocking_concerns=[],  # explicitly empty
+        )
+        # Deliberately don't approve
+        assert plan.approval_status == "draft"
+
+        executor = MainlineExecutor(REPO_ROOT)
+        result = executor.execute(plan, worker_mode="fake")
+
+        assert result.status == "blocked_needs_review", (
+            f"Expected blocked_needs_review but got {result.status}"
+        )
+
+    def test_approved_plan_proceeds_normally(self) -> None:
+        """Approved plans should still work — this is the happy-path sanity check."""
+        executor = MainlineExecutor(REPO_ROOT)
+        plan = _build_plan("Add tests for src/service.py")
+        result = executor.execute(plan, worker_mode="fake")
+        assert result.status == "completed"
+
+
+# ---------------------------------------------------------------------------
+# Test 8 — Default policy catches protected files in mainline
+# ---------------------------------------------------------------------------
+
+
+class TestDefaultPolicyProtectedFile:
+    def test_mainline_blocks_protected_file_with_default_policy(self) -> None:
+        """When using the default policy (no custom Policy argument),
+        changing config/secrets.yaml must be blocked through the full mainline."""
+        executor = MainlineExecutor(REPO_ROOT)  # no custom policy
+        plan = _build_plan(
+            "Update config/secrets.yaml with new credentials setup",
+            allowed_files=["src/main.py", "config/secrets.yaml"],
+        )
+        result = executor.execute(plan, worker_mode="fake")
+
+        assert result.status == "blocked_needs_review", (
+            f"Expected blocked_needs_review but got {result.status}"
+        )
+        actions = {d["action"] for d in result.control_decisions}
+        assert "needs_human_review" in actions
+
+    def test_control_plane_uses_default_policy_protected_files(self) -> None:
+        """The ControlPlane inside MainlineExecutor must use the default policy
+        from examples/policy.yaml, which includes config/secrets.yaml."""
+        executor = MainlineExecutor(REPO_ROOT)
+        assert executor._policy is not None
+        assert "config/secrets.yaml" in executor._policy.protected_files, (
+            f"Default policy protected_files={executor._policy.protected_files} "
+            f"does not include config/secrets.yaml"
+        )
+
+
+# ---------------------------------------------------------------------------
 # Cross-cutting tests
 # ---------------------------------------------------------------------------
 
