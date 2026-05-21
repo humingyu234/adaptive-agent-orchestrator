@@ -563,14 +563,105 @@ class MainlineExecutor:
 
         cp = ControlPlane(policy=self._policy)
         runner = LangGraphRunner(project_root=str(self.project_root))
+
+        # Build worker_registry — one dispatch callable per step.
+        # Each callable bridges from graph state → _execute_worker(packet).
+        # Keys must match plan.steps[i] (the node names LangGraphRunner uses),
+        # not pwt.step_id (the machine identifier).
+        run_id = _utc_now_compact() + "-" + uuid.uuid4().hex[:6]
+        worker_registry: dict[str, Any] = {}
+
+        if len(plan.planned_worker_tasks) != len(plan.steps):
+            return MainlineResult(
+                plan_id=plan.plan_id,
+                status="blocked_needs_review",
+                worker_mode=worker_mode,
+                worker_result={
+                    "behaviour": "blocked",
+                    "summary": (
+                        f"plan.steps ({len(plan.steps)}) and "
+                        f"planned_worker_tasks ({len(plan.planned_worker_tasks)}) "
+                        f"length mismatch — cannot build worker_registry"
+                    ),
+                },
+                control_decisions=[{
+                    "action": "needs_human_review",
+                    "passed": False,
+                    "reason": "PlanContract data inconsistency: steps/tasks length mismatch",
+                }],
+                summary="Blocked: plan steps and worker tasks arrays must be equal length",
+            )
+
+        for i, pwt in enumerate(plan.planned_worker_tasks):
+            step_name = plan.steps[i]
+
+            # Early-binding closure: capture pwt/run_id by parameter, not by
+            # loop variable, to avoid the classic late-binding footgun.
+            def _make_dispatch(task: Any, rid: str) -> Any:
+                def _dispatch(_graph_state: dict) -> dict[str, Any]:
+                    packet = self._task_to_packet(task, run_id=rid)
+                    return self._execute_worker(packet, worker_mode=worker_mode)
+                return _dispatch
+
+            worker_registry[step_name] = _make_dispatch(pwt, run_id)
+
         lg_result = runner.run(
             plan=plan,
             control_plane=cp,
             policy=self._policy,
             project_root=self.project_root,
             worker_mode=worker_mode,
+            worker_registry=worker_registry,
+            **kwargs,
         )
         return self._convert_langgraph_result(lg_result, plan, worker_mode)
+
+    # ------------------------------------------------------------------
+    # Per-task packet builder (used by _execute_langgraph)
+    # ------------------------------------------------------------------
+
+    def _task_to_packet(
+        self,
+        task: Any,
+        *,
+        run_id: str = "",
+    ) -> WorkerTaskPacket:
+        """Build a WorkerTaskPacket for a single PlannedWorkerTask.
+
+        This is the per-task equivalent of _plan_to_packet (which only
+        handles the first task).  Used by the LangGraph backend to
+        dispatch individual steps through the same _execute_worker path
+        as the native backend.
+        """
+        policy_required = self._policy.get_required_checks()
+        checks = list(getattr(task, "required_checks", []) or [])
+        for c in policy_required:
+            if c not in checks:
+                checks.append(c)
+
+        evidence = [
+            e for e in (getattr(task, "expected_evidence", []) or [])
+            if e not in ("result.md", "status.json")
+        ]
+        if not evidence:
+            evidence = ["test_output.txt", "diff.patch"]
+
+        risk = (getattr(task, "risk_level", None) or "medium")
+
+        return WorkerTaskPacket.create(
+            project_root=str(self.project_root),
+            run_id=run_id,
+            task_id=getattr(task, "step_id", "") or f"task-{run_id[:8]}",
+            title=getattr(task, "title", "") or getattr(task, "objective", "")[:80],
+            objective=getattr(task, "objective", ""),
+            allowed_files=list(getattr(task, "allowed_files", []) or []),
+            denied_files=list(getattr(task, "denied_files", []) or []),
+            protected_files=list(self._policy.protected_files),
+            required_checks=checks,
+            expected_evidence=evidence,
+            risk_level=risk,
+            run_mode="orchestrated",
+        )
 
     @staticmethod
     def _convert_langgraph_result(

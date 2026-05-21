@@ -78,9 +78,12 @@ class TestLangGraphIntegration:
                    )) as mock_run:
             result = executor._execute_langgraph(plan, worker_mode="fake")
             mock_run.assert_called_once()
-            # worker_mode must propagate to the runner call
+            # worker_mode and worker_registry must propagate to the runner call
             call_kwargs = mock_run.call_args.kwargs
             assert call_kwargs.get("worker_mode") == "fake"
+            assert "worker_registry" in call_kwargs, "worker_registry must be passed to runner.run()"
+            assert len(call_kwargs["worker_registry"]) == 1, \
+                "worker_registry must have one entry per planned task"
 
     def test_convert_langgraph_result_maps_statuses(self):
         """_convert_langgraph_result correctly maps RunnerResult → MainlineResult."""
@@ -128,3 +131,25 @@ class TestLangGraphIntegration:
             result = executor.execute(plan, worker_mode="fake", execution_backend="native")
             spy.assert_called_once()
             assert result.status == "completed"
+
+    def test_worker_registry_dispatches_to_execute_worker(self):
+        """Each entry in worker_registry calls _execute_worker with a valid packet."""
+        plan = _make_plan(task_count=1)
+        executor = MainlineExecutor()
+
+        from orchestrator.runners.langgraph_runner import _LANGGRAPH_AVAILABLE
+        if not _LANGGRAPH_AVAILABLE:
+            pytest.skip("LangGraph not installed")
+
+        # Execute through _execute_langgraph with a spy on _execute_worker
+        with patch.object(executor, "_execute_worker",
+                          wraps=executor._execute_worker) as spy:
+            result = executor._execute_langgraph(plan, worker_mode="fake")
+            # The worker_registry callable must have been invoked
+            spy.assert_called()
+            call_args = spy.call_args
+            packet = call_args.kwargs.get("packet") or (call_args.args[0] if call_args.args else None)
+            assert packet is not None, "worker_registry must pass a WorkerTaskPacket"
+            assert packet.task_id == "step-0"
+            assert result.status == "completed"
+
