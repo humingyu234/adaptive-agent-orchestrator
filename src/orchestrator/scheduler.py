@@ -52,6 +52,18 @@ def _bounded_output_summary(output: dict) -> str:
 
 
 class Scheduler:
+    """Legacy YAML-workflow scheduler.
+
+    Deprecated for new task execution.  Use MainlineExecutor for all new work.
+    MainlineExecutor supports both native (MultiWorkerExecutor) and langgraph
+    (LangGraphRunner) backends via the ``execution_backend`` parameter.
+
+    This class is preserved only for:
+    - Legacy YAML workflow compatibility
+    - run_orchestrated() as a legacy compatibility path (not the main entry
+      point for LangGraph — use MainlineExecutor with execution_backend="langgraph")
+    """
+
     def __init__(
         self,
         workflow: dict,

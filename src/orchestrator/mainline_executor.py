@@ -143,6 +143,7 @@ class MainlineExecutor:
         *,
         worker_mode: str = "fake",
         max_workers: int = 2,
+        execution_backend: str = "native",
     ) -> MainlineResult:
         """Execute a plan through the mainline chain.
 
@@ -150,8 +151,10 @@ class MainlineExecutor:
             plan: An **approved** PlanContract.  execute() enforces this —
                   unapproved plans are rejected.
             worker_mode: "fake" (deterministic, writes files) or "packet" (writes
-                         packet to disk for external worker).
+                         packet to disk for external worker) or "claude-code".
             max_workers: Maximum concurrent workers (Phase 20 multi-worker).
+            execution_backend: "native" (MultiWorkerExecutor/ThreadPoolExecutor)
+                               or "langgraph" (LangGraphRunner).
 
         Returns:
             MainlineResult with all paths, decisions, and status.
@@ -171,7 +174,12 @@ class MainlineExecutor:
                 summary=f"Blocked: plan not approved (status={plan.approval_status})",
             )
 
-        # Phase 20: multi-worker path when plan has multiple worker tasks
+        # LangGraph backend: delegate to LangGraphRunner
+        if execution_backend == "langgraph":
+            return self._execute_langgraph(plan, worker_mode=worker_mode,
+                                           max_workers=max_workers)
+
+        # Native backend: Phase 20 multi-worker path or single worker
         if len(plan.planned_worker_tasks) > 1:
             return self._execute_multi_worker(plan, worker_mode=worker_mode,
                                                max_workers=max_workers)
@@ -406,6 +414,7 @@ class MainlineExecutor:
         run_mode: str = "controlled",
         task_size: str = "medium",
         max_workers: int = 2,
+        execution_backend: str = "native",
     ) -> MainlineResult:
         """Execute a simple query directly without a pre-existing PlanContract.
 
@@ -463,7 +472,8 @@ class MainlineExecutor:
                 }],
                 summary=f"Plan blocked: {plan.blocking_concerns[0] if plan.blocking_concerns else 'unknown'}",
             )
-        return self.execute(plan, worker_mode=worker_mode, max_workers=max_workers)
+        return self.execute(plan, worker_mode=worker_mode, max_workers=max_workers,
+                           execution_backend=execution_backend)
 
     # ------------------------------------------------------------------
     # Phase 20 — Multi-worker execution
@@ -510,6 +520,86 @@ class MainlineExecutor:
             report_path=mw_result.combined_report_path,
             evidence_path=mw_result.combined_evidence_path,
             summary=mw_result.summary,
+        )
+
+    # ------------------------------------------------------------------
+    # LangGraph backend
+    # ------------------------------------------------------------------
+
+    def _execute_langgraph(
+        self,
+        plan: PlanContract,
+        *,
+        worker_mode: str = "fake",
+        **kwargs,
+    ) -> MainlineResult:
+        """Execute an approved PlanContract via LangGraphRunner.
+
+        Each step still goes through: worker dispatch → evidence collection
+        → ControlPlane check.  LangGraphRunner provides the DAG execution
+        structure (checkpoint, resume, branching); it does NOT replace
+        ControlPlane or worker dispatch.
+
+        If LangGraph is not installed, returns a blocked result with a
+        clear dependency-missing message.
+        """
+        from .runners.langgraph_runner import LangGraphRunner, _LANGGRAPH_AVAILABLE
+
+        if not _LANGGRAPH_AVAILABLE:
+            return MainlineResult(
+                plan_id=plan.plan_id,
+                status="blocked_needs_review",
+                worker_mode=worker_mode,
+                worker_result={"behaviour": "blocked",
+                               "summary": "LangGraph not installed"},
+                control_decisions=[{
+                    "action": "needs_human_review",
+                    "passed": False,
+                    "reason": "Orchestrated mode requires LangGraph. "
+                             "Install with: pip install langgraph",
+                }],
+                summary="Blocked: LangGraph not installed — dependency missing",
+            )
+
+        cp = ControlPlane(policy=self._policy)
+        runner = LangGraphRunner(project_root=str(self.project_root))
+        lg_result = runner.run(
+            plan=plan,
+            control_plane=cp,
+            policy=self._policy,
+            project_root=self.project_root,
+            worker_mode=worker_mode,
+        )
+        return self._convert_langgraph_result(lg_result, plan, worker_mode)
+
+    @staticmethod
+    def _convert_langgraph_result(
+        lg_result: Any,
+        plan: PlanContract,
+        worker_mode: str,
+    ) -> MainlineResult:
+        """Convert RunnerResult from LangGraphRunner into MainlineResult."""
+        return MainlineResult(
+            run_id=getattr(lg_result, "run_id", ""),
+            task_id=getattr(plan, "plan_id", ""),
+            plan_id=plan.plan_id,
+            status={
+                "completed": "completed",
+                "needs_human_review": "blocked_needs_review",
+                "failed": "blocked_failed",
+                "timed_out": "blocked_failed",
+            }.get(getattr(lg_result, "status", "unknown"), "unknown"),
+            worker_mode=worker_mode,
+            evidence_status={
+                "passed_steps": getattr(lg_result, "steps_completed", 0),
+                "step_count": len(getattr(plan, "steps", [])),
+            },
+            control_decisions=getattr(lg_result, "control_events", []),
+            report_path=getattr(lg_result, "report_path", "") or "",
+            evidence_path=(
+                "; ".join(str(p) for p in getattr(lg_result, "evidence_paths", []))
+            ),
+            summary=getattr(lg_result, "reason", ""),
         )
 
     # ------------------------------------------------------------------

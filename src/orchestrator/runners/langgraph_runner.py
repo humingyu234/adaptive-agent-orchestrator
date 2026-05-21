@@ -190,6 +190,7 @@ class LangGraphRunner:
         recovery_playbook: Any = None,
         state_center: Any = None,
         worker_registry: dict[str, Callable] | None = None,
+        worker_mode: str = "fake",
         **kwargs: Any,
     ) -> RunnerResult:
         """Execute an approved PlanContract.
@@ -244,6 +245,7 @@ class LangGraphRunner:
             policy=policy,
             recovery_playbook=recovery_playbook,
             worker_registry=worker_registry or {},
+            worker_mode=worker_mode,
             root=root,
         )
 
@@ -312,6 +314,7 @@ class LangGraphRunner:
         policy: Any,
         recovery_playbook: Any,
         worker_registry: dict[str, Callable],
+        worker_mode: str = "fake",
         root: Path,
     ) -> Any:
         """Build a StateGraph from an approved PlanContract.
@@ -326,6 +329,7 @@ class LangGraphRunner:
                 policy=policy,
                 recovery_playbook=recovery_playbook,
                 worker_registry=worker_registry,
+                worker_mode=worker_mode,
                 root=root,
             )
 
@@ -347,6 +351,7 @@ class LangGraphRunner:
                     policy=policy,
                     recovery_playbook=recovery_playbook,
                     worker_registry=worker_registry,
+                    worker_mode=worker_mode,
                     root=root,
                 ),
             )
@@ -395,6 +400,7 @@ class LangGraphRunner:
         policy: Any,
         recovery_playbook: Any,
         worker_registry: dict[str, Callable],
+        worker_mode: str = "fake",
         root: Path,
     ) -> Callable:
         """Create a node function that executes one workflow step."""
@@ -419,7 +425,7 @@ class LangGraphRunner:
                     return gs.to_dict()
             else:
                 # No-op node — useful for human_review gates
-                output = {"status": "completed", "step": step_name}
+                output = {"status": "completed", "step": step_name, "worker_mode": worker_mode}
 
             gs.node_outputs[step_name] = output
 
@@ -637,13 +643,14 @@ class _FakeGraphWrapper:
 
     def __init__(self, *, backend: GraphBackend, plan: Any, control_plane: Any,
                  policy: Any, recovery_playbook: Any, worker_registry: dict[str, Callable],
-                 root: Path) -> None:
+                 worker_mode: str = "fake", root: Path) -> None:
         self._backend = backend
         self._plan = plan
         self._control_plane = control_plane
         self._policy = policy
         self._recovery_playbook = recovery_playbook
         self._worker_registry = worker_registry
+        self._worker_mode = worker_mode
         self._root = root
 
     def compile(self) -> _FakeGraphWrapper:

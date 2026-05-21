@@ -396,8 +396,13 @@ class TestAcceptanceReportCompleteness:
 class TestP01RouterMainlineAutoConnect:
     """Proves the router's decision automatically selects the right execution path.
 
-    The ``_resolve_execution_path()`` function is the pure decision point.
-    These tests exercise every branch of that function.
+    The ``_resolve_execution_path()`` function returns a 3-tuple:
+    ``(path, effective_worker_mode, execution_backend)``.
+
+    execution_backend is:
+      ``"native"`` for controlled mode (MultiWorkerExecutor)
+      ``"langgraph"`` for orchestrated mode (LangGraphRunner)
+      ``None`` for legacy / noop / blocked paths
     """
 
     @staticmethod
@@ -423,69 +428,88 @@ class TestP01RouterMainlineAutoConnect:
 
         return _resolve_execution_path(decision, explicit_worker_mode, force_run)
 
-    # -- controlled / orchestrated → mainline ------------------------------------
+    # -- controlled → mainline + native backend ----------------------------------
 
     def test_controlled_route_auto_mainline(self):
-        """controlled task → mainline with default fake worker."""
+        """controlled task → mainline with default fake worker + native backend."""
         decision = self._make_decision(run_mode="controlled")
-        path, worker = self._resolve(decision)
+        path, worker, backend = self._resolve(decision)
         assert path == "mainline"
         assert worker == "fake"
+        assert backend == "native"
 
-    def test_orchestrated_route_with_force_run_auto_mainline(self):
-        """orchestrated task with --force-run → mainline with fake worker."""
-        decision = self._make_decision(
-            run_mode="orchestrated", runtime_support="future_orchestrated",
-        )
-        path, worker = self._resolve(decision, force_run=True)
-        assert path == "mainline"
-        assert worker == "fake"
+    # -- orchestrated → mainline + langgraph backend -----------------------------
 
-    def test_orchestrated_native_auto_mainline(self):
-        """orchestrated task with native runtime support → mainline."""
-        decision = self._make_decision(
-            run_mode="orchestrated", runtime_support="native",
-        )
-        path, worker = self._resolve(decision)
+    def test_orchestrated_route_to_langgraph_backend(self):
+        """orchestrated task → mainline + langgraph backend."""
+        decision = self._make_decision(run_mode="orchestrated")
+        path, worker, backend = self._resolve(decision)
         assert path == "mainline"
         assert worker == "fake"
+        # langgraph backend when langgraph is installed
+        from orchestrator.runners.langgraph_runner import _LANGGRAPH_AVAILABLE
+        expected_backend = "langgraph" if _LANGGRAPH_AVAILABLE else "blocked"
+        if _LANGGRAPH_AVAILABLE:
+            assert backend == "langgraph"
+        else:
+            assert path == "blocked"
+            assert backend is None
+
+    def test_orchestrated_route_with_force_run_falls_back_native(self):
+        """orchestrated task with --force-run when langgraph missing → native."""
+        decision = self._make_decision(run_mode="orchestrated")
+        import orchestrator.runners.langgraph_runner as lgr
+        _orig = lgr._LANGGRAPH_AVAILABLE
+        try:
+            lgr._LANGGRAPH_AVAILABLE = False
+            path, worker, backend = self._resolve(decision, force_run=True)
+            assert path == "mainline"
+            assert worker == "fake"
+            assert backend == "native"
+        finally:
+            lgr._LANGGRAPH_AVAILABLE = _orig
 
     # -- off / log → noop --------------------------------------------------------
 
     def test_off_route_is_noop(self):
         decision = self._make_decision(run_mode="off")
-        path, worker = self._resolve(decision)
+        path, worker, backend = self._resolve(decision)
         assert path == "noop"
         assert worker is None
+        assert backend is None
 
     def test_log_route_is_noop(self):
         decision = self._make_decision(run_mode="log")
-        path, worker = self._resolve(decision)
+        path, worker, backend = self._resolve(decision)
         assert path == "noop"
         assert worker is None
+        assert backend is None
 
     # -- explicit --worker-mode overrides router ---------------------------------
 
     def test_explicit_worker_mode_overrides_off_route(self):
-        """--worker-mode fake overrides off route → mainline with fake."""
+        """--worker-mode fake overrides off route → mainline + native."""
         decision = self._make_decision(run_mode="off")
-        path, worker = self._resolve(decision, explicit_worker_mode="fake")
+        path, worker, backend = self._resolve(decision, explicit_worker_mode="fake")
         assert path == "mainline"
         assert worker == "fake"
+        assert backend == "native"
 
     def test_explicit_worker_mode_overrides_log_route(self):
-        """--worker-mode claude-code overrides log route → mainline."""
+        """--worker-mode claude-code overrides log route → mainline + native."""
         decision = self._make_decision(run_mode="log")
-        path, worker = self._resolve(decision, explicit_worker_mode="claude-code")
+        path, worker, backend = self._resolve(decision, explicit_worker_mode="claude-code")
         assert path == "mainline"
         assert worker == "claude-code"
+        assert backend == "native"
 
     def test_explicit_worker_mode_overrides_controlled_default(self):
-        """--worker-mode packet takes priority over router's default fake."""
+        """--worker-mode packet takes priority over router's default fake + native."""
         decision = self._make_decision(run_mode="controlled")
-        path, worker = self._resolve(decision, explicit_worker_mode="packet")
+        path, worker, backend = self._resolve(decision, explicit_worker_mode="packet")
         assert path == "mainline"
         assert worker == "packet"
+        assert backend == "native"
 
     # -- force_run prevents early exit -------------------------------------------
 
@@ -493,30 +517,37 @@ class TestP01RouterMainlineAutoConnect:
         """off route with --force-run bypasses noop → falls through.
 
         With run_mode=off, should_only_log is True.  force_run skips the
-        noop gate, then should_execute_workflow returns False (off is not
-        controlled/orchestrated), so the path is legacy.
+        noop gate, then controlled/orchestrated check returns False
+        (off is neither controlled nor orchestrated), so the path is legacy.
         """
         decision = self._make_decision(run_mode="off")
-        path, worker = self._resolve(decision, force_run=True)
+        path, worker, backend = self._resolve(decision, force_run=True)
         assert path == "legacy"
         assert worker is None
+        assert backend is None
 
-    # -- orchestrated blocker ----------------------------------------------------
+    # -- orchestrated blocker (langgraph not installed) --------------------------
 
-    def test_orchestrated_without_runner_is_blocked(self):
-        """orchestrated + future_orchestrated → blocked (runner not ready)."""
-        decision = self._make_decision(
-            run_mode="orchestrated", runtime_support="future_orchestrated",
-        )
-        path, worker = self._resolve(decision)
-        assert path == "blocked"
-        assert worker is None
+    def test_orchestrated_without_langgraph_is_blocked(self):
+        """orchestrated without langgraph installed → blocked with clear message."""
+        decision = self._make_decision(run_mode="orchestrated")
+        import orchestrator.runners.langgraph_runner as lgr
+        _orig = lgr._LANGGRAPH_AVAILABLE
+        try:
+            lgr._LANGGRAPH_AVAILABLE = False
+            path, worker, backend = self._resolve(decision)
+            assert path == "blocked"
+            assert worker is None
+            assert backend is None
+        finally:
+            lgr._LANGGRAPH_AVAILABLE = _orig
 
     # -- legacy fallback ---------------------------------------------------------
 
     def test_non_standard_run_mode_falls_to_legacy(self):
         """A run_mode that is neither controlled/orchestrated nor off/log → legacy."""
         decision = self._make_decision(run_mode="custom_mode")
-        path, worker = self._resolve(decision)
+        path, worker, backend = self._resolve(decision)
         assert path == "legacy"
         assert worker is None
+        assert backend is None

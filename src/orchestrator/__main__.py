@@ -541,6 +541,7 @@ def _handle_ask_mainline(
     *,
     worker_mode: str = "fake",
     max_workers: int | None = None,
+    execution_backend: str | None = None,
 ) -> None:
     """Execute the ask command through the mainline executor path.
 
@@ -550,10 +551,14 @@ def _handle_ask_mainline(
     """
     if max_workers is None:
         max_workers = getattr(args, "max_workers", 2)
+    if execution_backend is None:
+        execution_backend = "native"
     executor = MainlineExecutor(Path.cwd())
 
     if plan is not None:
-        result = executor.execute(plan, worker_mode=worker_mode, max_workers=max_workers)
+        result = executor.execute(plan, worker_mode=worker_mode,
+                                  max_workers=max_workers,
+                                  execution_backend=execution_backend)
     else:
         result = executor.execute_from_query(
             args.query,
@@ -561,6 +566,7 @@ def _handle_ask_mainline(
             run_mode=decision.run_mode,
             task_size=decision.task_size,
             max_workers=max_workers,
+            execution_backend=execution_backend,
         )
 
     output = result.to_dict()
@@ -613,34 +619,48 @@ def _resolve_execution_path(
     decision,
     explicit_worker_mode: str | None = None,
     force_run: bool = False,
-) -> tuple[str, str | None]:
+) -> tuple[str, str | None, str | None]:
     """Determine which execution path to take for an ask command.
 
-    Returns ``(path, effective_worker_mode)`` where *path* is one of:
+    Returns ``(path, effective_worker_mode, execution_backend)`` where:
 
-    * ``"mainline"`` — use MainlineExecutor with *effective_worker_mode*
-    * ``"legacy"``  — use legacy Scheduler / YAML workflow
-    * ``"blocked"`` — execution blocked (orchestrated runner not ready)
-    * ``"noop"``    — no execution (off / log mode)
+    *path* is one of:
+      ``"mainline"`` — use MainlineExecutor
+      ``"legacy"``  — use legacy Scheduler / YAML workflow
+      ``"blocked"`` — execution blocked (missing dependency)
+      ``"noop"``    — no execution (off / log mode)
+
+    *execution_backend* is one of:
+      ``"native"`` — MultiWorkerExecutor (ThreadPoolExecutor)
+      ``"langgraph"`` — LangGraphRunner (checkpoint/resume/branching)
+      ``None`` — not applicable (legacy/noop/blocked)
     """
-    # Explicit --worker-mode always wins → mainline
+    # Explicit --worker-mode always wins → mainline + native
     if explicit_worker_mode is not None:
-        return ("mainline", explicit_worker_mode)
+        return ("mainline", explicit_worker_mode, "native")
 
     # Router says off/log → no execution (unless force_run)
     if should_only_log(decision) and not force_run:
-        return ("noop", None)
+        return ("noop", None, None)
 
-    # Orchestrated runner not ready → blocked
-    if requires_future_runner(decision) and not force_run:
-        return ("blocked", None)
+    # controlled → mainline + native backend
+    if decision.run_mode == "controlled":
+        return ("mainline", "fake", "native")
 
-    # Controlled / orchestrated → mainline with default fake worker
-    if decision.run_mode in ("controlled", "orchestrated"):
-        return ("mainline", "fake")
+    # orchestrated → mainline + langgraph backend
+    if decision.run_mode == "orchestrated":
+        from .runners.langgraph_runner import _LANGGRAPH_AVAILABLE
+        if _LANGGRAPH_AVAILABLE:
+            return ("mainline", "fake", "langgraph")
+        elif force_run:
+            print("Warning: LangGraph not installed. "
+                  "Falling back to native backend (--force-run).")
+            return ("mainline", "fake", "native")
+        else:
+            return ("blocked", None, None)
 
     # Everything else → legacy Scheduler / YAML workflow
-    return ("legacy", None)
+    return ("legacy", None, None)
 
 
 def _handle_ask_command(args) -> None:
@@ -655,7 +675,7 @@ def _handle_ask_command(args) -> None:
     # or legacy fallback
     worker_mode = getattr(args, "worker_mode", None)
     force_run = getattr(args, "force_run", False)
-    path, effective_worker_mode = _resolve_execution_path(
+    path, effective_worker_mode, execution_backend = _resolve_execution_path(
         decision,
         explicit_worker_mode=worker_mode,
         force_run=force_run,
@@ -676,9 +696,15 @@ def _handle_ask_command(args) -> None:
         fmt = getattr(args, "format", "json")
         if fmt == "text":
             print(render_route_decision(decision))
-            print("\nOrchestrated runner is not implemented yet. Use --force-run to fall back to controlled mode.")
+            print("\nOrchestrated mode requires LangGraph, which is not installed.")
+            print("Install with: pip install langgraph")
+            print("Or use --force-run to fall back to native backend.")
         else:
-            decision_dict["_note"] = "Orchestrated runner is not implemented yet. Use --force-run to fall back to controlled mode."
+            decision_dict["_note"] = (
+                "Orchestrated mode requires LangGraph, which is not installed. "
+                "Install with: pip install langgraph "
+                "Or use --force-run to fall back to native backend."
+            )
             print(json.dumps(decision_dict, ensure_ascii=False, indent=2))
         return
 
@@ -688,7 +714,9 @@ def _handle_ask_command(args) -> None:
         return  # blocked by planning gate — message already printed
 
     if path == "mainline":
-        _handle_ask_mainline(args, decision, plan, worker_mode=effective_worker_mode)
+        _handle_ask_mainline(args, decision, plan, worker_mode=effective_worker_mode,
+                             max_workers=getattr(args, "max_workers", None),
+                             execution_backend=execution_backend)
         return
 
     llm_config = _parse_llm_config(args)
@@ -999,7 +1027,7 @@ def _handle_run_command(args) -> None:
 
     if requires_future_runner(decision) and not getattr(args, "force_run", False):
         decision_dict = route_decision_to_dict(decision)
-        decision_dict["_note"] = "Orchestrated runner is not implemented yet. Use --force-run to fall back to controlled mode."
+        decision_dict["_note"] = "Orchestrated mode requires LangGraph, which is not installed. Install with: pip install langgraph"
         print(json.dumps(decision_dict, ensure_ascii=False, indent=2))
         return
 
@@ -1027,6 +1055,9 @@ def _handle_run_command(args) -> None:
     )
 
     # Phase 15: orchestrated mode with LangGraph runner
+    # Deprecation note: `run` command still uses the legacy Scheduler for
+    # orchestrated tasks.  New code should use `ask --mode orchestrated`
+    # which routes through MainlineExecutor → LangGraphRunner.
     if plan is not None and decision.run_mode == "orchestrated":
         from .runners.langgraph_runner import _LANGGRAPH_AVAILABLE
         if _LANGGRAPH_AVAILABLE:

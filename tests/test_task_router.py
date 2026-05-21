@@ -376,6 +376,12 @@ class AskRouteIntegrationTest(unittest.TestCase):
 
         mock_cwd.return_value = self.project_root
 
+        # Also mock _LANGGRAPH_AVAILABLE so the direct check in
+        # _resolve_execution_path sees langgraph as unavailable.
+        import orchestrator.runners.langgraph_runner as lgr
+        _orig = lgr._LANGGRAPH_AVAILABLE
+        lgr._LANGGRAPH_AVAILABLE = False
+
         captured = io.StringIO()
         old = sys.stdout
         sys.stdout = captured
@@ -385,10 +391,11 @@ class AskRouteIntegrationTest(unittest.TestCase):
             ))
         finally:
             sys.stdout = old
+            lgr._LANGGRAPH_AVAILABLE = _orig
 
         data = json.loads(captured.getvalue())
         self.assertIn("_note", data)
-        self.assertIn("Orchestrated runner", data["_note"])
+        self.assertIn("LangGraph", data["_note"])
         self.assertEqual(data["run_mode"], "orchestrated")
         self.assertEqual(data["runtime_support"], "future_orchestrated")
 
@@ -871,6 +878,10 @@ class RunModeEnforcementTest(unittest.TestCase):
 
         mock_cwd.return_value = self.project_root
 
+        import orchestrator.runners.langgraph_runner as lgr
+        _orig = lgr._LANGGRAPH_AVAILABLE
+        lgr._LANGGRAPH_AVAILABLE = False
+
         import io
         import sys
         captured = io.StringIO()
@@ -884,10 +895,11 @@ class RunModeEnforcementTest(unittest.TestCase):
             ))
         finally:
             sys.stdout = old
+            lgr._LANGGRAPH_AVAILABLE = _orig
 
         data = json.loads(captured.getvalue())
         self.assertIn("_note", data)
-        self.assertIn("Orchestrated runner", data["_note"])
+        self.assertIn("LangGraph", data["_note"])
 
     @patch("orchestrator.__main__.Path.cwd")
     def test_run_with_future_orchestrated_and_force_run_proceeds(self, mock_cwd):
