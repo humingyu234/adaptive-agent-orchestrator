@@ -325,1123 +325,48 @@ These contracts should be small, typed, serializable, and runner-independent.
 Work in phases. Do not skip phase gates. Each phase must have targeted tests and
 must preserve existing behavior unless the phase explicitly changes it.
 
-### Phase 0 - Baseline Inspection
-
-Do not edit files.
-
-Run or inspect:
-
-```text
-git status --short
-src/orchestrator/scheduler.py
-src/orchestrator/evaluator.py
-src/orchestrator/guardrails.py
-src/orchestrator/failure_taxonomy.py
-src/orchestrator/report_writer.py
-tests/
-```
-
-Then run the current test suite:
-
-```bash
-python -m pytest
-```
-
-If pytest is unavailable, report that clearly and use:
-
-```bash
-python -m unittest discover -s tests
-```
-
-Phase 0 output must include:
-
-- current dirty files
-- current test command and result
-- current scheduler responsibilities
-- existing control capabilities
-- missing control capabilities
-
-No code edits in this phase.
-
-### Phase 1 - Core Models
-
-Goal:
-
-Add the shared contract language without touching runtime behavior.
-
-Allowed files:
-
-```text
-src/orchestrator/control_models.py
-tests/test_control_models.py
-```
-
-Implement:
-
-- `TaskSize`
-- `RunMode`
-- `ControlAction`
-- `ControlDecision`
-- `WorkerTask`
-- `WorkerResult`
-- `EvidencePack`
-
-Tests must prove:
-
-- valid default `ControlDecision` can represent `continue`
-- failed `ControlDecision` can include a failure category
-- `WorkerTask` can record allowed files and required checks
-- `EvidencePack` can record commands and test results
-- all models are serializable with Pydantic/model dump
-
-Commands:
-
-```bash
-python -m pytest tests/test_control_models.py
-python -m pytest
-```
-
-Do not modify `scheduler.py` in this phase.
-
-### Phase 2 - ControlPlane Facade
-
-Goal:
-
-Create one runner-independent control entry point that wraps existing evaluator,
-guardrail, and failure taxonomy functionality.
-
-Allowed files:
-
-```text
-src/orchestrator/control_plane.py
-tests/test_control_plane.py
-```
-
-Allowed imports:
-
-- `Evaluator`
-- `GuardrailManager`
-- `build_default_guardrail_manager`
-- `GuardrailViolation`
-- `failure_taxonomy`
-- `control_models`
-- `models`
-
-Forbidden imports:
-
-- `Scheduler`
-- `LangGraph`
-- CLI modules
-- any runner
-
-Implement:
-
-```text
-ControlPlane.evaluate_output(...)
-ControlPlane.guard_input(...)
-ControlPlane.guard_output(...)
-ControlPlane.classify_failure(...)
-ControlPlane.make_decision(...)
-```
-
-Tests must prove:
-
-- valid output produces a continue decision
-- evaluator failure produces a non-continue decision
-- input guardrail violation produces fail + guardrail category
-- output guardrail violation produces fail + guardrail category
-- failure classification returns a structured failure record/category
-
-Commands:
-
-```bash
-python -m pytest tests/test_control_plane.py
-python -m pytest
-```
-
-Do not integrate with `scheduler.py` yet unless the user explicitly asks.
-
-### Phase 3 - Scheduler Uses ControlPlane
-
-Goal:
-
-Gradually route native runtime decisions through ControlPlane without changing
-external behavior.
-
-Allowed files:
-
-```text
-src/orchestrator/scheduler.py
-tests/test_runtime_smoke.py
-tests/test_control_plane_integration.py
-```
-
-Rules:
-
-- Keep existing CLI behavior compatible.
-- Keep existing workflow YAML format compatible.
-- Keep existing agent interface compatible.
-- Keep existing report fields compatible.
-- Any new report/evidence fields must be backward-compatible.
-- Preserve human review pause behavior.
-- Preserve guardrail failure behavior.
-- Preserve failure classification trace event.
-
-Implementation direction:
-
-```text
-Scheduler.__init__ creates self.control_plane
-existing evaluation paths begin delegating to ControlPlane
-existing failure classification begins delegating to ControlPlane
-old private methods may remain as compatibility wrappers
-```
-
-Tests must prove:
-
-- standard workflow still completes
-- human-review workflow still pauses
-- guardrail violation still fails with structured trace
-- failure classified event still exists
-
-Commands:
-
-```bash
-python -m pytest tests/test_runtime_smoke.py
-python -m pytest tests/test_control_plane_integration.py
-python -m pytest
-```
-
-### Phase 4 - EvidencePack
-
-Goal:
-
-Make runtime evidence explicit without inventing evidence that is not captured.
-
-Allowed files:
-
-```text
-src/orchestrator/evidence.py
-src/orchestrator/scheduler.py
-src/orchestrator/report_writer.py
-tests/test_evidence_pack.py
-```
-
-Start with evidence the current runtime really has:
-
-- task id
-- step/agent name
-- input view summary
-- output summary
-- status
-- duration
-- evaluation result
-- failure reason
-- report path
-
-Do not pretend to capture:
-
-- git diff
-- command output
-- test output
-- file changes
-
-unless the implementation actually captures them.
-
-Tests must prove:
-
-- successful step can produce evidence
-- failed step records error/failure reason
-- missing commands/files do not crash serialization
-- evidence can be written to JSON
-
-Commands:
-
-```bash
-python -m pytest tests/test_evidence_pack.py
-python -m pytest
-```
-
-### Phase 5 - Live Run View
-
-Goal:
-
-Expose task progress in a form Claude Code and humans can read.
-
-Allowed files:
-
-```text
-src/orchestrator/live_view.py
-src/orchestrator/__main__.py
-tests/test_live_view.py
-tests/test_cli_output.py
-```
-
-Core functions:
-
-```text
-build_live_view(state, result=None) -> dict
-render_live_view(view) -> str
-```
-
-CLI commands may be added after the pure functions exist:
-
-```text
-python -m orchestrator status --task-id <task_id>
-python -m orchestrator watch --task-id <task_id>
-```
-
-View should include:
-
-- task id
-- status
-- current step
-- progress
-- steps total
-- steps completed
-- last decision
-- last failure
-- human review required
-- report path
-
-Tests must prove:
-
-- completed run renders completed
-- failed run shows failure reason
-- needs-human-review run shows human review waiting state
-- missing optional paths do not crash
-
-Commands:
-
-```bash
-python -m pytest tests/test_live_view.py
-python -m pytest tests/test_cli_output.py
-python -m pytest
-```
-
-### Phase 6 - Policy YAML
-
-Goal:
-
-Make basic control policy declarative.
-
-Allowed files:
-
-```text
-src/orchestrator/policy.py
-examples/policy.yaml
-tests/test_policy.py
-```
-
-Policy concepts:
-
-```yaml
-mode: controlled
-
-files:
-  allowed:
-    - src/orchestrator/**
-    - tests/**
-  protected:
-    - .env
-    - secrets/**
-    - outputs/**
-
-checks:
-  required:
-    - pytest
-
-human_review:
-  required_for:
-    - high_risk_tool
-    - protected_file_change
-    - failed_tests
-
-tools:
-  shell:
-    risk_level: high
-  search:
-    risk_level: low
-```
-
-Tests must prove:
-
-- allowed files pass
-- protected files are blocked or require human review
-- high-risk tool requires human review
-- missing policy uses safe defaults
-
-Commands:
-
-```bash
-python -m pytest tests/test_policy.py
-python -m pytest
-```
-
-### Phase 7 - Final Integration Gate
-
-Goal:
-
-Prove AAO Core behaves as one system, not scattered helpers.
-
-Add or update:
-
-```text
-tests/test_control_plane_integration.py
-```
-
-Required scenarios:
-
-```text
-1. Normal workflow
-   run deep_research.yaml
-   expect completed
-   expect report exists
-   expect live view can render
-   expect evidence can be generated
-
-2. Guardrail workflow
-   trigger sensitive output
-   expect failed
-   expect failure category GUARDRAIL_BLOCKED
-
-3. Human review workflow
-   run deep_research_human_review.yaml
-   expect needs_human_review
-   expect live view says human review is required
-
-4. Evaluator failure
-   construct missing-field output
-   expect ControlDecision is not continue
-
-5. Failure taxonomy
-   construct error context
-   expect category and severity are present
-```
-
-Commands:
-
-```bash
-python -m pytest
-```
-
-Final phase output must include:
-
-- total tests run
-- passed/failed/skipped
-- changed files
-- remaining risks
-- next recommended phase
-
-### Phase 7A - Core Closure Gate
-
-Goal:
-
-Close the remaining quality gaps in Phase 0-7 before adding new control-layer
-capabilities. This phase is a hardening and closure phase, not a feature
-expansion phase.
-
-This phase exists because Phase 0-7 can pass tests while still leaving hidden
-interface drift:
-
-```text
-ControlPlane exists, but some runtime checks may still bypass it.
-Live view exists, but progress may not yet represent the whole run clearly.
-Evidence exists, but summaries must stay honest and bounded.
-Policy exists, but it must not be described as runtime enforcement unless it is.
-```
-
-Non-goals:
-
-- no LangGraph
-- no ClaudeCodeWorker
-- no new top-level package
-- no package migration
-- no new heavy dependency
-- no new planning council
-- no Phase 7.5 control-layer expansion
-- no broad rewrite of `scheduler.py`
-- no unrelated sales-agent, docs, or job-search work
-
-Allowed files:
-
-```text
-src/orchestrator/control_models.py
-src/orchestrator/control_plane.py
-src/orchestrator/scheduler.py
-src/orchestrator/live_view.py
-src/orchestrator/evidence.py
-src/orchestrator/report_writer.py
-tests/test_control_models.py
-tests/test_control_plane.py
-tests/test_control_plane_integration.py
-tests/test_live_view.py
-tests/test_evidence_pack.py
-tests/test_policy.py
-.gitignore
-CLAUDE.md
-```
-
-Any other file change must be explicitly justified before editing.
-
-Required fixes:
-
-1. `ControlPlane.make_decision()` must guard the actual output.
-
-   Current contract:
-
-   ```text
-   input guard checks payload/input context
-   evaluator checks output
-   output guard checks output
-   ```
-
-   It is not acceptable for output guardrails to check the input payload when
-   the caller provided a separate `output` object.
-
-   Required tests:
-
-   ```text
-   test_make_decision_blocks_sensitive_output_even_when_input_payload_is_clean
-   test_make_decision_allows_clean_input_and_clean_output
-   ```
-
-2. Scheduler guardrail execution must go through ControlPlane.
-
-   Target runtime path:
-
-   ```text
-   Scheduler
-     -> ControlPlane.guard_input(agent_name, payload=view, guardrail_names=agent.config.guardrails)
-     -> agent.run(view)
-     -> ControlPlane.guard_output(agent_name, payload=output, guardrail_names=agent.config.guardrails)
-     -> ControlPlane.evaluate_output(...)
-     -> ControlPlane.classify_failure(...)
-   ```
-
-   The scheduler should not directly call:
-
-   ```text
-   agent.apply_input_guardrails(...)
-   agent.apply_output_guardrails(...)
-   ```
-
-   unless those calls are retained only as deprecated compatibility wrappers and
-   are not used by the scheduler runtime path.
-
-   Required behavior to preserve:
-
-   - empty query still fails before agent execution
-   - sensitive output still fails after agent execution
-   - `guardrail_violation` trace event still contains:
-     - `event`
-     - `agent_name`
-     - `stage`
-     - `reason`
-     - `failure_category`
-     - `timestamp`
-   - failure classification still emits `failure_classified`
-   - successful workflows still complete
-   - human review pause/resume still works
-
-   Required tests:
-
-   ```text
-   test_scheduler_uses_control_plane_for_input_guardrail
-   test_scheduler_uses_control_plane_for_output_guardrail
-   test_scheduler_preserves_guardrail_violation_trace_shape
-   test_scheduler_preserves_human_review_pause_after_control_plane_guardrails
-   ```
-
-3. Control action naming must be consistent.
-
-   Use this spelling everywhere in code, tests, and documentation:
-
-   ```text
-   needs_human_review
-   ```
-
-   Do not introduce a second action name such as `human_review` unless there is
-   an explicit compatibility mapping and tests for it.
-
-4. Live view progress must be honest and useful.
-
-   `build_live_view(...)` must not pretend to know more than the runtime state
-   records. It should expose progress from real runtime signals:
-
-   ```text
-   completed steps: execution log or successful evaluation/write events
-   current step: latest running/completed/failed agent signal available
-   total steps: workflow length when provided, otherwise a clear fallback
-   status: state metadata
-   last decision: latest evaluation/control decision
-   last failure: latest failure_classified event
-   human review: human_review_gate or needs_human_review status
-   artifacts: report/evidence paths when available
-   ```
-
-   Backward compatibility rule:
-
-   ```text
-   build_live_view(state, result=None) must still work.
-   Optional extra arguments are allowed only if old callers keep working.
-   ```
-
-   Required tests:
-
-   ```text
-   test_live_view_progress_uses_workflow_total_when_available
-   test_live_view_progress_has_honest_fallback_without_workflow
-   test_live_view_reports_current_step_for_failed_run
-   test_live_view_reports_current_step_for_human_review_run
-   ```
-
-5. EvidencePack must stay honest but become more readable.
-
-   Evidence may include a short `output_summary` only if it is derived from data
-   the runtime actually recorded.
-
-   Do not invent:
-
-   ```text
-   files_changed
-   commands_run
-   test_results
-   diff_summary
-   ```
-
-   unless the runtime really captures those fields.
-
-   Required tests:
-
-   ```text
-   test_evidence_pack_derives_bounded_output_summary_from_recorded_output
-   test_evidence_pack_does_not_invent_files_commands_tests_or_diff
-   test_evidence_summary_in_report_is_readable_and_bounded
-   ```
-
-6. Policy scope must be explicit.
-
-   Phase 6 introduced a declarative policy parser/check helper. In Phase 7A,
-   do not claim runtime policy enforcement unless scheduler/runtime enforcement
-   is actually implemented and tested.
-
-   Default closure requirement:
-
-   ```text
-   Policy is a declarative helper in Phase 0-7.
-   Runtime enforcement belongs to a later phase unless the user explicitly asks
-   to implement the minimal enforcement slice now.
-   ```
-
-   Required tests:
-
-   ```text
-   test_policy_default_behavior_is_documented_by_tests
-   test_policy_protected_file_requires_review_when_configured
-   test_policy_high_risk_tool_requires_review_when_configured
-   ```
-
-7. Repository hygiene must pass.
-
-   Required cleanup:
-
-   - add or update `.gitignore`
-   - ensure `.venv/`, `.claude/`, `.pytest_cache/`, `__pycache__/`, `tmp/`, and
-     generated `outputs/` are not intended commit content
-   - remove trailing whitespace from changed files
-   - avoid UTF-8 BOM in source and markdown files unless explicitly required
-   - normalize line endings for edited source files
-
-   Required commands:
-
-   ```bash
-   git diff --check
-   python3 -m compileall -q src tests
-   python3 -m pytest tests/test_control_models.py tests/test_control_plane.py tests/test_control_plane_integration.py tests/test_live_view.py tests/test_evidence_pack.py tests/test_policy.py -q
-   python3 -m pytest -q
-   git status --short
-   ```
-
-Definition of done:
-
-```text
-Phase 7A is done only when:
-- all required tests exist
-- all targeted tests pass
-- full pytest passes
-- compileall passes
-- git diff --check passes
-- scheduler guardrails no longer bypass ControlPlane
-- make_decision guards output, not input payload
-- live view progress is honest and backward-compatible
-- evidence is more readable without false claims
-- policy scope is explicit
-- the final report lists changed files and remaining risks
-```
-
-Required final explanation to the user:
-
-Explain Phase 7A naturally and concretely. Do not just say "tests pass."
-Explain:
-
-```text
-what was wrong before
-what was changed
-how the runtime path works now
-what tests prove it
-what is still intentionally not included
-```
-
-### Phase 7B - Hermes-Informed ControlPlane Hardening
-
-Goal:
-
-Strengthen the AAO control layer using lessons from mature agent execution
-systems, especially `NousResearch/hermes-agent`, without integrating Hermes as
-a dependency or changing AAO's product direction.
-
-This phase exists because Phase 0-7A can make the ControlPlane structurally
-connected while still leaving important product-grade control cases
-underspecified:
-
-```text
-it can say "failed"
-but not always "what kind of failure"
-it can say "retry"
-but not always "which failures should never retry"
-it can detect content guardrails
-but not tool-loop/no-progress behavior
-```
-
-Phase 7B is the bridge between "ControlPlane is wired" and "ControlPlane is
-robust enough to guide recovery decisions."
-
-Reference sources:
-
-```text
-Hermes Agent error classification:
-  NousResearch/hermes-agent/agent/error_classifier.py
-
-Hermes Agent tool loop guardrails:
-  NousResearch/hermes-agent/agent/tool_guardrails.py
-
-Hermes Agent jittered retry:
-  NousResearch/hermes-agent/agent/retry_utils.py
-
-Hermes Agent worker isolation pattern:
-  NousResearch/hermes-agent/tools/delegate_tool.py
-```
-
-Use these as design references, not as copy-paste integration targets.
-
-Borrowing policy:
-
-Hermes Agent is MIT-licensed, so small pieces may be reused when doing so is
-cleaner than reinventing them. Still keep AAO's architecture in control.
-
-```text
-May reuse directly with attribution and tests:
-  small pure utilities
-  provider error pattern lists
-  tiny deterministic helpers such as jittered backoff
-
-May adapt, but must rewrite around AAO contracts:
-  tool-loop detection algorithms
-  failure classification pipeline
-  retry/failover decisions
-
-Do not copy or integrate wholesale:
-  Hermes conversation loop
-  gateway
-  TUI
-  memory system
-  provider failover runtime
-  worker/delegation runtime
-```
-
-If code or data is copied or closely adapted from Hermes, add a short source
-comment near each borrowed piece and keep the MIT license obligations in mind.
-The comment should name the exact upstream file and symbol/pattern when
-possible, for example:
-
-```python
-# Adapted from Hermes Agent (MIT): agent/error_classifier.py _BILLING_PATTERNS
-```
-
-Prefer copying small stable data/utility code over copying large behavior. The
-source comment is not just legal hygiene; it makes the borrowed production
-experience visible to reviewers and future maintainers.
-
-Non-goals:
-
-- no Hermes dependency
-- no Hermes gateway
-- no Hermes TUI
-- no Hermes conversation loop
-- no Hermes full memory system
-- no LangGraph
-- no Claude Code Worker Bridge
-- no Planning Council
-- no web dashboard
-- no new heavy dependency
-- no broad scheduler rewrite
-- no extra LLM call in the default control path
-- no automatic infinite retry loop
-
-Allowed files:
-
-```text
-src/orchestrator/control_models.py
-src/orchestrator/control_plane.py
-src/orchestrator/failure_taxonomy.py
-src/orchestrator/guardrails.py
-src/orchestrator/scheduler.py
-tests/test_control_models.py
-tests/test_control_plane.py
-tests/test_failure_taxonomy.py
-tests/test_guardrails.py
-tests/test_control_plane_integration.py
-CLAUDE.md
-```
-
-Any other file change must be justified before editing.
-
-Required work:
-
-1. Failure classification must distinguish origin, category, reason, and
-   recovery.
-
-   Do not turn `FailureCategory` into a flat dumping ground for every provider
-   error. Keep the model readable:
-
-   ```text
-   origin/source
-     where the failure was observed or reported
-
-   category
-     broad failure family
-
-   reason
-     concrete machine-readable cause
-
-   recovery hint / action
-     bounded next action
-   ```
-
-   Important boundary:
-
-   ```text
-   ControlPlane does not directly call LLM providers.
-
-   Provider/API failures are reported by a worker or provider layer:
-     Worker/Provider -> FailureRecord -> ControlPlane classify/decide
-
-   ControlPlane-originated failures come from control decisions:
-     evaluator failed
-     guardrail blocked
-     policy denied
-     evidence missing
-   ```
-
-   Suggested origins/sources:
-
-   ```text
-   control_plane
-   worker
-   provider
-   tool
-   policy
-   scheduler
-   unknown
-   ```
-
-   Recommended categories and reasons:
-
-   ```text
-   PROVIDER_ERROR
-     auth
-     auth_permanent
-     billing
-     rate_limit
-     timeout
-     overloaded
-     server_error
-     context_overflow
-     model_not_found
-     format_error
-
-   TASK_QUALITY_ERROR
-     evaluation_failed
-     low_quality_output
-     missing_required_field
-     missing_evidence
-
-   GUARDRAIL_BLOCKED
-     input_guardrail_blocked
-     output_guardrail_blocked
-     sensitive_content
-     protected_action
-
-   TOOL_ERROR
-     tool_failed
-     exact_repeated_tool_failure
-     same_tool_repeated_failure
-     idempotent_no_progress
-
-   POLICY_ERROR
-     protected_file_change
-     high_risk_tool
-     reviewer_write_attempt
-     missing_required_check
-
-   UNKNOWN
-     unknown
-   ```
-
-   Existing categories must remain backward-compatible where practical. If a
-   compatibility mapping is needed, add tests for it.
-
-   Provider reasons such as `billing`, `rate_limit`, or `timeout` do not mean
-   the ControlPlane caused the provider failure. They mean the ControlPlane can
-   understand a provider failure reported by the worker and choose a bounded
-   next action.
-
-2. Recovery hints must be explicit and bounded.
-
-   Each known failure should map to a recovery hint. Suggested actions:
-
-   ```text
-   continue
-   retry
-   retry_with_backoff
-   request_evidence
-   compress_context
-   fallback_model_or_provider
-   replan
-   needs_human_review
-   fail
-   ```
-
-   Do not let the scheduler guess recovery from raw strings when the
-   ControlPlane already knows the failure reason.
-
-   A recovery hint is not the same thing as implemented runtime capability.
-   For example, `fallback_model_or_provider` means "this failure is safe to
-   solve by provider fallback if such a provider route exists." If AAO does not
-   yet have provider fallback wired, return the hint clearly but do not pretend
-   the runtime actually switched providers.
-
-   Initial mapping:
-
-   ```text
-   rate_limit            -> retry_with_backoff
-   timeout               -> retry_with_backoff
-   overloaded            -> retry_with_backoff
-   server_error          -> retry_with_backoff, bounded
-   context_overflow      -> compress_context
-   model_not_found       -> fallback_model_or_provider or fail
-   auth                  -> fallback_model_or_provider or needs_human_review
-   auth_permanent        -> fail or needs_human_review
-   billing               -> fail or fallback_model_or_provider, not blind retry
-   format_error          -> fail or needs_human_review, not blind retry
-   missing_evidence      -> request_evidence
-   evaluation_failed     -> retry or replan, bounded
-   guardrail_blocked     -> fail or needs_human_review, not retry
-   protected_file_change -> needs_human_review
-   exact_repeated_tool_failure -> replan or fail
-   same_tool_repeated_failure  -> replan or fail
-   idempotent_no_progress      -> replan or fail
-   unknown               -> safe fallback with clear uncertainty
-   ```
-
-3. Jittered backoff must be used only for transient failures.
-
-   Add a small local utility if needed. It may be inspired by Hermes
-   `jittered_backoff`, but do not import Hermes.
-
-   Use it only for:
-
-   ```text
-   rate_limit
-   timeout
-   overloaded
-   server_error
-   ```
-
-   Never use blind retry/backoff for:
-
-   ```text
-   guardrail_blocked
-   protected_file_change
-   missing_evidence
-   evaluation_failed without a retry limit
-   billing
-   auth_permanent
-   format_error without a changed request
-   ```
-
-4. Add a pure tool-loop guardrail controller.
-
-   Inspired by Hermes `tool_guardrails.py`, add a small AAO-native control
-   primitive that can be called by ControlPlane.
-
-   It should detect:
-
-   ```text
-   exact repeated failure
-     same tool name + same normalized arguments fails repeatedly
-
-   same tool repeated failure
-     same tool fails repeatedly even with different arguments
-
-   idempotent no-progress
-     read-only/idempotent tool returns the same result repeatedly
-   ```
-
-   This controller must be pure and testable. It should not require a live
-   runner, live shell, model call, or Hermes dependency.
-
-   Suggested output shape:
-
-   ```text
-   action: allow | warn | block | halt
-   code
-   reason
-   tool_name
-   count
-   normalized_signature or args hash
-   recovery_hint
-   ```
-
-   Safety rules:
-
-   - normalize tool arguments with stable ordering
-   - do not store raw sensitive arguments in public metadata if avoidable
-   - read-only no-progress should compare stable result hashes, not long raw
-     outputs
-   - different arguments or different results should not be falsely blocked
-   - warnings and hard stops must have separate thresholds
-
-5. Do not fake runtime integration.
-
-   If the current scheduler/runtime does not yet record enough tool-call events
-   to apply this controller during real runs, keep the controller as a pure
-   ControlPlane capability and write tests for it. Do not pretend it is wired
-   into runtime if it is not.
-
-   Runtime wiring can happen only when there is a real event path:
-
-   ```text
-   tool call planned
-     -> ControlPlane pre-tool check
-     -> tool executed or blocked
-     -> tool result recorded
-     -> ControlPlane post-tool update
-     -> trace/evidence updated
-   ```
-
-6. Worker isolation lessons are documentation/checklist only in this phase.
-
-   From Hermes `delegate_tool.py`, record the worker isolation checklist for
-   later Phase 12:
-
-   ```text
-   independent context
-   restricted tools
-   independent task id
-   focused task prompt
-   parent sees result/evidence summary, not full child reasoning
-   heartbeat/stall detection
-   dangerous action approval does not block the main control loop
-   ```
-
-   Do not implement the Claude Code Worker Bridge in Phase 7B.
-
-7. Hermes memory/reflection prompt ideas are deferred.
-
-   Hermes also contains useful background review / reflection ideas about what
-   should be remembered, what should not be remembered, and how skills should
-   be updated. Do not implement that in Phase 7B. Record it as Phase 14 memory
-   layer reference material only.
-
-Required tests:
-
-```text
-test_rate_limit_maps_to_retry_with_backoff
-test_timeout_maps_to_retry_with_backoff
-test_context_overflow_maps_to_compress_context
-test_billing_does_not_blind_retry
-test_guardrail_blocked_does_not_retry
-test_missing_evidence_requests_evidence
-test_unknown_failure_uses_safe_fallback
-
-test_exact_repeated_tool_failure_reaches_block_threshold
-test_same_tool_repeated_failure_reaches_warning_or_block_threshold
-test_idempotent_no_progress_is_detected
-test_tool_loop_allows_different_arguments
-test_tool_loop_allows_different_results
-test_tool_loop_metadata_does_not_expose_raw_sensitive_arguments
-
-test_control_plane_returns_recovery_hint_for_provider_failure
-test_control_plane_returns_recovery_hint_for_tool_loop_failure
-```
-
-If existing test filenames differ, use the closest matching test file or add a
-focused new test file. Keep test names contract-based.
-
-Required commands:
-
-```bash
-python -m pytest tests/test_failure_taxonomy.py tests/test_control_plane.py tests/test_guardrails.py -q
-python -m pytest tests/test_control_plane_integration.py -q
-python -m pytest -q
-git diff --check
-python -m compileall -q src tests
-git status --short
-```
-
-If the full suite fails for an environment reason, report the exact failing
-command and error. Do not claim the phase is done.
-
-Definition of done:
-
-```text
-Phase 7B is done only when:
-- provider/API failure reasons exist and are tested
-- known failure reasons map to bounded recovery hints
-- transient retry uses jitter/backoff only where appropriate
-- non-retryable failures do not silently retry
-- tool-loop guardrail controller exists and is pure/tested
-- recovery hints whose runtime support is not yet implemented are listed in
-  the phase handoff, not silently treated as done
-- no Hermes dependency was added
-- no Phase 8+ feature was started
-- targeted tests pass
-- full tests pass or failures are precisely explained
-- final explanation says what was borrowed from Hermes and what was not
-```
-
-Required final explanation to the user:
-
-Explain Phase 7B naturally and concretely. Include:
-
-```text
-what got stronger in ControlPlane
-which Hermes ideas were borrowed
-which Hermes parts were intentionally not integrated
-which failures can retry
-which failures must not retry
-what the tool-loop guardrail detects
-what remains for Phase 8/10/11/12
-```
+CLAUDE.md keeps the product map and hard constraints. Detailed construction
+specs live in `.claude/phase-specs/`. For any phase, read the matching phase
+spec before editing files.
+
+### Core Phases (0-7B) — AAO Core Foundation
+
+| Phase | Name | Spec File |
+|-------|------|-----------|
+| 0 | Baseline Inspection | `.claude/phase-specs/phase-00-baseline-inspection.md` |
+| 1 | Core Models | `.claude/phase-specs/phase-01-core-models.md` |
+| 2 | ControlPlane Facade | `.claude/phase-specs/phase-02-control-plane-facade.md` |
+| 3 | Scheduler Uses ControlPlane | `.claude/phase-specs/phase-03-scheduler-uses-control-plane.md` |
+| 4 | EvidencePack | `.claude/phase-specs/phase-04-evidence-pack.md` |
+| 5 | Live Run View | `.claude/phase-specs/phase-05-live-run-view.md` |
+| 6 | Policy YAML | `.claude/phase-specs/phase-06-policy-yaml.md` |
+| 7 | Final Integration Gate | `.claude/phase-specs/phase-07-final-integration-gate.md` |
+| 7A | Core Closure Gate | `.claude/phase-specs/phase-07a-core-closure-gate.md` |
+| 7B | Hermes-Informed Hardening | `.claude/phase-specs/phase-07b-hermes-informed-hardening.md` |
 
 ---
 
 ## 5B. AAO v1 Product Release Plan
 
-Phase 0-7B closes AAO Core. Phase 8-17 turn that core into the complete
-version the user can actually use, record, and show as proof of AI-native
-engineering ability.
+Phase 0-7B closes AAO Core. Phase 8-17 make that core visible, routed,
+policy-aware, recoverable, planned, memory-backed, tested, and demo-ready.
+
+Important: Phase 8-17 do not prove the original end-to-end blueprint by
+themselves if the Claude Code worker path is still fake, packet-only, or manual.
+Phase 18 is the real-worker hard landing gate.
+
+After Phase 18 passes real smoke, the remaining landing work is not "more
+features". It is exactly three integration gaps:
+
+```text
+Phase 19  real LLM Planning Council
+Phase 20  multi-worker execution from an approved plan
+Phase 21  end-to-end blueprint acceptance
+```
+
+Do not add new roadmap phases or optional integrations before these three are
+done. The goal is to make the user's original workflow real, not to keep growing
+the framework sideways.
 
 CLAUDE.md keeps the product map and hard constraints. Detailed construction
 specs live in .claude/phase-specs/. For Phase 8+, always read the matching
@@ -1499,11 +424,44 @@ Phase 16  Golden Scenario Suite
 Phase 17  Demo, README, and Release
           Make AAO easy to understand, run, trust, and record in a 3-5 minute
           demo.
+
+Phase 18  Real Claude Code Worker Bridge
+          Prove the real path: ask -> route -> plan -> user approval ->
+          launch Claude Code worker -> collect observed evidence -> apply
+          ControlPlane -> audit report. No fake worker may satisfy this gate.
+
+Phase 19  Real LLM Planning Council
+          Replace deterministic advisor-only planning with provider-backed
+          planner / critic / execution-planner advisors, while keeping local
+          deterministic advisors only for tests and fallback. This phase also
+          owns the Prompt Quality Gate: centralized advisor prompts, golden
+          planning cases, local validators, and real-provider smoke tests. A
+          model response that is not worker-ready does not count.
+
+Phase 20  Multi-Worker Plan Execution
+          Turn the approved plan into one or more bounded worker tasks, execute
+          independent tasks in parallel where safe, and keep per-worker evidence,
+          policy, recovery, and audit decisions separate.
+
+Phase 21  Blueprint End-to-End Acceptance
+          Prove the original user workflow with real commands: task -> multi-LLM
+          planning -> user approval -> real worker execution -> control gates ->
+          evidence -> audit report. No mock-only success may pass this phase.
 ```
 
 Phase spec index:
 
 ```text
+.claude/phase-specs/phase-00-baseline-inspection.md
+.claude/phase-specs/phase-01-core-models.md
+.claude/phase-specs/phase-02-control-plane-facade.md
+.claude/phase-specs/phase-03-scheduler-uses-control-plane.md
+.claude/phase-specs/phase-04-evidence-pack.md
+.claude/phase-specs/phase-05-live-run-view.md
+.claude/phase-specs/phase-06-policy-yaml.md
+.claude/phase-specs/phase-07-final-integration-gate.md
+.claude/phase-specs/phase-07a-core-closure-gate.md
+.claude/phase-specs/phase-07b-hermes-informed-hardening.md
 .claude/phase-specs/phase-08-real-time-watch.md
 .claude/phase-specs/phase-09-task-router.md
 .claude/phase-specs/phase-09a-runtime-mode-cleanup-contract.md
@@ -1516,15 +474,35 @@ Phase spec index:
 .claude/phase-specs/phase-15-langgraph-runner.md
 .claude/phase-specs/phase-16-golden-scenario-suite.md
 .claude/phase-specs/phase-17-demo-readme-release.md
+.claude/phase-specs/phase-18-real-claude-code-worker-bridge.md
+.claude/phase-specs/phase-19-real-llm-planning-council.md
+.claude/phase-specs/phase-20-multi-worker-plan-execution.md
+.claude/phase-specs/phase-21-blueprint-e2e-acceptance.md
 ```
 
-Do not ask Claude Code to implement Phase 8-17 in one pass. Start exactly one
+Do not ask Claude Code to implement Phase 8-21 in one pass. Start exactly one
 phase at a time, read that phase spec, implement it, test it, hand it off, and
 review it before moving on.
 
 Do not start Phase 8 until Phase 7B is reviewed. Phase 8 is a visibility phase;
 it should display real control decisions, not compensate for a shallow
 ControlPlane.
+
+Do not claim "complete landing" after Phase 17 if `--worker-mode claude-code`
+does not launch a real Claude Code worker process. Passing fake-worker, packet,
+demo, or golden-scenario tests proves the control chain; it does not prove the
+real daily-use workflow.
+
+Do not claim "original blueprint complete" after Phase 18 either. Phase 18 proves
+one real worker can execute. The blueprint is complete only after Phase 21 proves:
+
+```text
+real planning council
+  -> explicit user approval
+  -> real worker execution
+  -> evidence-gated control decisions
+  -> audit/report output
+```
 
 ---
 
