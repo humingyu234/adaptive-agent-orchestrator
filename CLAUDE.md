@@ -1,655 +1,161 @@
 # Adaptive Agent Orchestrator - Claude Code Working Guide
 
-This file is the project-level operating guide for Claude Code when working on
-Adaptive Agent Orchestrator (AAO).
-
-Read this before making changes. Follow it unless the user explicitly overrides
-the plan.
+AAO 项目级操作指南。改代码前先读这个。遵循它除非用户明确推翻。
 
 ---
 
-## 0. Final Product Direction
+## 1. AAO 是什么
 
-AAO is an Agent Runtime Control Plane.
+AAO 是 **Agent Runtime Control Plane**（Agent 运行时控制层）。
 
-It is not:
+不是：
+- Claude Code 替代品
+- LangGraph 替代品
+- 通用 all-in-one agent 框架
+- tracing / eval / workflow 平台
 
-- a Claude Code replacement
-- a LangGraph replacement
-- a generic all-in-one agent framework
-- a tracing platform
-- an eval SaaS
-- a heavyweight workflow platform for every tiny task
+是：
+- agent 工作流的控制层
+- 运行时裁判：继续 / 重试 / 重新规划 / 暂停等人工 / 回滚 / 失败
+- evidence（证据）、live progress（实时进度）、failure classification（失败分类）、audit report（审计报告）系统
 
-It is:
-
-- a control layer for agent workflows
-- a runtime judge for whether a step should continue, retry, replan, pause for
-  human review, roll back, or fail
-- a system for evidence, live progress, failure classification, and audit
-  reports
-
-Why this position:
-
-Better models and workers improve agent capability. AAO improves agent
-reliability by judging whether a step is correct, risky, incomplete, or
-recoverable independent of which model or worker produced it. These are
-different problems; keep the control layer independent from the worker layer.
-
-Final intended shape:
-
-```text
-Human
-  -> Claude Code frontend
-  -> AAO command protocol
-  -> AAO Control Plane
-      -> Task sizing
-      -> Plan contract
-      -> Policy engine
-      -> Evaluator gate
-      -> Guardrails
-      -> Failure taxonomy
-      -> Human review gate
-      -> Evidence pack
-      -> Live run view
-      -> Audit report
-      -> Regression compare
-  -> Runner layer
-      -> NativeRunner
-      -> LangGraphRunner
-      -> ClaudeCodeWorker
-      -> TestWorker
-      -> ReviewWorker
-```
-
-The user should still communicate with Claude Code naturally. AAO should work in
-the background as the control, visibility, and audit layer.
-
-Layer terminology:
-
-```text
-Claude Code frontend
-  The user's primary conversation and coding interface.
-
-AAO Control Plane
-  The runtime control layer: task sizing, plan contracts, policy, evaluator
-  gates, guardrails, failure taxonomy, recovery decisions, evidence, live view,
-  human review, audit reports, and regression comparison.
-
-Runner / Execution Engine
-  The system that executes workflow structure. NativeRunner and LangGraphRunner
-  are runners. They are not workers.
-
-Worker
-  The actor that performs work inside a step: Claude Code, an LLM provider, a
-  search/tool worker, TestWorker, ReviewWorker, or HumanReviewer.
-
-ECC / Everything Claude Code
-  A Claude Code worker-discipline pack: commands, hooks, agents, rules, and
-  skills that make Claude Code behave more predictably. It can strengthen the
-  Claude Code worker, but it is not the AAO control layer.
-
-Claude Code Agent View
-  A multi-session view for Claude Code workers. It shows which sessions are
-  running, waiting, or complete. It is not a quality/evidence/control monitor.
-
-AAO Live Watch
-  A control-layer view. It shows task progress, current step, last decision,
-  evidence, failure classification, recovery action, and human-review state.
-```
-
-Keep these terms strict. Do not call NativeRunner or LangGraphRunner workers.
-Do not turn AAO Live Watch into a clone of Claude Code Agent View.
+核心原则：更好的模型提升 agent **能力**。AAO 提升 agent **可靠性**——独立于模型和 worker 去判断每一步是否正确、有风险、不完整、可恢复。
 
 ---
 
-## 1. Hard Constraints
+## 2. 分层定义
 
-Do not do these unless the user explicitly asks:
-
-- Do not create a new top-level `aao/` package yet.
-- Do not move `agents`, `llm`, `cli`, `models`, `workflow`, `state`, or
-  `scheduler` into a new package in one large step.
-- Do not rewrite `scheduler.py` from scratch.
-- Do not remove or reset existing user changes.
-- Do not edit `.env`, secrets, generated outputs, `.venv`, or `tmp/` unless the
-  task explicitly requires it.
-- Do not add LangGraph, Langfuse, DeepEval, LiteLLM, OPA, or Casbin in the core
-  phases.
-- Do not add extra LLM calls to the default control path.
-- Do not make simple tasks slower by forcing them through heavyweight workflow
-  machinery.
-- Do not claim evidence exists unless the code actually records it.
-
-Default principle:
-
-```text
-AAO core must be lightweight by default and extensible by adapter.
+```
+Human → Claude Code frontend → AAO Control Plane → Runner → Worker
+                                                      ↘ Reviewer (只读)
 ```
 
-Over-design filter:
+| 层 | 职责 |
+|----|------|
+| **Claude Code frontend** | 用户的主对话和编码界面 |
+| **AAO Control Plane** | 运行时控制：任务分级、计划契约、策略、评估、护栏、失败分类、恢复、evidence、实时视图、人工审核、审计 |
+| **Runner / Execution Engine** | 执行工作流结构（NativeRunner, LangGraphRunner）。是 runner，不是 worker。 |
+| **Worker** | 执行具体步骤：Claude Code、LLM provider、TestWorker、ReviewWorker、HumanReviewer |
+| **Reviewer** | 只读检查员，审查 worker 产出。不改代码。输出 ReviewFinding。 |
+| **Human Reviewer** | 人工审批者，在 milestone gate 确认或拒绝 |
+| **Project Session** | 跨任务持久层：项目记忆、milestone 状态、审批日志、会话标识 |
 
-Before adding any new subsystem, ask whether it clearly helps at least one of
-these product goals:
+术语要严格。不要把 runner 叫 worker。不要让 reviewer 写代码。
 
-```text
-- make AI task execution less likely to drift
-- detect failure earlier
-- reduce wasted time or tokens
-- make evidence more trustworthy
-- make runtime progress more visible
-- make human review safer and better timed
-- make the project easier to demonstrate, review, or use
+---
+
+## 3. 硬约束
+
+除非用户明确要求，否则不做：
+
+- 不重写 scheduler.py
+- 不随意引入大框架（LangGraph、Langfuse、DeepEval、LiteLLM、OPA、Casbin）
+- 不 claim evidence 除非代码真的记录了 observed evidence
+- 不在默认控制路径上加额外 LLM 调用
+- 不让简单任务被重型工作流拖慢
+- 不让 AAO 偷偷自动修改 AAO 自己（src/orchestrator/*.py、CLAUDE.md、phase specs）
+- 不编辑 .env、secrets、.venv、outputs/、tmp/ 除非任务需要
+
+过度设计过滤器——加任何新子系统前先问：
+
+```
+能不能让 AI 任务执行更不容易跑偏？
+能不能更早发现失败？
+能不能减少浪费的时间/token？
+能不能让 evidence 更可信？
+能不能让运行时进度更可见？
+能不能让 human review 更安全、时机更好？
+能不能让项目更容易演示、审查、使用？
 ```
 
-If the answer is not a clear yes, defer the idea. Prefer a thin adapter over a
-new platform.
+答案不是明确的"是"就推迟。偏好薄适配器而不是新平台。
 
-External wheel intake rule:
+控制循环焦点：
 
-AAO is not a wheel collector. External projects such as Hermes Agent,
-LangGraph, Claude Code, ECC, Langfuse, LangSmith, Braintrust, Guardrails AI,
-or OpenTelemetry may be studied only through this filter:
-
-```text
-Does this strengthen AAO's control loop?
-
-control loop:
-observe execution
-  -> detect abnormal behavior
-  -> classify the failure
-  -> choose bounded recovery
-  -> record evidence
-  -> expose progress/audit state
 ```
-
-Only take an external idea if it clearly improves one of these control-loop
-links. Do not take features just because they are impressive.
-
-Allowed intake forms:
-
-```text
-learn a failure mode
-learn a small control primitive
-write a thin adapter
-add a deterministic test scenario
-```
-
-Forbidden intake forms:
-
-```text
-merge another agent framework into AAO core
-copy an entire conversation loop
-copy an entire gateway/TUI/memory/plugin platform
-make AAO depend on a large external system before its own core contract is stable
-```
-
-Stop adding wheels when AAO can prove its own core value:
-
-```text
-one real worker can be controlled
-20+ golden reliability scenarios can run
-false completion can be blocked
-failure categories map to recovery actions
-evidence and audit reports are real, not claimed
-the 3-5 minute demo is clear to a new reviewer
+观察执行 → 检测异常 → 分类失败 → 选择有界恢复 → 记录 evidence → 暴露进度/审计状态
 ```
 
 ---
 
-## 2. Work Modes
+## 4. 工作模式
 
-AAO should support these final modes:
+| 模式 | 说明 |
+|------|------|
+| **off** | 直接用 Claude Code。AAO 不参与。 |
+| **log** | AAO 记录任务和结果，但不阻断或路由执行。 |
+| **controlled** | 全控制：检查、evidence、失败分类、人工门、审计。 |
+| **orchestrated** | 复杂 DAG：checkpoint、resume、分支、并行、人工中断。 |
 
-```text
-off
-  Use Claude Code directly. No AAO involvement.
+任务分级：
+- **small**（1-2文件、低风险、<30分钟）→ off / log
+- **medium**（一个特性切片、多文件、需要测试）→ controlled
+- **large**（多阶段、多 worker、长运行、可恢复）→ orchestrated
 
-log
-  AAO records the task and outcome but does not block or route execution.
-
-controlled
-  AAO performs control checks, evidence collection, failure classification,
-  human gates, live status, and audit reporting.
-
-orchestrated
-  AAO uses a runner such as LangGraph for complex multi-stage workflows with
-  checkpoint, resume, branching, parallel work, and human interrupt.
-```
-
-Task sizing rule:
-
-```text
-small task
-  1-2 files, low risk, easy to inspect, under about 30 minutes.
-  Use off/log.
-
-medium task
-  one feature slice, several files, tests required, review needed.
-  Use controlled.
-
-large task
-  multi-stage, multi-worker, long-running, resumable, or needs branching.
-  Use orchestrated.
-```
-
-Do not force AAO onto small tasks.
+不要对小任务强加 AAO。
 
 ---
 
-## 3. Current Implementation Reality
+## 5. 施工入口
 
-The current AAO implementation already has useful control pieces, but they are
-spread across the runtime:
+按 phase 施工。每个 phase 有独立 spec 在 `.claude/phase-specs/`。
+做 phase 前必须读对应 spec。做完必须跑对应测试并中文汇报。
 
-- `src/orchestrator/scheduler.py`
-  - currently acts as the native runtime loop
-  - owns much of execution, evaluation, failure handling, checkpoints, and final
-    reporting
-- `src/orchestrator/evaluator.py`
-  - L1 structural evaluation and optional L2 semantic evaluation
-- `src/orchestrator/guardrails.py`
-  - input and output guardrails
-- `src/orchestrator/failure_taxonomy.py`
-  - failure categories, severity, and failure records
-- `src/orchestrator/report_writer.py`
-  - convergence/audit report generation
-- `src/orchestrator/agents/base.py`
-  - tool declaration and trust-level tool permission checks
+### Phase 00-21（已完成）
 
-The next architectural move is not a big package migration. The next move is to
-create a stable ControlPlane facade that can reuse these pieces.
+核心基础（0-7B）+ v1 产品发布（8-21）。spec 和代码均已完成。
 
----
+### Phase 29（优先 — Runner 架构修正，建议在 22 之前做）
 
-## 4. Target Core Contracts
+| Phase | 名称 | Spec |
+|-------|------|------|
+| 29 | Runner Architecture Boundary Cleanup | `phase-29-runner-architecture-boundary-cleanup.md` |
 
-The project needs a small set of common contracts that every runner and worker
-can speak.
+Phase 29 把已存在的 LangGraphRunner 接到 MainlineExecutor 主链路正确位置，
+清理 native / langgraph / mainline / multi_worker 边界。v2 协作能力依赖干净的 runner 架构。
 
-Suggested models:
+### Phase 22-28（v2 项目协作能力，建议 29 之后按序执行）
 
-```text
-TaskSize
-  small | medium | large
+| Phase | 名称 | Spec |
+|-------|------|------|
+| 22 | Task Auto Repair Loop | `phase-22-task-auto-repair-loop.md` |
+| 23 | Isolated Reviewer | `phase-23-isolated-reviewer.md` |
+| 24 | Project Session Layer | `phase-24-project-session-layer.md` |
+| 25 | Milestone Gate / Human Approval | `phase-25-milestone-gate-human-approval.md` |
+| 26 | Project Resume + Interactive Ask | `phase-26-project-resume-and-interactive-ask.md` |
+| 27 | AAO Self-Issue Handling | `phase-27-aao-self-issue-handling.md` |
+| 28 | Project Collaboration Acceptance | `phase-28-project-collaboration-acceptance.md` |
 
-RunMode
-  off | log | controlled | orchestrated
+完整 spec 文件索引见 `.claude/phase-specs/` 目录。
 
-ControlAction
-  continue | retry | replan | rollback | needs_human_review | fail
-
-ControlDecision
-  action
-  passed
-  reason
-  severity
-  failure_category
-  evidence_required
-  next_step_hint
-
-WorkerTask
-  task_id
-  objective
-  allowed_files
-  required_checks
-  risk_level
-  mode
-
-WorkerResult
-  task_id
-  worker_name
-  status
-  output
-  files_changed
-  commands_run
-  tests_run
-  errors
-
-EvidencePack
-  task_id
-  step_name
-  files_changed
-  commands_run
-  test_results
-  diff_summary
-  notes
-```
-
-These contracts should be small, typed, serializable, and runner-independent.
+不要一次实现多个 phase。一次一个：读 spec → 实现 → 测试 → handoff → review。
 
 ---
 
-## 5. Construction Plan
+## 6. Project Skills
 
-Work in phases. Do not skip phase gates. Each phase must have targeted tests and
-must preserve existing behavior unless the phase explicitly changes it.
+操作检查清单在 `.claude/project-skills/`。当内部检查清单用，不是死板模板。
 
-CLAUDE.md keeps the product map and hard constraints. Detailed construction
-specs live in `.claude/phase-specs/`. For any phase, read the matching phase
-spec before editing files.
-
-### Core Phases (0-7B) — AAO Core Foundation
-
-| Phase | Name | Spec File |
-|-------|------|-----------|
-| 0 | Baseline Inspection | `.claude/phase-specs/phase-00-baseline-inspection.md` |
-| 1 | Core Models | `.claude/phase-specs/phase-01-core-models.md` |
-| 2 | ControlPlane Facade | `.claude/phase-specs/phase-02-control-plane-facade.md` |
-| 3 | Scheduler Uses ControlPlane | `.claude/phase-specs/phase-03-scheduler-uses-control-plane.md` |
-| 4 | EvidencePack | `.claude/phase-specs/phase-04-evidence-pack.md` |
-| 5 | Live Run View | `.claude/phase-specs/phase-05-live-run-view.md` |
-| 6 | Policy YAML | `.claude/phase-specs/phase-06-policy-yaml.md` |
-| 7 | Final Integration Gate | `.claude/phase-specs/phase-07-final-integration-gate.md` |
-| 7A | Core Closure Gate | `.claude/phase-specs/phase-07a-core-closure-gate.md` |
-| 7B | Hermes-Informed Hardening | `.claude/phase-specs/phase-07b-hermes-informed-hardening.md` |
+| Skill | 使用场景 |
+|-------|---------|
+| `aao-core-builder.md` | 修改 AAO 核心架构 |
+| `aao-boundary-test-designer.md` | 添加或改变运行时行为前 |
+| `aao-reviewer-mode.md` | 独立只读审查会话。Reviewer 必须隔离、只读、不信 worker 自述、输出 finding 不直接修。 |
+| `aao-tutor-explanation.md` | 讲解：先举具体例子，再给直观图景，然后真实代码路径，最后工程术语。 |
+| `aao-scope-guard.md` | 任务范围开始膨胀时 |
+| `aao-live-visibility.md` | 实现运行时状态、进度、evidence、报告 |
+| `aao-phase-handoff.md` | 停止工作或进入下一个 phase 前。必须说明真实 vs mock vs artifact 边界。 |
 
 ---
 
-## 5B. AAO v1 Product Release Plan
+## 7. 提交纪律
 
-Phase 0-7B closes AAO Core. Phase 8-17 make that core visible, routed,
-policy-aware, recoverable, planned, memory-backed, tested, and demo-ready.
+- 绝不用 `git add .`
+- 只 stage 明确文件列表
+- phase spec 和代码分 commit
+- 当前 phase 没测完不过审前，不开始下个 phase
 
-Important: Phase 8-17 do not prove the original end-to-end blueprint by
-themselves if the Claude Code worker path is still fake, packet-only, or manual.
-Phase 18 is the real-worker hard landing gate.
-
-After Phase 18 passes real smoke, the remaining landing work is not "more
-features". It is exactly three integration gaps:
-
-```text
-Phase 19  real LLM Planning Council
-Phase 20  multi-worker execution from an approved plan
-Phase 21  end-to-end blueprint acceptance
-```
-
-Do not add new roadmap phases or optional integrations before these three are
-done. The goal is to make the user's original workflow real, not to keep growing
-the framework sideways.
-
-CLAUDE.md keeps the product map and hard constraints. Detailed construction
-specs live in .claude/phase-specs/. For Phase 8+, always read the matching
-phase spec before editing files.
-
-Product-release phases:
-
-```text
-Phase 8   Real-Time Watch
-          Make runtime progress, evidence, failures, recovery, and human-review
-          state visible while a task is running.
-
-Phase 9   Task Router
-          Route small/medium/large work into off/log/controlled/orchestrated
-          modes without making simple tasks heavy.
-
-Phase 9A  Runtime Mode + Cleanup Contract
-          Turn the routing labels into explicit runtime semantics and stop the
-          CLI/scheduler from accumulating more mixed responsibilities before
-          policy, recovery, worker, and LangGraph phases add more pressure.
-
-Phase 10  Runtime Policy Enforcement
-          Turn declarative policy into minimal real runtime blocking/review
-          behavior for protected files, high-risk tools, failed checks, and
-          missing evidence.
-
-Phase 11  Recovery Playbook
-          Map failure categories to bounded actions such as retry, request
-          evidence, replan, human review, or fail.
-
-Phase 12  Claude Code Worker Bridge
-          Let AAO create task packets for Claude Code workers and verify the
-          returned evidence/result files.
-
-Phase 12A ECC Integration Pack
-          Use ECC-style commands, hooks, and worker rules to make Claude Code
-          workers more disciplined without replacing AAO ControlPlane.
-
-Phase 13  Planning Council
-          For complex tasks, create a plan, challenge risks, merge a final plan,
-          and require user approval before execution.
-
-Phase 14  Memory Layer
-          Add lightweight inspectable project memory for decisions, constraints,
-          failures, and runs, with observed/reported/inferred source labels.
-
-Phase 15  LangGraph Runner
-          Add LangGraph as an optional orchestrated-mode runner for complex DAG,
-          checkpoint, resume, branching, and human interrupt.
-
-Phase 16  Golden Scenario Suite
-          Prove AAO's control behavior with deterministic scenarios such as
-          missing evidence, policy deny, human review, recovery, and audit.
-
-Phase 17  Demo, README, and Release
-          Make AAO easy to understand, run, trust, and record in a 3-5 minute
-          demo.
-
-Phase 18  Real Claude Code Worker Bridge
-          Prove the real path: ask -> route -> plan -> user approval ->
-          launch Claude Code worker -> collect observed evidence -> apply
-          ControlPlane -> audit report. No fake worker may satisfy this gate.
-
-Phase 19  Real LLM Planning Council
-          Replace deterministic advisor-only planning with provider-backed
-          planner / critic / execution-planner advisors, while keeping local
-          deterministic advisors only for tests and fallback. This phase also
-          owns the Prompt Quality Gate: centralized advisor prompts, golden
-          planning cases, local validators, and real-provider smoke tests. A
-          model response that is not worker-ready does not count.
-
-Phase 20  Multi-Worker Plan Execution
-          Turn the approved plan into one or more bounded worker tasks, execute
-          independent tasks in parallel where safe, and keep per-worker evidence,
-          policy, recovery, and audit decisions separate.
-
-Phase 21  Blueprint End-to-End Acceptance
-          Prove the original user workflow with real commands: task -> multi-LLM
-          planning -> user approval -> real worker execution -> control gates ->
-          evidence -> audit report. No mock-only success may pass this phase.
-```
-
-Phase spec index:
-
-```text
-.claude/phase-specs/phase-00-baseline-inspection.md
-.claude/phase-specs/phase-01-core-models.md
-.claude/phase-specs/phase-02-control-plane-facade.md
-.claude/phase-specs/phase-03-scheduler-uses-control-plane.md
-.claude/phase-specs/phase-04-evidence-pack.md
-.claude/phase-specs/phase-05-live-run-view.md
-.claude/phase-specs/phase-06-policy-yaml.md
-.claude/phase-specs/phase-07-final-integration-gate.md
-.claude/phase-specs/phase-07a-core-closure-gate.md
-.claude/phase-specs/phase-07b-hermes-informed-hardening.md
-.claude/phase-specs/phase-08-real-time-watch.md
-.claude/phase-specs/phase-09-task-router.md
-.claude/phase-specs/phase-09a-runtime-mode-cleanup-contract.md
-.claude/phase-specs/phase-10-runtime-policy-enforcement.md
-.claude/phase-specs/phase-11-recovery-playbook.md
-.claude/phase-specs/phase-12-claude-code-worker-bridge.md
-.claude/phase-specs/phase-12a-ecc-integration-pack.md
-.claude/phase-specs/phase-13-planning-council.md
-.claude/phase-specs/phase-14-memory-layer.md
-.claude/phase-specs/phase-15-langgraph-runner.md
-.claude/phase-specs/phase-16-golden-scenario-suite.md
-.claude/phase-specs/phase-17-demo-readme-release.md
-.claude/phase-specs/phase-18-real-claude-code-worker-bridge.md
-.claude/phase-specs/phase-19-real-llm-planning-council.md
-.claude/phase-specs/phase-20-multi-worker-plan-execution.md
-.claude/phase-specs/phase-21-blueprint-e2e-acceptance.md
-```
-
-Do not ask Claude Code to implement Phase 8-21 in one pass. Start exactly one
-phase at a time, read that phase spec, implement it, test it, hand it off, and
-review it before moving on.
-
-Do not start Phase 8 until Phase 7B is reviewed. Phase 8 is a visibility phase;
-it should display real control decisions, not compensate for a shallow
-ControlPlane.
-
-Do not claim "complete landing" after Phase 17 if `--worker-mode claude-code`
-does not launch a real Claude Code worker process. Passing fake-worker, packet,
-demo, or golden-scenario tests proves the control chain; it does not prove the
-real daily-use workflow.
-
-Do not claim "original blueprint complete" after Phase 18 either. Phase 18 proves
-one real worker can execute. The blueprint is complete only after Phase 21 proves:
-
-```text
-real planning council
-  -> explicit user approval
-  -> real worker execution
-  -> evidence-gated control decisions
-  -> audit/report output
-```
-
----
-
-## 6. Optional Integrations - Not Core Phases
-
-These are future adapters. Do not add them during Phase 0-7B. When a later
-product-release phase introduces one, use it as a thin adapter, not as the AAO
-brain.
-
-```text
-LangGraph
-  Use later for complex DAG, parallelism, checkpoint, resume, and human
-  interrupt. It should be a runner, not the AAO brain.
-
-Langfuse
-  Use later as trace/export dashboard. It should receive AAO events, not control
-  AAO decisions.
-
-DeepEval
-  Use later for offline regression/eval suites. It should test AAO outputs, not
-  replace ControlPlane.
-
-LiteLLM
-  Use later for model gateway, provider routing, fallback, and cost tracking.
-
-Guardrails AI
-  Use later as optional validator adapters. Keep AAO GuardrailManager as the
-  control entry point.
-
-OPA/Casbin
-  Use much later only if enterprise policy needs justify it. Start with YAML
-  policy.
-
-Hermes Agent
-  Do not integrate Hermes as a whole system. Treat it as a mature execution
-  project to study for failure modes and small control primitives. Acceptable
-  references: error classification, tool-loop guardrails, jittered retry, and
-  worker isolation checklists. Future support may be a thin HermesWorker
-  adapter, not a Hermes-based AAO core.
-```
-
----
-
-## 7. Project Skills
-
-Use project skills as operating modes. CLAUDE.md keeps the index and global
-communication rule; detailed project-skill instructions live in
-.claude/project-skills/.
-
-Communication rule for all project skills:
-
-```text
-Use the skill as an internal operating checklist, not a rigid answer template.
-Be strict about evidence, tests, scope, file paths, and validation.
-Be natural in explanation and teaching.
-Use structured checklists when risk is high, when reviewing code, or when
-handing off a phase. For quick explanations, use clear prose first.
-```
-
-If the user says they do not understand, slow down and explain the concrete
-runtime path before adding more abstraction.
-
-Project-skill index:
-
-```text
-.claude/project-skills/aao-core-builder.md
-  Use when modifying AAO core architecture.
-
-.claude/project-skills/aao-boundary-test-designer.md
-  Use before adding or changing runtime behavior.
-
-.claude/project-skills/aao-reviewer-mode.md
-  Use in a separate read-only review session. Reviewer must check final
-  behavior, runtime path, architecture contract, and false-green tests.
-
-.claude/project-skills/aao-tutor-explanation.md
-  Use after every phase, feature slice, bug fix, or important design decision.
-
-.claude/project-skills/aao-scope-guard.md
-  Use when the task starts expanding or a dependency/feature feels tempting.
-
-.claude/project-skills/aao-live-visibility.md
-  Use when implementing runtime status, progress, evidence, or reporting.
-
-.claude/project-skills/aao-phase-handoff.md
-  Use before stopping work or moving to the next phase.
-```
-
-Before starting a phase, read the matching phase spec and any relevant
-project-skill file. Do not load every phase spec or every project skill by
-default.
-
----
-
-## 8. Repository Hygiene And Phase Commit Discipline
-
-Product-release phases must not blur into one giant working tree.
-
-If `git status --short` shows many unrelated changes, do not keep piling on new
-work blindly. First classify what is in the tree.
-
-Use these buckets:
-
-```text
-A. phase spec / project rules
-   CLAUDE.md
-   .claude/phase-specs/
-   .claude/project-skills/
-
-B. current phase source + tests
-   the smallest code/test set that implements the active phase
-
-C. supporting docs
-   docs/, README notes, ADRs, demo scripts
-
-D. local or generated noise
-   .claude/projects/
-   tmp/
-   outputs/
-   caches
-   local settings
-```
-
-Rules:
-
-1. Do not use `git add .` in this project.
-2. Stage explicit file lists only.
-3. Keep phase-rule/docs commits separate from code commits when practical.
-4. Do not start the next phase if the current phase code is not tested and
-   handoff-reviewed.
-5. If the tree is already messy, stop and report the buckets before adding more
-   changes.
-
-Preferred commit slicing:
-
-```text
-Commit 1
-  phase rules / phase spec / CLAUDE.md updates
-
-Commit 2
-  current phase code + tests
-
-Commit 3
-  optional supporting docs or demo material
-```
-
-Before any commit, run:
+提交前：
 
 ```bash
 git status --short
@@ -658,129 +164,52 @@ python -m compileall -q src tests
 python -m pytest -q
 ```
 
-Use the equivalent `py -m ...` commands on Windows if needed.
+---
 
-If full pytest is too expensive for the current step, run targeted tests first
-and say clearly what full-suite coverage is still pending.
+## 8. 测试标准
+
+运行时控制变更必须覆盖：
+- 坏 case 安全失败
+- 正常 case 仍然通过
+- 边界 case
+- 误报防护
+- 邻近回归路径
+- phase 承诺了特定运行时路径时必须有 contract/path 测试
+
+控制层变更：至少一个测试在实现只是"猜对了最终值"时会失败。
 
 ---
 
-## 9. Reviewer Workflow
+## 9. Reviewer 流程
 
-For each phase:
+1. 实施会话做最小的 phase 限定变更
+2. 跑针对性测试 + 全量测试
+3. 单独 reviewer 会话只读审查 diff
+4. Reviewer 命名架构契约、追踪运行时路径、检查表面接线
+5. P0 必须修、P1 应该修、P2 记录为跟进
+6. 用户批准后才开始下个 phase
 
-1. Implementation session makes the smallest phase-bounded change.
-2. Implementation session runs targeted tests.
-3. Implementation session runs full tests when practical.
-4. Separate reviewer session reviews the diff in read-only mode.
-5. Reviewer names the architecture contract for the phase.
-6. Reviewer traces the runtime path from source event to final report/audit.
-7. Reviewer asks what current tests would still pass if the design were only
-   superficially wired.
-8. P0 issues must be fixed before moving on.
-9. P1 issues should be fixed unless clearly deferred with reason.
-10. P2 issues are recorded as follow-up.
-11. User approves before the next phase begins.
-
-Do not let one session both implement and approve its own work.
+不要让同一个会话既实施又审批。
 
 ---
 
-## 10. Testing Standard
+## 10. 完成定义
 
-For any runtime-control change, tests must include:
+### Core Done (Phase 0-7B)
+Control models、ControlPlane、EvidencePack、LiveRunView、Policy YAML 存在且经过测试。
+失败分类明确传播，integration 测试覆盖 guardrail、human-review、evaluator-failure 等路径。
 
-- bad case fails safely
-- normal case still passes
-- boundary case
-- false-positive guard
-- nearby regression path
-- contract/path test when the phase promises a specific runtime path
+### v1 Product Release Done (Phase 0-21)
+真实任务通过 Claude Code worker bridge 运行。Live Watch 显示进度和控制决策。
+False completion 可被阻止。失败分类映射到恢复动作。Human review 可暂停/恢复。
+Audit Report 含真实 observed evidence。Golden Scenario Suite 通过。
 
-Use targeted tests first, then full tests.
-
-For control-layer changes, do not only test the final value. Add at least one
-test that would fail if the implementation merely guessed the right result at
-the end.
-
-Examples:
-
-- Known failure categories are propagated explicitly; `infer_failure_category`
-  is used only for unknown fallback paths.
-- Observed evidence comes from captured command/test output, not from worker
-  claims.
-- A read-only reviewer path cannot call write tools even if the final report
-  would look valid.
-
-Preferred command order:
-
-```bash
-python -m pytest tests/<target_test_file>.py
-python -m pytest
-```
-
-If pytest is unavailable:
-
-```bash
-python -m unittest discover -s tests
-```
-
-Report the exact command and result. Do not say tests passed unless the command
-actually passed.
+### v2 Collaboration Done (Phase 22-28)
+见 `phase-28-project-collaboration-acceptance.md`。核心要求：复杂多阶段协作任务
+（调研→对比→设计→审批→并行执行→独立审查→自动修复→milestone gate→resume+追问）
+端到端跑通。
 
 ---
 
-## 10. Final Definition of Done
-
-AAO has two definitions of done: Core Done and v1 Product/Portfolio Release
-Done.
-
-AAO Core is considered done only when:
-
-- Control models exist and are tested.
-- ControlPlane exists and is runner-independent.
-- Scheduler delegates relevant decisions to ControlPlane without breaking
-  current CLI/workflows.
-- Known failure categories are propagated explicitly instead of being guessed
-  through fallback inference.
-- Failure classification includes enough reason/recovery information to decide
-  whether to retry, back off, request evidence, replan, ask for human review, or
-  fail.
-- Transient provider failures and non-retryable control failures are clearly
-  separated.
-- Tool-loop/no-progress guardrails exist as pure tested control primitives.
-- EvidencePack records real runtime evidence.
-- LiveRunView can show task progress and human-review state.
-- Policy YAML can express basic allowed/protected files, required checks, and
-  human-review triggers.
-- Integration tests cover normal, guardrail, human-review, evaluator-failure,
-  failure-taxonomy, recovery-hint, and tool-loop paths.
-- Full test suite passes or any skipped tests are clearly explained.
-- Reviewer session has no blocking P0 findings.
-
-Only after this should the project move into product-release phases such as:
-
-- Real-Time Watch
-- Task Router
-- Runtime Policy Enforcement
-- Recovery Playbook
-- Claude Code Worker Bridge
-- LangGraphRunner
-- Golden Scenario Suite
-- Demo/README release work
-
-AAO v1 Product/Portfolio Release is considered done only when:
-
-- a real task can be run through the Claude Code worker bridge
-- Live Watch shows task progress and control decisions while the task runs
-- false completion can be blocked by missing tests/evidence/policy
-- failures are classified and mapped to recovery actions
-- human review can pause and resume a risky run
-- Audit Report includes real observed evidence and clear limitations
-- Golden Scenario Suite passes
-- README quickstart works from a clean clone
-- the demo script can show AAO's value in 3-5 minutes
-
-Do not claim AAO v1 is complete just because the core tests pass. Core tests
-prove the control foundation; product-release tests prove it is usable and
-showable.
+不夸证不举。Core 测试证明控制基础。v1 测试证明可用性。v2 测试证明多会话项目能力。
+每层都要自己的 evidence。

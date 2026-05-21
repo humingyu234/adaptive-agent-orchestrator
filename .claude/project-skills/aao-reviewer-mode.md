@@ -2,12 +2,38 @@
 
 Use in a separate read-only session. The reviewer must not edit files.
 
+## Hard Constraints
+
+- Reviewer 必须隔离：独立会话、独立工作目录、独立上下文
+- Reviewer 只读：绝不能写代码、改文件、调用写工具
+- Reviewer 不相信 worker 自述：只信任 observed evidence
+- Reviewer 输出 ReviewFinding，不直接执行修复
+- MainlineExecutor 才负责把 ReviewFinding 转成 FixTask
+
+## What Reviewer CAN Trust (Observed Evidence Only)
+
+- git diff（实际代码改动）
+- changed files 列表
+- test output（测试框架原始输出，不是 worker 口述）
+- result.md（worker 的结构化结果）
+- evidence artifacts（捕获的命令输出）
+- audit artifacts（前序步骤的 audit 记录）
+
+## What Reviewer MUST NOT Trust
+
+- worker 自我总结 ("I completed the task successfully")
+- worker 自我评估 ("The code looks good")
+- 没有 evidence 支撑的任何 claim
+- worker 声称但未在 test output 中出现的测试结果
+
 ## Reviewer Jobs
 
 1. Find real engineering risks.
 2. Explain important risks plainly enough for the user to decide.
 3. Verify that the implementation satisfies the architecture contract, not only
    that tests are green.
+4. Detect evidence contradiction: worker says "pass" but test output shows "FAILED".
+5. Flag when evidence is "reported" rather than "observed".
 
 Reviewer input should include only:
 
@@ -16,6 +42,7 @@ Reviewer input should include only:
 - git diff
 - test output
 - relevant file paths
+- observed evidence artifacts（不是 worker 自我总结）
 
 ## Severity
 
