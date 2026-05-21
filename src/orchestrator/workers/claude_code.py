@@ -1,14 +1,18 @@
-"""Claude Code worker adapter — task rendering and result loading.
+"""Claude Code worker adapter — task rendering, result loading, and subprocess execution.
 
-Owns Claude Code specific instruction formatting.  Does NOT own policy,
-recovery, evaluation, or evidence classification — those live in the
-orchestrator layer.
+Owns Claude Code specific instruction formatting and real subprocess worker launch.
+Does NOT own policy, recovery, evaluation, or evidence classification — those
+live in the orchestrator layer.
 """
 
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+import os
+import shlex
+import subprocess
+import time
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -249,3 +253,225 @@ def _read_text_or_empty(path: Path) -> str:
         return path.read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError):
         return ""
+
+
+# =============================================================================
+# Real subprocess worker (Phase 18)
+# =============================================================================
+
+
+@dataclass
+class ClaudeCodeWorkerConfig:
+    """Configuration for launching a real Claude Code worker subprocess."""
+
+    command: str = "claude"
+    timeout_seconds: int = 600
+    prompt_mode: str = "stdin"  # stdin | file
+    project_root: str = ""
+    extra_args: list[str] = field(default_factory=lambda: ["-p", "--verbose"])
+
+    @classmethod
+    def from_env(cls, project_root: str = "") -> "ClaudeCodeWorkerConfig":
+        return cls(
+            command=os.environ.get("AAO_CLAUDE_CODE_COMMAND", "claude"),
+            timeout_seconds=int(os.environ.get("AAO_CLAUDE_CODE_TIMEOUT_SECONDS", "600")),
+            prompt_mode=os.environ.get("AAO_CLAUDE_CODE_PROMPT_MODE", "stdin"),
+            project_root=project_root,
+        )
+
+
+@dataclass
+class WorkerRunResult:
+    """Result of a real Claude Code subprocess worker execution."""
+
+    run_id: str = ""
+    task_id: str = ""
+    packet_dir: str = ""
+    exit_code: int = -1
+    timed_out: bool = False
+    stdout_path: str = ""
+    stderr_path: str = ""
+    transcript_path: str = ""
+    result_md_path: str = ""
+    status_json_path: str = ""
+    observed_paths: list[str] = field(default_factory=list)
+    changed_files: list[str] = field(default_factory=list)
+    summary: str = ""
+    worker_status: str = "unknown"
+    error: str = ""
+    command: str = ""
+
+    @property
+    def succeeded(self) -> bool:
+        return self.exit_code == 0 and not self.timed_out
+
+
+def run_claude_code_worker(
+    packet: WorkerTaskPacket,
+    *,
+    config: ClaudeCodeWorkerConfig | None = None,
+) -> WorkerRunResult:
+    """Launch a real Claude Code subprocess as a bounded worker.
+
+    1. Renders the packet into a strict task prompt.
+    2. Writes the prompt into the task directory for auditability.
+    3. Launches the configured Claude Code command via subprocess.
+    4. Passes the prompt via stdin (or file, depending on config).
+    5. Captures stdout/stderr to observed files.
+    6. Waits with timeout.
+    7. Loads worker result/status/evidence from the task directory.
+    8. Returns WorkerRunResult for ControlPlane/evidence/audit to consume.
+
+    Does NOT call ControlPlane directly — that is the caller's responsibility.
+    """
+    if config is None:
+        config = ClaudeCodeWorkerConfig.from_env()
+
+    pdir = packet.packet_root
+    pdir.mkdir(parents=True, exist_ok=True)
+    observed_dir = pdir / "observed"
+    observed_dir.mkdir(parents=True, exist_ok=True)
+
+    cwd = config.project_root or str(Path.cwd())
+
+    # 1. Render the task prompt
+    prompt = render_claude_code_task(packet)
+
+    # 2. Write prompt to task directory for auditability
+    task_prompt_path = pdir / "worker_prompt.txt"
+    task_prompt_path.write_text(prompt, encoding="utf-8")
+
+    # 3–4. Build the subprocess command
+    # -p: print/non-interactive mode
+    # --output-format text: plain text output (easier to capture)
+    # --verbose: include tool calls in output
+    cmd = _build_worker_command(config, prompt, task_prompt_path)
+    cmd_display = " ".join(cmd)
+
+    # Setup output capture files
+    stdout_path = observed_dir / "worker_stdout.txt"
+    stderr_path = observed_dir / "worker_stderr.txt"
+    transcript_path = observed_dir / "worker_transcript.txt"
+    exit_json_path = observed_dir / "worker_exit.json"
+
+    start_time = time.monotonic()
+    timed_out = False
+    exit_code = -1
+    stdout_text = ""
+    stderr_text = ""
+    error = ""
+
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            cwd=cwd,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        try:
+            stdout_text, stderr_text = proc.communicate(
+                input=prompt,
+                timeout=config.timeout_seconds,
+            )
+            exit_code = proc.returncode
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            stdout_text, stderr_text = proc.communicate(timeout=10)
+            timed_out = True
+            exit_code = -1
+            error = f"Worker timed out after {config.timeout_seconds}s"
+    except FileNotFoundError:
+        error = f"Claude Code command not found: {config.command!r}"
+        exit_code = -2
+    except PermissionError:
+        error = f"Permission denied executing: {config.command!r}"
+        exit_code = -3
+    except OSError as exc:
+        error = f"OS error launching worker: {exc}"
+        exit_code = -4
+
+    elapsed = time.monotonic() - start_time
+
+    # 5. Write captured output to observed files
+    stdout_path.write_text(stdout_text or "", encoding="utf-8", errors="replace")
+    stderr_path.write_text(stderr_text or "", encoding="utf-8", errors="replace")
+
+    # Transcript: combined output
+    transcript = (
+        f"=== AAO Worker Transcript ===\n"
+        f"Command: {cmd_display}\n"
+        f"Exit code: {exit_code}\n"
+        f"Timed out: {timed_out}\n"
+        f"Elapsed: {elapsed:.1f}s\n"
+        f"=== STDOUT ===\n{stdout_text}\n"
+        f"=== STDERR ===\n{stderr_text}\n"
+        f"=== END ===\n"
+    )
+    transcript_path.write_text(transcript, encoding="utf-8", errors="replace")
+
+    # Exit metadata
+    exit_json_path.write_text(
+        json.dumps({
+            "exit_code": exit_code,
+            "timed_out": timed_out,
+            "elapsed_seconds": round(elapsed, 2),
+            "command": cmd_display,
+        }, indent=2),
+        encoding="utf-8",
+    )
+
+    # 7. Load worker result/status/evidence from the task directory
+    result_data = load_claude_code_result(pdir)
+    observed = _list_observed_relative(pdir)
+
+    result_md = pdir / "result.md"
+    status_json = pdir / "status.json"
+
+    return WorkerRunResult(
+        run_id=packet.run_id,
+        task_id=packet.task_id,
+        packet_dir=str(pdir),
+        exit_code=exit_code,
+        timed_out=timed_out,
+        stdout_path=str(stdout_path),
+        stderr_path=str(stderr_path),
+        transcript_path=str(transcript_path),
+        result_md_path=str(result_md) if result_md.exists() else "",
+        status_json_path=str(status_json) if status_json.exists() else "",
+        observed_paths=observed,
+        changed_files=result_data.get("changed_files", []),
+        summary=result_data.get("summary", ""),
+        worker_status=result_data.get("status", "unknown"),
+        error=error,
+        command=cmd_display,
+    )
+
+
+def _build_worker_command(
+    config: ClaudeCodeWorkerConfig,
+    prompt: str,
+    prompt_file: Path,
+) -> list[str]:
+    """Build the subprocess command argv list.
+
+    Uses `claude -p` for non-interactive print mode.  The prompt is passed
+    via stdin regardless of prompt_mode — the command is always `claude -p -`
+    (read from stdin) in its simplest form.
+
+    When prompt_mode == "file", we write the prompt to a file and pass
+    `claude -p @file` if the Claude Code version supports it.  Otherwise
+    stdin is the safe default.
+    """
+    # Split the command into argv list so callers can pass "python3 script.py --arg"
+    # as a single string without shell=True.
+    cmd = shlex.split(config.command) + config.extra_args
+
+    if config.prompt_mode == "file":
+        cmd.extend([f"@<{prompt_file}"])
+    # stdin mode: -p alone reads from the subprocess stdin pipe
+
+    return cmd

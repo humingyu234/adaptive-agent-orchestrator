@@ -23,12 +23,29 @@ BOUNDARY RULES (Phase 13 hard constraints):
 
 from __future__ import annotations
 
+import json
+import os
 import re
 import uuid
 from dataclasses import dataclass, field
-from typing import Literal, Protocol, runtime_checkable
+from typing import Any, Literal, Protocol, runtime_checkable
+
+from .planning_prompts import (
+    PLANNER_SYSTEM_PROMPT as _PLANNER_SYSTEM_PROMPT,
+    REVIEWER_SYSTEM_PROMPT as _REVIEWER_SYSTEM_PROMPT,
+    EXECUTION_PLANNER_SYSTEM_PROMPT as _EXECUTION_SYSTEM_PROMPT,
+    build_planner_prompt as _build_planner_prompt,
+    build_reviewer_prompt as _build_reviewer_prompt,
+    build_execution_planner_prompt as _build_execution_prompt,
+    validate_planner_pydantic,
+    validate_reviewer_pydantic,
+    validate_execution_planner_pydantic,
+    PROMPT_VERSION,
+    PROMPT_DATE,
+)
 
 PlanApprovalStatus = Literal["draft", "approved", "edited", "rejected"]
+PlanningMode = Literal["deterministic", "llm"]
 
 
 # =============================================================================
@@ -47,6 +64,11 @@ class PlannedWorkerTask:
     required_checks: list[str] = field(default_factory=list)
     expected_evidence: list[str] = field(default_factory=list)
     risk_level: str = "low"
+    # Phase 20: multi-worker execution fields
+    step_id: str = ""
+    dependencies: list[str] = field(default_factory=list)  # step_ids this step depends on
+    can_run_parallel: bool = False
+    requires_human_review: bool = False
 
     @property
     def has_boundaries(self) -> bool:
@@ -91,6 +113,7 @@ class PlanContract:
     objective: str = ""
     run_mode: str = "controlled"
     task_size: str = "medium"
+    planning_mode: str = "deterministic"
     steps: list[str] = field(default_factory=list)
     risks: list[str] = field(default_factory=list)
     non_goals: list[str] = field(default_factory=list)
@@ -505,6 +528,407 @@ class LocalExecutionPlannerAdvisor:
 
 
 # =============================================================================
+# LLM-backed advisors (Phase 19v2 — structured JSON + Pydantic + retry)
+# Prompts and builders are centralized in planning_prompts.py
+# =============================================================================
+
+
+def _validate_with_retry(
+    provider: Any,
+    model: str,
+    system_and_prompt: str,
+    raw_data: dict[str, Any],
+    validator: Any,
+    advisor_name: str = "",
+) -> dict[str, Any]:
+    """Pydantic-validate raw LLM JSON; retry with correction prompt on failure.
+
+    Returns:
+        {"data": dict} on success (after up to 2 retries)
+        {"blocking_concern": str} on exhaustion — caller MUST NOT fake a PlanContract
+    """
+    max_retries = 2
+    last_data = raw_data
+    last_errors: list[str] = []
+
+    for attempt in range(max_retries + 1):
+        errors = validator(last_data)
+        if not errors:
+            return {"data": last_data}
+
+        last_errors = errors
+        if attempt < max_retries:
+            correction = _build_validation_correction(
+                system_and_prompt, last_data, errors, advisor_name
+            )
+            last_data = provider.complete_json_strict(
+                correction,
+                model=model,
+                temperature=0.2,
+                max_tokens=2500,
+                max_retries=0,  # no nested retry
+            )
+            if last_data.get("parse_error"):
+                return {
+                    "blocking_concern": (
+                        f"{advisor_name} Pydantic validation failed with {len(last_errors)} error(s) "
+                        f"(attempt {attempt + 1}/{max_retries + 1}), then correction produced "
+                        f"unparseable JSON: {last_data.get('last_error', '?')}"
+                    )
+                }
+
+    return {
+        "blocking_concern": (
+            f"{advisor_name} output failed Pydantic validation after {max_retries + 1} attempts. "
+            f"Last errors: {'; '.join(last_errors[:3])}"
+        )
+    }
+
+
+def _build_validation_correction(
+    original_prompt: str,
+    raw_data: dict[str, Any],
+    errors: list[str],
+    advisor_name: str,
+) -> str:
+    """Build a correction prompt that includes validation errors and original output."""
+    import json as _json
+    error_list = "\n".join(f"- {e}" for e in errors)
+    return (
+        f"{original_prompt}\n\n"
+        f"---\n\n"
+        f"Your last {advisor_name} output failed validation with these errors:\n"
+        f"{error_list}\n\n"
+        f"Your last output was:\n```json\n{_json.dumps(raw_data, indent=2, ensure_ascii=False)[:2000]}\n```\n\n"
+        f"Please fix ALL errors and return ONLY a valid JSON object. "
+        f"Do NOT wrap in markdown fences, do not add explanatory text."
+    )
+
+
+def _candidate_to_dict(candidate: "PlanCandidate") -> dict[str, Any]:
+    """Convert a PlanCandidate to a dict suitable for prompt builders."""
+    return {
+        "summary": candidate.summary,
+        "steps": candidate.steps,
+        "risks": candidate.risks,
+        "non_goals": candidate.non_goals,
+        "required_evidence": candidate.required_evidence,
+        "human_review_gates": candidate.human_review_gates,
+        "blocking_concerns": candidate.blocking_concerns,
+        "non_blocking_concerns": candidate.non_blocking_concerns,
+    }
+
+
+def _parse_plan_candidate(raw: dict[str, Any], role: str) -> PlanCandidate:
+    """Parse LLM JSON response into a PlanCandidate, with fallback defaults.
+
+    For execution_planner role: if ``worker_tasks`` is a top-level JSON list,
+    it is serialised into the ``assumptions`` field as ``__worker_tasks__:JSON``
+    so that ``_extract_worker_tasks_from_candidates`` can consume it.
+    """
+    assumptions: list[str] = [str(a) for a in raw.get("assumptions", [])]
+
+    worker_tasks = raw.get("worker_tasks")
+    if role == "execution_planner" and isinstance(worker_tasks, list) and worker_tasks:
+        assumptions.append(f"__worker_tasks__:{json.dumps(worker_tasks)}")
+
+    return PlanCandidate(
+        role=role,
+        summary=str(raw.get("summary", "")),
+        steps=[str(s) for s in raw.get("steps", [])],
+        risks=[str(r) for r in raw.get("risks", [])],
+        non_goals=[str(n) for n in raw.get("non_goals", [])],
+        required_evidence=[str(e) for e in raw.get("required_evidence", [])],
+        human_review_gates=[str(g) for g in raw.get("human_review_gates", [])],
+        assumptions=assumptions,
+        blocking_concerns=[str(b) for b in raw.get("blocking_concerns", [])],
+        non_blocking_concerns=[str(n) for n in raw.get("non_blocking_concerns", [])],
+    )
+
+
+class LLMPlannerAdvisor:
+    """Planner backed by a real LLM provider with structured JSON + Pydantic validation."""
+
+    role = "planner"
+    _MAX_RETRIES = 2
+
+    def __init__(self, provider_name: str = "deepseek", model: str = "",
+                 timeout: int = 120) -> None:
+        self.provider_name = provider_name
+        self.model = model
+        self.timeout = timeout
+
+    def advise(
+        self,
+        query: str,
+        task_size: str = "medium",
+        run_mode: str = "controlled",
+        risk_level: str = "low",
+        task_type: str = "unknown",
+    ) -> PlanCandidate:
+        from .llm_providers import get_provider
+
+        provider = get_provider(self.provider_name)
+        model = self.model or _default_model_for(self.provider_name)
+        task_prompt = _build_planner_prompt(
+            query, task_size, run_mode, risk_level, task_type,
+        )
+        base_prompt = _PLANNER_SYSTEM_PROMPT + "\n\n" + task_prompt
+
+        # ---- structured JSON with retry + correction prompts -------------------
+        try:
+            raw = provider.complete_json_strict(
+                base_prompt,
+                model=model,
+                temperature=0.3,
+                max_tokens=2000,
+                max_retries=self._MAX_RETRIES,
+            )
+        except Exception as exc:
+            return PlanCandidate(
+                role="planner",
+                summary=f"Planner provider call failed: {exc}",
+                blocking_concerns=[f"PLANNER_ERROR: {exc}"],
+            )
+
+        if raw.get("parse_error"):
+            return PlanCandidate(
+                role="planner",
+                summary=f"Planner JSON parse failed after {raw.get('attempts', '?')} attempts",
+                blocking_concerns=[
+                    f"PLANNER_PARSE_ERROR: {raw.get('last_error', 'Unknown parse error')}"
+                ],
+            )
+
+        # ---- Pydantic validation with retry ------------------------------------
+        result = _validate_with_retry(
+            provider,
+            model,
+            task_prompt,
+            raw,
+            validate_planner_pydantic,
+            advisor_name="Planner",
+        )
+
+        if result.get("blocking_concern"):
+            return PlanCandidate(
+                role="planner",
+                summary="Planner output failed Pydantic validation after retries",
+                blocking_concerns=[result["blocking_concern"]],
+            )
+
+        return _parse_plan_candidate(result["data"], "planner")
+
+
+class LLMRiskReviewerAdvisor:
+    """Risk Reviewer backed by a real LLM provider with structured JSON + Pydantic validation."""
+
+    role = "risk_reviewer"
+    _MAX_RETRIES = 2
+
+    def __init__(self, provider_name: str = "deepseek", model: str = "",
+                 timeout: int = 120) -> None:
+        self.provider_name = provider_name
+        self.model = model
+        self.timeout = timeout
+        self.planner_output: PlanCandidate | None = None
+
+    def advise(
+        self,
+        query: str,
+        task_size: str = "medium",
+        run_mode: str = "controlled",
+        risk_level: str = "low",
+        task_type: str = "unknown",
+    ) -> PlanCandidate:
+        from .llm_providers import get_provider
+
+        provider = get_provider(self.provider_name)
+        model = self.model or _default_model_for(self.provider_name)
+        task_prompt = _build_reviewer_prompt(
+            query, task_size, run_mode, risk_level,
+            planner_output=_candidate_to_dict(self.planner_output) if self.planner_output else None,
+            task_type=task_type,
+        )
+        base_prompt = _REVIEWER_SYSTEM_PROMPT + "\n\n" + task_prompt
+
+        try:
+            raw = provider.complete_json_strict(
+                base_prompt,
+                model=model,
+                temperature=0.3,
+                max_tokens=2000,
+                max_retries=self._MAX_RETRIES,
+            )
+        except Exception as exc:
+            return PlanCandidate(
+                role="risk_reviewer",
+                summary=f"Reviewer provider call failed: {exc}",
+                blocking_concerns=[f"REVIEWER_ERROR: {exc}"],
+            )
+
+        if raw.get("parse_error"):
+            return PlanCandidate(
+                role="risk_reviewer",
+                summary=f"Reviewer JSON parse failed after {raw.get('attempts', '?')} attempts",
+                blocking_concerns=[
+                    f"REVIEWER_PARSE_ERROR: {raw.get('last_error', 'Unknown parse error')}"
+                ],
+            )
+
+        result = _validate_with_retry(
+            provider,
+            model,
+            task_prompt,
+            raw,
+            validate_reviewer_pydantic,
+            advisor_name="Risk Reviewer",
+        )
+
+        if result.get("blocking_concern"):
+            return PlanCandidate(
+                role="risk_reviewer",
+                summary="Reviewer output failed Pydantic validation after retries",
+                blocking_concerns=[result["blocking_concern"]],
+            )
+
+        return _parse_plan_candidate(result["data"], "risk_reviewer")
+
+
+class LLMExecutionPlannerAdvisor:
+    """Execution Planner backed by a real LLM provider with structured JSON + Pydantic validation.
+
+    worker_tasks is the CRITICAL output.  If Pydantic validation fails even after
+    retries, this advisor returns a blocking_concern — it never fakes worker_tasks.
+    """
+
+    role = "execution_planner"
+    _MAX_RETRIES = 2
+
+    def __init__(self, provider_name: str = "deepseek", model: str = "",
+                 timeout: int = 120) -> None:
+        self.provider_name = provider_name
+        self.model = model
+        self.timeout = timeout
+        self.planner_output: PlanCandidate | None = None
+        self.reviewer_output: PlanCandidate | None = None
+
+    def advise(
+        self,
+        query: str,
+        task_size: str = "medium",
+        run_mode: str = "controlled",
+        risk_level: str = "low",
+        task_type: str = "unknown",
+    ) -> PlanCandidate:
+        from .llm_providers import get_provider
+
+        provider = get_provider(self.provider_name)
+        model = self.model or _default_model_for(self.provider_name)
+        task_prompt = _build_execution_prompt(
+            query, task_size, run_mode, risk_level,
+            planner_output=_candidate_to_dict(self.planner_output) if self.planner_output else None,
+            reviewer_output=_candidate_to_dict(self.reviewer_output) if self.reviewer_output else None,
+            task_type=task_type,
+        )
+        base_prompt = _EXECUTION_SYSTEM_PROMPT + "\n\n" + task_prompt
+
+        try:
+            raw = provider.complete_json_strict(
+                base_prompt,
+                model=model,
+                temperature=0.3,
+                max_tokens=2500,
+                max_retries=self._MAX_RETRIES,
+            )
+        except Exception as exc:
+            return PlanCandidate(
+                role="execution_planner",
+                summary=f"Execution planner provider call failed: {exc}",
+                blocking_concerns=[f"EXECUTION_PLANNER_ERROR: {exc}"],
+            )
+
+        if raw.get("parse_error"):
+            return PlanCandidate(
+                role="execution_planner",
+                summary=f"Execution planner JSON parse failed after {raw.get('attempts', '?')} attempts",
+                blocking_concerns=[
+                    f"EXECUTION_PLANNER_PARSE_ERROR: {raw.get('last_error', 'Unknown parse error')}"
+                ],
+            )
+
+        result = _validate_with_retry(
+            provider,
+            model,
+            task_prompt,
+            raw,
+            validate_execution_planner_pydantic,
+            advisor_name="Execution Planner",
+        )
+
+        if result.get("blocking_concern"):
+            return PlanCandidate(
+                role="execution_planner",
+                summary="Execution planner output failed Pydantic validation after retries",
+                blocking_concerns=[result["blocking_concern"]],
+            )
+
+        data = result["data"]
+        candidate = _parse_plan_candidate(data, "execution_planner")
+        return candidate
+
+
+def _default_model_for(provider_name: str) -> str:
+    """Return a sensible default model for a given provider."""
+    defaults: dict[str, str] = {
+        "deepseek": os.environ.get("AAO_PLANNING_DEFAULT_MODEL", "deepseek-v4-pro"),
+        "glm": "GLM-5.1",
+        "kimi": "moonshot-v1-8k",
+        "openai": "gpt-4o-mini",
+        "anthropic": "claude-sonnet-4-6",
+        "mock": "mock",
+    }
+    return defaults.get(provider_name, "default")
+
+
+def _extract_worker_tasks_from_candidates(candidates: list[PlanCandidate]) -> list[PlannedWorkerTask]:
+    """Parse worker_tasks from the execution planner's LLM output.
+
+    The LLM execution planner's response includes a ``worker_tasks`` field in JSON.
+    We stash it in the candidate's ``assumptions`` as ``__worker_tasks__:JSON``.
+    This function extracts and parses it into PlannedWorkerTask objects.
+    """
+    for candidate in candidates:
+        if candidate.role != "execution_planner":
+            continue
+        for assumption in candidate.assumptions:
+            if assumption.startswith("__worker_tasks__:"):
+                try:
+                    raw = json.loads(assumption[len("__worker_tasks__:"):])
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(raw, list):
+                    tasks: list[PlannedWorkerTask] = []
+                    for item in raw:
+                        if not isinstance(item, dict):
+                            continue
+                        tasks.append(PlannedWorkerTask(
+                            title=str(item.get("title", "")),
+                            objective=str(item.get("objective", "")),
+                            allowed_files=[str(f) for f in item.get("allowed_files", [])],
+                            denied_files=[str(f) for f in item.get("denied_files", [])],
+                            required_checks=[str(c) for c in item.get("required_checks", [])],
+                            expected_evidence=[str(e) for e in item.get("expected_evidence", [])],
+                            risk_level=str(item.get("risk_level", "low")),
+                            dependencies=[str(d) for d in item.get("dependencies", [])],
+                            can_run_parallel=bool(item.get("can_run_parallel", False)),
+                            requires_human_review=bool(item.get("requires_human_review", False)),
+                        ))
+                    return tasks
+    return []
+
+
+# =============================================================================
 # Planning Council
 # =============================================================================
 
@@ -512,17 +936,27 @@ class LocalExecutionPlannerAdvisor:
 class PlanningCouncil:
     """Bounded planning checkpoint for complex tasks.
 
-    Gathers candidates from three deterministic advisors, merges them into one
-    PlanContract.  If ANY advisor produces blocking_concerns, the merged
-    contract carries them forward and cannot be approved until resolved.
+    Gathers candidates from three advisors (deterministic or LLM-backed),
+    merges them into one PlanContract.  If ANY advisor produces
+    blocking_concerns, the merged contract carries them forward and cannot be
+    approved until resolved.
 
     Hard caps: max_candidates <= 3, max_revision_rounds <= 1.
+
+    Phase 19: supports ``mode="llm"`` with provider-backed advisors.
+    In LLM mode, advisors are called sequentially with full context:
+    planner → reviewer (receives planner output) → execution planner
+    (receives both planner and reviewer output).
     """
 
     def __init__(
         self,
         max_candidates: int = 3,
         max_revision_rounds: int = 1,
+        mode: PlanningMode = "deterministic",
+        planner_provider: str = "deepseek",
+        reviewer_provider: str = "deepseek",
+        execution_planner_provider: str = "deepseek",
     ) -> None:
         if max_candidates > 3:
             raise ValueError("max_candidates must be <= 3")
@@ -530,11 +964,20 @@ class PlanningCouncil:
             raise ValueError("max_revision_rounds must be <= 1")
         self._max_candidates = max_candidates
         self._max_revision_rounds = max_revision_rounds
-        self._advisors: list[PlanningAdvisor] = [
-            LocalPlannerAdvisor(),
-            LocalRiskReviewerAdvisor(),
-            LocalExecutionPlannerAdvisor(),
-        ]
+        self._mode: PlanningMode = mode
+
+        if mode == "llm":
+            self._advisors: list[PlanningAdvisor] = [
+                LLMPlannerAdvisor(provider_name=planner_provider),
+                LLMRiskReviewerAdvisor(provider_name=reviewer_provider),
+                LLMExecutionPlannerAdvisor(provider_name=execution_planner_provider),
+            ]
+        else:
+            self._advisors: list[PlanningAdvisor] = [
+                LocalPlannerAdvisor(),
+                LocalRiskReviewerAdvisor(),
+                LocalExecutionPlannerAdvisor(),
+            ]
 
     @property
     def max_candidates(self) -> int:
@@ -562,6 +1005,10 @@ class PlanningCouncil:
         Phase 14: memory_context provides advisory memory hints (project
         constraints, failure lessons, etc.) that may enrich the plan but do
         NOT replace fresh validation.
+
+        Phase 19: in LLM mode, advisors are called sequentially with full
+        context: planner first, then reviewer (receives planner output),
+        then execution planner (receives both planner and reviewer output).
         """
         candidates: list[PlanCandidate] = []
         disagreements: list[str] = []
@@ -580,14 +1027,68 @@ class PlanningCouncil:
                 for item in getattr(mc, "relevant_decisions", []):
                     memory_hints.append(f"architecture decision: {item.title}")
 
-        for advisor in self._advisors[: self._max_candidates]:
-            candidate = advisor.advise(
-                query=query,
-                task_size=task_size,
-                run_mode=run_mode,
-                risk_level=risk_level,
-            )
-            candidates.append(candidate)
+        # ---- Phase 19: LLM mode — sequential calls with context passing --------
+        if self._mode == "llm":
+            planner = self._advisors[0] if len(self._advisors) > 0 else None
+            reviewer = self._advisors[1] if len(self._advisors) > 1 else None
+            executor = self._advisors[2] if len(self._advisors) > 2 else None
+
+            # 1. Planner
+            if planner is None:
+                candidates.append(PlanCandidate(
+                    role="planner",
+                    blocking_concerns=["PLANNER_ERROR: No planner advisor configured"],
+                ))
+            else:
+                planner_candidate = planner.advise(
+                    query=query, task_size=task_size,
+                    run_mode=run_mode, risk_level=risk_level,
+                    task_type=task_type,
+                )
+                candidates.append(planner_candidate)
+
+                # 2. Reviewer — receives planner output
+                if reviewer is not None and isinstance(reviewer, LLMRiskReviewerAdvisor):
+                    reviewer.planner_output = planner_candidate
+                if reviewer is None:
+                    candidates.append(PlanCandidate(
+                        role="risk_reviewer",
+                        blocking_concerns=["REVIEWER_ERROR: No reviewer advisor configured"],
+                    ))
+                else:
+                    reviewer_candidate = reviewer.advise(
+                        query=query, task_size=task_size,
+                        run_mode=run_mode, risk_level=risk_level,
+                        task_type=task_type,
+                    )
+                    candidates.append(reviewer_candidate)
+
+                    # 3. Execution planner — receives both planner and reviewer output
+                    if executor is not None and isinstance(executor, LLMExecutionPlannerAdvisor):
+                        executor.planner_output = planner_candidate
+                        executor.reviewer_output = reviewer_candidate
+                    if executor is None:
+                        candidates.append(PlanCandidate(
+                            role="execution_planner",
+                            blocking_concerns=["EXECUTION_PLANNER_ERROR: No executor advisor configured"],
+                        ))
+                    else:
+                        executor_candidate = executor.advise(
+                            query=query, task_size=task_size,
+                            run_mode=run_mode, risk_level=risk_level,
+                            task_type=task_type,
+                        )
+                        candidates.append(executor_candidate)
+        else:
+            # ---- Deterministic mode — parallel calls (no context passing) ------
+            for advisor in self._advisors[: self._max_candidates]:
+                candidate = advisor.advise(
+                    query=query,
+                    task_size=task_size,
+                    run_mode=run_mode,
+                    risk_level=risk_level,
+                )
+                candidates.append(candidate)
 
         # ---- merge structured fields ------------------------------------------
         all_steps: list[str] = []
@@ -676,9 +1177,14 @@ class PlanningCouncil:
 
         # ---- planned worker tasks (complex tasks only) ------------------------
         planned_worker_tasks: list[PlannedWorkerTask] = []
-        if task_size == "large":
+        # Phase 19: parse worker_tasks from execution planner's LLM output
+        worker_tasks_from_llm = _extract_worker_tasks_from_candidates(candidates)
+        if worker_tasks_from_llm:
+            planned_worker_tasks = worker_tasks_from_llm
+        elif task_size == "large":
             files_list = _extract_files(query)
             planned_worker_tasks.append(PlannedWorkerTask(
+                step_id="step-1",
                 title=f"Execute: {query[:60]}",
                 objective=query,
                 allowed_files=files_list if files_list else [],
@@ -694,6 +1200,7 @@ class PlanningCouncil:
             objective=query,
             run_mode=run_mode,
             task_size=task_size,
+            planning_mode=self._mode,
             steps=all_steps,
             risks=all_risks,
             non_goals=all_non_goals,
@@ -746,9 +1253,24 @@ class PlanningCouncil:
 # Convenience: build a council with defaults
 # =============================================================================
 
-def build_default_council() -> PlanningCouncil:
-    """Return a PlanningCouncil with default deterministic advisors."""
-    return PlanningCouncil(max_candidates=3, max_revision_rounds=1)
+def build_default_council(mode: PlanningMode = "deterministic") -> PlanningCouncil:
+    """Return a PlanningCouncil with default advisors.
+
+    In deterministic mode, uses local rule-based advisors.
+    In LLM mode, uses provider-backed advisors configured via environment:
+    ``AAO_PLANNER_PROVIDER``, ``AAO_RISK_REVIEWER_PROVIDER``,
+    ``AAO_EXECUTION_PLANNER_PROVIDER`` (default "deepseek" each).
+    """
+    if mode == "llm":
+        return PlanningCouncil(
+            max_candidates=3,
+            max_revision_rounds=1,
+            mode="llm",
+            planner_provider=os.environ.get("AAO_PLANNER_PROVIDER", "deepseek"),
+            reviewer_provider=os.environ.get("AAO_RISK_REVIEWER_PROVIDER", "deepseek"),
+            execution_planner_provider=os.environ.get("AAO_EXECUTION_PLANNER_PROVIDER", "deepseek"),
+        )
+    return PlanningCouncil(max_candidates=3, max_revision_rounds=1, mode="deterministic")
 
 
 # =============================================================================
@@ -777,6 +1299,9 @@ def planned_task_to_packet_kwargs(
         "required_checks": pwt.required_checks,
         "expected_evidence": pwt.expected_evidence,
         "risk_level": pwt.risk_level,
+        "dependencies": pwt.dependencies,
+        "can_run_parallel": pwt.can_run_parallel,
+        "requires_human_review": pwt.requires_human_review,
     }
 
 
@@ -798,6 +1323,7 @@ def render_plan_contract(plan: PlanContract) -> str:
         f"  Plan ID:       {plan.plan_id}",
         f"  Status:        {plan.approval_status}",
         f"  Executable:    {'NO — blocking concerns exist' if plan.has_blocking_concerns else 'Yes'}",
+        f"  Planning Mode: {plan.planning_mode}",
         f"  Task Size:     {plan.task_size}",
         f"  Run Mode:      {plan.run_mode}",
         f"  Objective:     {plan.objective[:100]}",
@@ -883,6 +1409,7 @@ def plan_contract_to_dict(plan: PlanContract) -> dict[str, object]:
         "objective": plan.objective,
         "run_mode": plan.run_mode,
         "task_size": plan.task_size,
+        "planning_mode": plan.planning_mode,
         "approval_status": plan.approval_status,
         "has_blocking_concerns": plan.has_blocking_concerns,
         "steps": plan.steps,
@@ -897,6 +1424,7 @@ def plan_contract_to_dict(plan: PlanContract) -> dict[str, object]:
         "memory_hints": plan.memory_hints,
         "planned_worker_tasks": [
             {
+                "step_id": wt.step_id,
                 "title": wt.title,
                 "objective": wt.objective,
                 "allowed_files": wt.allowed_files,
@@ -905,9 +1433,32 @@ def plan_contract_to_dict(plan: PlanContract) -> dict[str, object]:
                 "expected_evidence": wt.expected_evidence,
                 "risk_level": wt.risk_level,
                 "has_boundaries": wt.has_boundaries,
+                "dependencies": wt.dependencies,
+                "can_run_parallel": wt.can_run_parallel,
+                "requires_human_review": wt.requires_human_review,
             }
             for wt in plan.planned_worker_tasks
         ],
         "source_candidate_count": len(plan.source_candidates),
+        "advisor_outputs": [
+            {
+                "role": c.role,
+                "summary": c.summary,
+                "steps": c.steps,
+                "risks": c.risks,
+                "non_goals": c.non_goals,
+                "required_evidence": c.required_evidence,
+                "human_review_gates": c.human_review_gates,
+                "blocking_concerns": c.blocking_concerns,
+                "non_blocking_concerns": c.non_blocking_concerns,
+                "assumptions": c.assumptions,
+            }
+            for c in plan.source_candidates
+        ],
+        "critic_findings": {
+            "blocking_concerns": plan.blocking_concerns,
+            "non_blocking_concerns": plan.non_blocking_concerns,
+            "disagreements": plan.disagreements,
+        },
         "disagreements": plan.disagreements,
     }

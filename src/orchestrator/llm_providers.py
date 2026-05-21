@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -34,6 +35,18 @@ class LLMProvider(ABC):
         model: str,
         temperature: float = 0.7,
         max_tokens: int = 2000,
+    ) -> dict[str, Any]:
+        ...
+
+    @abstractmethod
+    def complete_json_strict(
+        self,
+        prompt: str,
+        *,
+        model: str,
+        temperature: float = 0.3,
+        max_tokens: int = 2500,
+        max_retries: int = 2,
     ) -> dict[str, Any]:
         ...
 
@@ -71,6 +84,17 @@ class MockProvider(LLMProvider):
         max_tokens: int = 2000,
     ) -> dict[str, Any]:
         return {"mock": True, "prompt_preview": prompt[:100]}
+
+    def complete_json_strict(
+        self,
+        prompt: str,
+        *,
+        model: str,
+        temperature: float = 0.3,
+        max_tokens: int = 2500,
+        max_retries: int = 2,
+    ) -> dict[str, Any]:
+        return {"mock": True, "prompt_preview": prompt[:100], "mode": "strict"}
 
 
 class CLIProvider(LLMProvider):
@@ -189,6 +213,72 @@ class CLIProvider(LLMProvider):
         except json.JSONDecodeError:
             return {"raw": raw, "parse_error": True}
 
+    def complete_json_strict(
+        self,
+        prompt: str,
+        *,
+        model: str,
+        temperature: float = 0.3,
+        max_tokens: int = 2500,
+        max_retries: int = 2,
+    ) -> dict[str, Any]:
+        """Call the CLI LLM and return parsed JSON dict, with automatic retry.
+
+        On parse failure the original response text is appended to a correction
+        prompt and the model is asked to fix it.  After *max_retries* attempts
+        the method returns ``{"parse_error": True, "raw": "...", "attempts": N,
+        "last_error": "..."}`` instead of raising — callers MUST check for
+        ``parse_error`` in the returned dict.
+        """
+        last_raw: str = ""
+        last_error: str = ""
+        current_prompt = prompt
+
+        for attempt in range(max_retries + 1):
+            try:
+                raw = self.complete(
+                    current_prompt + "\n\nReturn JSON only.",
+                    model=model,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                )
+            except RuntimeError:
+                raise  # network / auth errors propagate immediately
+
+            last_raw = raw
+            text = raw.strip()
+
+            # Strip markdown code fences
+            if text.startswith("```json"):
+                text = text[7:]
+            elif text.startswith("```"):
+                text = text[3:]
+            if text.endswith("```"):
+                text = text[:-3]
+            text = text.strip()
+
+            # Try to extract JSON substring if the model embedded it in text
+            parsed = _extract_json_substring(text)
+            if parsed is not None:
+                return parsed
+
+            # Parse failed — build correction prompt
+            last_error = _describe_json_parse_error(text)
+            if attempt < max_retries:
+                current_prompt = _build_correction_prompt(
+                    original_prompt=prompt,
+                    raw_response=text,
+                    error=last_error,
+                )
+                temperature = max(0.1, temperature - 0.1)
+
+        return {
+            "parse_error": True,
+            "raw": last_raw,
+            "attempts": max_retries + 1,
+            "last_error": last_error,
+        }
+
 
 class CodexProvider(CLIProvider):
     name = "codex"
@@ -301,6 +391,7 @@ class OpenAICompatibleProvider(LLMProvider):
         self.name = name
         self.api_key = api_key
         self.api_base = (api_base or "").rstrip("/") + "/"
+        self._json_mode_supported: bool | None = None  # lazy detection
 
     def _get_client(self):
         import httpx
@@ -311,8 +402,18 @@ class OpenAICompatibleProvider(LLMProvider):
                 "Authorization": f"Bearer {self.api_key}",
                 "Content-Type": "application/json",
             },
-            timeout=60.0,
+            timeout=180.0,
         )
+
+    def _supports_json_mode(self) -> bool:
+        """Detect whether this provider supports response_format json_object."""
+        if self._json_mode_supported is not None:
+            return self._json_mode_supported
+        # GLM proxy (svips.org) and Kimi do not reliably support json_object mode.
+        # DeepSeek and OpenAI do.  Default to False for safety.
+        unsupported = {"glm", "kimi"}
+        self._json_mode_supported = self.name not in unsupported
+        return self._json_mode_supported
 
     def complete(
         self,
@@ -321,20 +422,22 @@ class OpenAICompatibleProvider(LLMProvider):
         model: str,
         temperature: float = 0.7,
         max_tokens: int = 2000,
+        response_format: str | None = None,
     ) -> str:
         import httpx
 
         client = self._get_client()
+        body: dict[str, Any] = {
+            "model": model,
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+        }
+        if response_format and self._supports_json_mode():
+            body["response_format"] = {"type": response_format}
+
         try:
-            response = client.post(
-                "chat/completions",
-                json={
-                    "model": model,
-                    "messages": [{"role": "user", "content": prompt}],
-                    "temperature": temperature,
-                    "max_tokens": max_tokens,
-                },
-            )
+            response = client.post("chat/completions", json=body)
             response.raise_for_status()
             data = response.json()
             return data["choices"][0]["message"]["content"]
@@ -385,6 +488,83 @@ class OpenAICompatibleProvider(LLMProvider):
             return json.loads(text)
         except json.JSONDecodeError:
             return {"raw": raw, "parse_error": True}
+
+    # ------------------------------------------------------------------
+    # Phase 19v2: structured JSON with retry
+    # ------------------------------------------------------------------
+
+    def complete_json_strict(
+        self,
+        prompt: str,
+        *,
+        model: str,
+        temperature: float = 0.3,
+        max_tokens: int = 2500,
+        max_retries: int = 2,
+    ) -> dict[str, Any]:
+        """Call the LLM and return parsed JSON dict, with automatic retry.
+
+        On parse failure the original response text is appended to a correction
+        prompt and the model is asked to fix it.  After *max_retries* attempts
+        the method returns ``{"parse_error": True, "raw": "...", "attempts": N,
+        "last_error": "..."}`` instead of raising — callers MUST check for
+        ``parse_error`` in the returned dict.
+
+        JSON mode (``response_format={"type": "json_object"}``) is enabled for
+        providers that support it, with automatic fallback for those that don't.
+        """
+        last_raw: str = ""
+        last_error: str = ""
+        current_prompt = prompt
+
+        for attempt in range(max_retries + 1):
+            use_json_mode = self._supports_json_mode()
+            try:
+                raw = self.complete(
+                    current_prompt,
+                    model=model,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    response_format="json_object" if use_json_mode else None,
+                )
+            except RuntimeError:
+                raise  # network / auth errors propagate immediately
+
+            last_raw = raw
+            text = raw.strip()
+
+            # Strip markdown code fences
+            if text.startswith("```json"):
+                text = text[7:]
+            elif text.startswith("```"):
+                text = text[3:]
+            if text.endswith("```"):
+                text = text[:-3]
+            text = text.strip()
+
+            # Try to extract JSON substring if the model embedded it in text
+            parsed = _extract_json_substring(text)
+
+            if parsed is not None:
+                return parsed
+
+            # Parse failed — build correction prompt
+            last_error = _describe_json_parse_error(text)
+            if attempt < max_retries:
+                correction = _build_correction_prompt(
+                    original_prompt=prompt,
+                    raw_response=text,
+                    error=last_error,
+                )
+                current_prompt = correction
+                temperature = max(0.1, temperature - 0.1)
+
+        return {
+            "parse_error": True,
+            "raw": last_raw,
+            "attempts": max_retries + 1,
+            "last_error": last_error,
+        }
 
 
 class GLMProvider(OpenAICompatibleProvider):
@@ -441,7 +621,7 @@ class AnthropicProvider(LLMProvider):
                 "anthropic-version": "2023-06-01",
                 "Content-Type": "application/json",
             },
-            timeout=60.0,
+            timeout=180.0,
         )
 
     def complete(
@@ -459,6 +639,7 @@ class AnthropicProvider(LLMProvider):
                 json={
                     "model": model,
                     "max_tokens": max_tokens,
+                    "temperature": temperature,
                     "messages": [{"role": "user", "content": prompt}],
                 },
             )
@@ -496,6 +677,167 @@ class AnthropicProvider(LLMProvider):
             return json.loads(text)
         except json.JSONDecodeError:
             return {"raw": raw, "parse_error": True}
+
+    def complete_json_strict(
+        self,
+        prompt: str,
+        *,
+        model: str,
+        temperature: float = 0.3,
+        max_tokens: int = 2500,
+        max_retries: int = 2,
+    ) -> dict[str, Any]:
+        """Call the Anthropic LLM and return parsed JSON dict, with automatic retry.
+
+        Anthropic does not support response_format json_object.
+        On parse failure the original response text is appended to a correction
+        prompt and the model is asked to fix it.  After *max_retries* attempts
+        the method returns ``{"parse_error": True, "raw": "...", "attempts": N,
+        "last_error": "..."}`` instead of raising — callers MUST check for
+        ``parse_error`` in the returned dict.
+        """
+        last_raw: str = ""
+        last_error: str = ""
+        current_prompt = prompt
+
+        for attempt in range(max_retries + 1):
+            try:
+                raw = self.complete(
+                    current_prompt + "\n\nReturn JSON only.",
+                    model=model,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                )
+            except RuntimeError:
+                raise  # network / auth errors propagate immediately
+
+            last_raw = raw
+            text = raw.strip()
+
+            # Strip markdown code fences
+            if text.startswith("```json"):
+                text = text[7:]
+            elif text.startswith("```"):
+                text = text[3:]
+            if text.endswith("```"):
+                text = text[:-3]
+            text = text.strip()
+
+            # Try to extract JSON substring if the model embedded it in text
+            parsed = _extract_json_substring(text)
+            if parsed is not None:
+                return parsed
+
+            # Parse failed — build correction prompt
+            last_error = _describe_json_parse_error(text)
+            if attempt < max_retries:
+                current_prompt = _build_correction_prompt(
+                    original_prompt=prompt,
+                    raw_response=text,
+                    error=last_error,
+                )
+                temperature = max(0.1, temperature - 0.1)
+
+        return {
+            "parse_error": True,
+            "raw": last_raw,
+            "attempts": max_retries + 1,
+            "last_error": last_error,
+        }
+
+
+# ------------------------------------------------------------------
+# JSON parse helpers for complete_json_strict
+# ------------------------------------------------------------------
+
+
+def _extract_json_substring(text: str) -> dict[str, Any] | None:
+    """Try to find and parse a JSON object within arbitrary text.
+
+    Returns a dict on success or None if no JSON object can be found.
+    """
+    if not text:
+        return None
+
+    # Fast path: the whole string is valid JSON
+    try:
+        result = json.loads(text)
+        if isinstance(result, dict):
+            return result
+    except (json.JSONDecodeError, ValueError):
+        pass
+
+    # Try to find JSON object boundaries with braces
+    # Strategy: find the first '{' and find its matching '}'
+    start = text.find("{")
+    if start == -1:
+        return None
+
+    # Walk forward counting brace depth
+    depth = 0
+    for end in range(start, len(text)):
+        ch = text[end]
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                candidate = text[start:end + 1]
+                try:
+                    result = json.loads(candidate)
+                    if isinstance(result, dict):
+                        return result
+                except (json.JSONDecodeError, ValueError):
+                    pass
+                break
+
+    return None
+
+
+def _describe_json_parse_error(text: str) -> str:
+    """Produce a human-readable description of why the text fails JSON parse."""
+    if not text:
+        return "Output was empty (expected a JSON object)."
+
+    # Trim to avoid reporting errors on trailing noise if we can find a brace
+    trimmed = text.strip()
+
+    try:
+        json.loads(trimmed)
+        return "Text parsed as valid JSON but was not a dict."
+    except json.JSONDecodeError as exc:
+        # Give context: show the error position
+        line = exc.lineno
+        col = exc.colno
+        msg = exc.msg
+        # Show a snippet around the error
+        snippet = ""
+        lines = text.split("\n")
+        if 1 <= line <= len(lines):
+            snippet = lines[line - 1].strip()
+            if len(snippet) > 120:
+                snippet = snippet[:120] + "..."
+        return (
+            f"JSON parse error at line {line}, col {col}: {msg}. "
+            f"Snippet: {snippet}"
+        )
+
+
+def _build_correction_prompt(
+    original_prompt: str,
+    raw_response: str,
+    error: str,
+) -> str:
+    """Build a correction prompt with the original request, raw output, and errors."""
+    return (
+        f"{original_prompt}\n\n"
+        f"---\n\n"
+        f"Your last response could not be parsed as valid JSON.\n\n"
+        f"Error: {error}\n\n"
+        f"Your last response was:\n```\n{raw_response[:2000]}\n```\n\n"
+        f"Please fix the issue and return ONLY a valid JSON object. "
+        f"Do NOT wrap it in markdown fences, do not add any other text."
+    )
 
 
 PROVIDER_REGISTRY: dict[str, type[LLMProvider]] = {

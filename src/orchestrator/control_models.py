@@ -58,6 +58,7 @@ RecoveryHint = Literal[
 ControlAction = Literal[
     "continue",
     "retry",
+    "retry_with_backoff",
     "replan",
     "rollback",
     "needs_human_review",

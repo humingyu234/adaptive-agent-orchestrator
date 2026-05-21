@@ -10,7 +10,9 @@ YAML-workflow path through Scheduler is preserved for legacy/native mode.
 from __future__ import annotations
 
 import json
+import random
 import re
+import time
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -55,6 +57,7 @@ class MainlineResult:
     plan_id: str = ""
     status: str = "unknown"  # completed, blocked_needs_review, blocked_failed, pending_external
     worker_mode: str = "fake"
+    retry_count: int = 0
     worker_result: dict[str, Any] = field(default_factory=dict)
     evidence_status: dict[str, Any] | None = None
     control_decisions: list[dict[str, Any]] = field(default_factory=list)
@@ -71,6 +74,7 @@ class MainlineResult:
             "plan_id": self.plan_id,
             "status": self.status,
             "worker_mode": self.worker_mode,
+            "retry_count": self.retry_count,
             "worker_result": self.worker_result,
             "evidence_status": self.evidence_status,
             "control_decisions": self.control_decisions,
@@ -138,6 +142,7 @@ class MainlineExecutor:
         plan: PlanContract,
         *,
         worker_mode: str = "fake",
+        max_workers: int = 2,
     ) -> MainlineResult:
         """Execute a plan through the mainline chain.
 
@@ -146,6 +151,7 @@ class MainlineExecutor:
                   unapproved plans are rejected.
             worker_mode: "fake" (deterministic, writes files) or "packet" (writes
                          packet to disk for external worker).
+            max_workers: Maximum concurrent workers (Phase 20 multi-worker).
 
         Returns:
             MainlineResult with all paths, decisions, and status.
@@ -164,6 +170,11 @@ class MainlineExecutor:
                 }],
                 summary=f"Blocked: plan not approved (status={plan.approval_status})",
             )
+
+        # Phase 20: multi-worker path when plan has multiple worker tasks
+        if len(plan.planned_worker_tasks) > 1:
+            return self._execute_multi_worker(plan, worker_mode=worker_mode,
+                                               max_workers=max_workers)
 
         run_id = _utc_now_compact() + "-" + uuid.uuid4().hex[:6]
         task_id = f"task-{run_id}"
@@ -187,18 +198,169 @@ class MainlineExecutor:
                 summary="Packet written to disk — awaiting external worker execution",
             )
 
-        # 3. Classify evidence
+        # 2c. Claude Code worker infrastructure failures — command not found,
+        #     timeout, permission denied.  These are not task failures; they
+        #     are worker-launch failures and must not be mistaken for success.
+        if worker_mode == "claude-code":
+            infra_decisions = self._check_worker_infrastructure(worker_result)
+            if infra_decisions:
+                # Derive status from the actual decision actions (not hardcoded):
+                # command-not-found / timeout → fail → blocked_failed
+                # non-zero exit → needs_human_review → blocked_needs_review
+                infra_actions = {d.action for d in infra_decisions}
+                if "needs_human_review" in infra_actions:
+                    infra_status = "blocked_needs_review"
+                elif "fail" in infra_actions:
+                    infra_status = "blocked_failed"
+                else:
+                    infra_status = "blocked"
+                return MainlineResult(
+                    run_id=run_id,
+                    task_id=task_id,
+                    plan_id=plan.plan_id,
+                    status=infra_status,
+                    worker_mode=worker_mode,
+                    worker_result=worker_result,
+                    control_decisions=[_decision_to_dict(d) for d in infra_decisions],
+                    worker_packet_path=str(packet.packet_root),
+                    summary=f"Worker infrastructure failure: {worker_result.get('error', 'unknown')}",
+                )
+
+        # 3-5. Evidence → control checks → status (with retry loop)
+        max_retries = 2
+        retry_count = 0
+        all_control_decisions: list[ControlDecision] = []
+        final_evidence_status: WorkerEvidenceStatus | None = None
+        final_worker_result: dict[str, Any] = worker_result
+
+        for attempt in range(max_retries + 1):
+            # 3. Classify evidence
+            evidence_status = classify_worker_evidence_from_packet(packet)
+            final_evidence_status = evidence_status
+
+            # 4. Check test results for failures
+            test_decisions = self._check_test_results(packet)
+
+            # 5. Run ControlPlane checks
+            control_decisions = test_decisions + self._run_control_checks(
+                packet, evidence_status, final_worker_result,
+            )
+            all_control_decisions = control_decisions
+
+            # 6. Determine whether this attempt is recoverable
+            failed_actions = {d.action for d in control_decisions if not d.passed}
+            retryable = {"retry", "retry_with_backoff"} & failed_actions
+            should_replan = "replan" in failed_actions
+
+            if (retryable or should_replan) and attempt < max_retries:
+                retry_count += 1
+
+                if should_replan:
+                    # Merge failure reasons into the plan so the worker sees them
+                    failure_reasons = [
+                        d.reason for d in control_decisions
+                        if not d.passed and d.action == "replan"
+                    ]
+                    plan.steps = list(plan.steps) + [
+                        f"REPLAN ({retry_count}): " + "; ".join(failure_reasons[:3])
+                    ]
+                    # Regenerate packet with updated plan
+                    packet = self._plan_to_packet(plan, run_id=run_id, task_id=task_id)
+
+                if retryable:
+                    if "retry_with_backoff" in retryable:
+                        time.sleep(random.uniform(0.5, 3.0))
+
+                # Re-execute worker for next attempt
+                final_worker_result = self._execute_worker(packet, worker_mode=worker_mode)
+                continue
+            break
+
+        # 7. Generate audit report
+        report_path, evidence_path = self._generate_report(
+            plan=plan,
+            packet=packet,
+            worker_result=final_worker_result,
+            evidence_status=final_evidence_status,
+            control_decisions=all_control_decisions,
+        )
+
+        # 8. Determine overall status
+        overall_status = self._determine_status(all_control_decisions, final_evidence_status)
+
+        # 9. Persist review state when blocked for human review
+        if overall_status == "blocked_needs_review":
+            self._persist_review_state(
+                run_id=run_id,
+                task_id=task_id,
+                plan=plan,
+                worker_mode=worker_mode,
+                max_workers=max_workers,
+                packet=packet,
+                result_status=overall_status,
+            )
+
+        return MainlineResult(
+            run_id=run_id,
+            task_id=task_id,
+            plan_id=plan.plan_id,
+            status=overall_status,
+            worker_mode=worker_mode,
+            retry_count=retry_count,
+            worker_result=final_worker_result,
+            evidence_status=_evidence_status_to_dict(final_evidence_status),
+            control_decisions=[_decision_to_dict(d) for d in all_control_decisions],
+            report_path=str(report_path),
+            evidence_path=str(evidence_path),
+            worker_packet_path=str(packet.packet_root),
+            changed_files=final_evidence_status.changed_files,
+            summary=self._build_summary(overall_status, all_control_decisions, final_evidence_status),
+        )
+
+    def complete_packet_execution(
+        self,
+        task_id: str,
+        *,
+        plan: PlanContract,
+        worker_mode: str = "packet",
+    ) -> MainlineResult | None:
+        """Complete execution of a packet that was written to disk.
+
+        This is the resume path for ``worker_mode="packet"``: the external
+        worker has finished and written results back to the packet directory.
+        This method picks up from there — evidence classification, control
+        checks, and report generation.
+
+        Returns None if the packet directory does not exist.
+        """
+        packet_root = packet_dir(self.project_root, task_id)
+        if not packet_root.exists():
+            return None
+
+        run_id = _utc_now_compact() + "-" + uuid.uuid4().hex[:6]
+        packet = WorkerTaskPacket(
+            task_id=task_id,
+            task_title=plan.planned_worker_tasks[0].title if plan.planned_worker_tasks else "Packet task",
+            task_objective=plan.objective,
+            allowed_files=plan.planned_worker_tasks[0].allowed_files if plan.planned_worker_tasks else [],
+            denied_files=plan.planned_worker_tasks[0].denied_files if plan.planned_worker_tasks else [],
+            required_checks=plan.planned_worker_tasks[0].required_checks if plan.planned_worker_tasks else [],
+            expected_evidence=plan.planned_worker_tasks[0].expected_evidence if plan.planned_worker_tasks else [],
+            packet_root=packet_root,
+        )
+
+        worker_result = load_worker_result_text(packet)
         evidence_status = classify_worker_evidence_from_packet(packet)
 
-        # 4. Check test results for failures
+        # Check test results
         test_decisions = self._check_test_results(packet)
 
-        # 5. Run ControlPlane checks
+        # Run control checks
         control_decisions = test_decisions + self._run_control_checks(
             packet, evidence_status, worker_result,
         )
 
-        # 6. Generate audit report
+        # Generate report
         report_path, evidence_path = self._generate_report(
             plan=plan,
             packet=packet,
@@ -207,8 +369,18 @@ class MainlineExecutor:
             control_decisions=control_decisions,
         )
 
-        # 7. Determine overall status
         overall_status = self._determine_status(control_decisions, evidence_status)
+
+        if overall_status == "blocked_needs_review":
+            self._persist_review_state(
+                run_id=run_id,
+                task_id=task_id,
+                plan=plan,
+                worker_mode=worker_mode,
+                max_workers=1,
+                packet=packet,
+                result_status=overall_status,
+            )
 
         return MainlineResult(
             run_id=run_id,
@@ -233,20 +405,49 @@ class MainlineExecutor:
         worker_mode: str = "fake",
         run_mode: str = "controlled",
         task_size: str = "medium",
+        max_workers: int = 2,
     ) -> MainlineResult:
-        """Execute a simple query directly without a PlanContract.
+        """Execute a simple query directly without a pre-existing PlanContract.
 
         For small/medium tasks that don't go through Planning Council but the
-        user still wants the mainline path (--worker-mode flag).
-        """
-        from .planning import build_default_council
+        user still wants the mainline path (--worker-mode flag or auto-routed).
 
-        council = build_default_council()
+        For orchestrated/large tasks, LLM planning is attempted if providers
+        are configured; otherwise deterministic mode is used as fallback.
+        """
+        from .planning import build_default_council, PlanningMode
+
+        # Use LLM planning for orchestrated or large tasks when a provider key
+        # is configured; deterministic mode for everything else.
+        planning_mode: PlanningMode = "deterministic"
+        if run_mode == "orchestrated" or task_size == "large":
+            import os
+            if (
+                os.environ.get("DEEPSEEK_API_KEY")
+                or os.environ.get("OPENAI_API_KEY")
+                or os.environ.get("AAO_PLANNING_PROVIDER")
+            ):
+                planning_mode = "llm"
+
+        council = build_default_council(mode=planning_mode)
         plan = council.create_plan(
             query,
             task_size=task_size,
             run_mode=run_mode,
         )
+        if plan.has_blocking_concerns:
+            return MainlineResult(
+                plan_id=plan.plan_id,
+                status="blocked_needs_review",
+                worker_mode=worker_mode,
+                worker_result={"behaviour": "blocked", "summary": "Plan has blocking concerns"},
+                control_decisions=[{
+                    "action": "needs_human_review",
+                    "passed": False,
+                    "reason": f"Plan has {len(plan.blocking_concerns)} blocking concern(s)",
+                }],
+                summary=f"Plan blocked: {plan.blocking_concerns[0] if plan.blocking_concerns else 'unknown'}",
+            )
         try:
             plan.approve()
         except ValueError:
@@ -262,7 +463,54 @@ class MainlineExecutor:
                 }],
                 summary=f"Plan blocked: {plan.blocking_concerns[0] if plan.blocking_concerns else 'unknown'}",
             )
-        return self.execute(plan, worker_mode=worker_mode)
+        return self.execute(plan, worker_mode=worker_mode, max_workers=max_workers)
+
+    # ------------------------------------------------------------------
+    # Phase 20 — Multi-worker execution
+    # ------------------------------------------------------------------
+
+    def _execute_multi_worker(
+        self,
+        plan: PlanContract,
+        *,
+        worker_mode: str = "fake",
+        max_workers: int = 2,
+    ) -> MainlineResult:
+        """Execute a plan with multiple worker tasks via MultiWorkerExecutor."""
+        from .multi_worker import MultiWorkerExecutor
+
+        executor = MultiWorkerExecutor(
+            project_root=self.project_root,
+            policy=self._policy,
+            max_workers=max_workers,
+            worker_mode=worker_mode,
+        )
+        mw_result = executor.execute(plan)
+
+        return MainlineResult(
+            run_id=mw_result.run_id,
+            task_id=f"multi-{mw_result.run_id}",
+            plan_id=mw_result.plan_id,
+            status=mw_result.status,
+            worker_mode=worker_mode,
+            worker_result=mw_result.to_dict(),
+            evidence_status={
+                "passed_steps": mw_result.passed_steps,
+                "failed_steps": mw_result.failed_steps,
+                "blocked_steps": mw_result.blocked_steps,
+                "step_count": mw_result.step_count,
+            },
+            control_decisions=[
+                {
+                    "action": "continue" if mw_result.status == "completed" else "needs_human_review",
+                    "passed": mw_result.status == "completed",
+                    "reason": mw_result.summary,
+                },
+            ],
+            report_path=mw_result.combined_report_path,
+            evidence_path=mw_result.combined_evidence_path,
+            summary=mw_result.summary,
+        )
 
     # ------------------------------------------------------------------
     # Plan → Packet conversion
@@ -352,6 +600,8 @@ class MainlineExecutor:
             return self._execute_fake_worker(packet)
         elif worker_mode == "packet":
             return self._execute_packet_worker(packet)
+        elif worker_mode == "claude-code":
+            return self._execute_claude_code_worker(packet)
         else:
             raise ValueError(f"Unknown worker_mode: {worker_mode!r}")
 
@@ -374,6 +624,86 @@ class MainlineExecutor:
             "summary": "Packet written to disk — awaiting external worker execution",
             "observed_paths": [],
         }
+
+    def _execute_claude_code_worker(self, packet: WorkerTaskPacket) -> dict[str, Any]:
+        """Launch a real Claude Code subprocess as the worker."""
+        from .workers.claude_code import (
+            ClaudeCodeWorkerConfig,
+            run_claude_code_worker,
+        )
+
+        config = ClaudeCodeWorkerConfig.from_env(
+            project_root=str(self.project_root),
+        )
+        result = run_claude_code_worker(packet, config=config)
+
+        return {
+            "run_id": result.run_id,
+            "task_id": result.task_id,
+            "packet_dir": result.packet_dir,
+            "behaviour": "claude-code",
+            "exit_code": result.exit_code,
+            "timed_out": result.timed_out,
+            "worker_status": result.worker_status,
+            "changed_files": result.changed_files,
+            "summary": result.summary,
+            "error": result.error,
+            "observed_paths": result.observed_paths,
+            "stdout_path": result.stdout_path,
+            "stderr_path": result.stderr_path,
+            "transcript_path": result.transcript_path,
+            "result_md_path": result.result_md_path,
+            "status_json_path": result.status_json_path,
+            "command": result.command,
+        }
+
+    # ------------------------------------------------------------------
+    # Worker infrastructure checking (Phase 18)
+    # ------------------------------------------------------------------
+
+    def _check_worker_infrastructure(
+        self,
+        worker_result: dict[str, Any],
+    ) -> list[ControlDecision]:
+        """Detect worker-launch failures: command not found, timeout, etc."""
+        decisions: list[ControlDecision] = []
+
+        error = worker_result.get("error", "")
+        exit_code = worker_result.get("exit_code", 0)
+        timed_out = worker_result.get("timed_out", False)
+
+        if timed_out:
+            decisions.append(ControlDecision(
+                passed=False,
+                action="fail",
+                reason=f"Worker timed out after {worker_result.get('timeout', 'unknown')}",
+                severity="high",
+                failure_category="worker_timeout",
+                failure_origin="worker",
+                recovery_hint="retry_with_backoff",
+            ))
+        elif error:
+            decisions.append(ControlDecision(
+                passed=False,
+                action="fail",
+                reason=f"Worker infrastructure failure: {error}",
+                severity="high",
+                failure_category="worker_infrastructure",
+                failure_origin="worker",
+                recovery_hint="fail",
+            ))
+        elif exit_code != 0:
+            decisions.append(ControlDecision(
+                passed=False,
+                action="needs_human_review",
+                reason=f"Worker exited with code {exit_code}",
+                severity="medium",
+                failure_category="worker_error",
+                failure_origin="worker",
+                recovery_hint="needs_human_review",
+            ))
+
+        return decisions
 
     # ------------------------------------------------------------------
     # Test result checking (P1.2)
@@ -399,7 +729,7 @@ class MainlineExecutor:
             failed_count = int(match.group(1)) if match else 1
             decisions.append(ControlDecision(
                 passed=False,
-                action="needs_human_review" if self._policy.mode == "controlled" else "fail",
+                action="retry",
                 reason=f"Test failure detected: {failed_count} test(s) failed",
                 severity="medium",
                 failure_category="task_quality_error",
@@ -583,6 +913,149 @@ class MainlineExecutor:
         if any(w in combined for w in ("lint", "type", "mypy", "flake8")):
             checks.append("python -m ruff check")
         return checks
+
+    # ------------------------------------------------------------------
+    # Human Review persistence
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _review_dir() -> Path:
+        """Directory for persisted review states."""
+        d = Path.cwd() / "outputs" / "reviews"
+        d.mkdir(parents=True, exist_ok=True)
+        return d
+
+    def _persist_review_state(
+        self,
+        *,
+        run_id: str,
+        task_id: str,
+        plan: PlanContract,
+        worker_mode: str,
+        max_workers: int,
+        packet: WorkerTaskPacket,
+        result_status: str,
+    ) -> None:
+        """Save blocked task state so it can be listed and resumed later."""
+        review_state = {
+            "run_id": run_id,
+            "task_id": task_id,
+            "plan_id": plan.plan_id,
+            "plan": plan_contract_to_dict(plan),
+            "worker_mode": worker_mode,
+            "max_workers": max_workers,
+            "worker_packet_path": str(packet.packet_root),
+            "status": result_status,
+            "created_at": _utc_now_iso(),
+        }
+        review_path = self._review_dir() / f"{task_id}.json"
+        review_path.write_text(
+            json.dumps(review_state, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+
+    @classmethod
+    def list_reviews(cls) -> list[dict[str, Any]]:
+        """List all pending human review tasks."""
+        reviews: list[dict[str, Any]] = []
+        review_dir = cls._review_dir()
+        if not review_dir.exists():
+            return reviews
+        for path in sorted(review_dir.glob("*.json")):
+            try:
+                reviews.append(json.loads(path.read_text(encoding="utf-8")))
+            except (json.JSONDecodeError, KeyError):
+                pass
+        return reviews
+
+    @classmethod
+    def resume_from_review(
+        cls,
+        task_id: str,
+        *,
+        decision: str,
+        reason: str = "",
+        worker_mode_override: str | None = None,
+    ) -> MainlineResult | None:
+        """Resume a blocked human review task.
+
+        Args:
+            task_id: The task ID from the blocked result.
+            decision: "approve" or "reject".
+            reason: Optional human review reason.
+            worker_mode_override: Override the worker mode (e.g. for testing).
+
+        Returns:
+            MainlineResult if resumed, None if task not found.
+        """
+        review_path = cls._review_dir() / f"{task_id}.json"
+        if not review_path.exists():
+            return None
+
+        review_state = json.loads(review_path.read_text(encoding="utf-8"))
+
+        if decision == "reject":
+            return MainlineResult(
+                run_id=review_state.get("run_id", ""),
+                task_id=task_id,
+                plan_id=review_state.get("plan_id", ""),
+                status="blocked_rejected",
+                worker_mode=review_state.get("worker_mode", "fake"),
+                worker_result={
+                    "behaviour": "human_rejected",
+                    "summary": f"Human rejected: {reason}" if reason else "Human rejected",
+                },
+                control_decisions=[{
+                    "action": "needs_human_review",
+                    "passed": False,
+                    "reason": f"Human rejected: {reason}" if reason else "Human rejected",
+                }],
+                summary=f"Blocked: human rejected ({reason})" if reason else "Blocked: human rejected",
+            )
+
+        # Reconstruct PlanContract from persisted state
+        plan_dict = review_state.get("plan", {})
+        plan = PlanContract(
+            objective=plan_dict.get("objective", ""),
+            steps=plan_dict.get("steps", []),
+            planned_worker_tasks=[
+                PlannedWorkerTask(
+                    step_id=wt.get("step_id", f"step-{i}"),
+                    title=wt.get("title", ""),
+                    objective=wt.get("objective", ""),
+                    allowed_files=wt.get("allowed_files", []),
+                    denied_files=wt.get("denied_files", []),
+                    required_checks=wt.get("required_checks", []),
+                    expected_evidence=wt.get("expected_evidence", []),
+                    risk_level=wt.get("risk_level", "low"),
+                    dependencies=wt.get("dependencies", []),
+                    can_run_parallel=wt.get("can_run_parallel", False),
+                )
+                for i, wt in enumerate(plan_dict.get("planned_worker_tasks", []))
+            ],
+            plan_id=review_state.get("plan_id", task_id),
+            planning_mode=plan_dict.get("planning_mode", "deterministic"),
+            blocking_concerns=plan_dict.get("blocking_concerns", []),
+        )
+        # Add human decision into blocking concerns so the control chain knows
+        plan.blocking_concerns = [
+            bc for bc in plan.blocking_concerns
+            if not bc.startswith("HUMAN_OVERRIDE:")
+        ]
+        if reason:
+            plan.blocking_concerns.append(f"HUMAN_OVERRIDE: approved by human review — {reason}")
+
+        # Must re-approve
+        plan.approval_status = "approved"
+
+        worker_mode = worker_mode_override or review_state.get("worker_mode", "fake")
+        max_workers = review_state.get("max_workers", 2)
+
+        # Clean up the review file
+        review_path.unlink(missing_ok=True)
+
+        executor = cls()
+        return executor.execute(plan, worker_mode=worker_mode, max_workers=max_workers)
 
 
 # =============================================================================

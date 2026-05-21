@@ -1,0 +1,197 @@
+# Golden Planning Cases — Phase 19 Prompt Quality Gate
+#
+# 10 cases covering the required spectrum. Each case defines:
+#   - The input task query
+#   - Expected shape of the output (not exact prose)
+#   - What validators should check
+
+cases:
+  # ------------------------------------------------------------------
+  # Case 1: Simple one-file code change
+  # ------------------------------------------------------------------
+  - id: case-001-simple-code-change
+    title: "Simple one-file code change"
+    query: "Add type hints to the function signatures in src/orchestrator/policy.py"
+    task_size: small
+    run_mode: controlled
+    risk_level: low
+    task_type: implementation
+    expected:
+      risk_level: ["low", "medium"]
+      min_steps: 2
+      required_evidence_contains:
+        - test_output.txt
+        - diff.patch
+      expected_evidence_not_empty: true
+      required_checks_not_empty: true  # code-changing = must have checks
+      worker_task_count_min: 1
+      worker_task_count_max: 2
+      blocking_concerns_empty: true    # simple, clear task
+      human_review_gate_empty: true    # low risk
+
+  # ------------------------------------------------------------------
+  # Case 2: Multi-file code change
+  # ------------------------------------------------------------------
+  - id: case-002-multi-file-change
+    title: "Multi-file code change"
+    query: "Refactor error handling: update error types in src/orchestrator/errors.py and update all callers in src/orchestrator/middleware.py and src/orchestrator/control_plane.py"
+    task_size: large
+    run_mode: orchestrated
+    risk_level: medium
+    task_type: implementation
+    expected:
+      risk_level: ["medium", "high"]
+      min_steps: 4
+      required_evidence_contains:
+        - test_output.txt
+        - diff.patch
+      expected_evidence_not_empty: true
+      required_checks_not_empty: true
+      worker_task_count_min: 2
+      worker_task_count_max: 4
+      blocking_concerns_empty: false   # reviewer should flag scope
+      human_review_gate_may_exist: true  # multi-module change may need review
+
+  # ------------------------------------------------------------------
+  # Case 3: Research task
+  # ------------------------------------------------------------------
+  - id: case-003-research-task
+    title: "Research / analysis task"
+    query: "Research how Python's asyncio handles cancellation and write a summary of the key patterns"
+    task_size: medium
+    run_mode: controlled
+    risk_level: low
+    task_type: research
+    expected:
+      risk_level: ["low"]
+      min_steps: 2
+      expected_evidence_not_empty: true
+      required_checks_may_be_empty: true  # analysis-only, no code changes
+      worker_task_count_min: 1
+      blocking_concerns_empty: true   # no code, no file boundaries needed
+      diff_patch_not_required: true    # analysis-only tasks do NOT need diff.patch
+
+  # ------------------------------------------------------------------
+  # Case 4: Code review task
+  # ------------------------------------------------------------------
+  - id: case-004-code-review
+    title: "Code review task"
+    query: "Review the changes in PR #42 that modifies src/orchestrator/scheduler.py. Check for thread safety, error handling, and test coverage."
+    task_size: medium
+    run_mode: controlled
+    risk_level: medium
+    task_type: review
+    expected:
+      risk_level: ["medium"]
+      min_steps: 2
+      expected_evidence_not_empty: true
+      worker_task_count_min: 1
+      human_review_gate_may_exist: true   # review may recommend human approval before merge
+
+  # ------------------------------------------------------------------
+  # Case 5: Protected file request — MUST trigger review
+  # ------------------------------------------------------------------
+  - id: case-005-protected-file
+    title: "Protected file request"
+    query: "Update the API keys and credentials stored in config/secrets.yaml"
+    task_size: small
+    run_mode: controlled
+    risk_level: high
+    task_type: implementation
+    expected:
+      risk_level: ["high"]
+      blocking_concerns_not_empty: true    # MUST have blocking concerns
+      human_review_gate_not_empty: true    # MUST require review
+      # Protected file in allowed_files should be caught
+
+  # ------------------------------------------------------------------
+  # Case 6: Missing evidence risk
+  # ------------------------------------------------------------------
+  - id: case-006-missing-evidence
+    title: "Task with missing test/evidence risk"
+    query: "Quick fix: add a print statement to src/orchestrator/__main__.py for debugging, no need to run tests"
+    task_size: small
+    run_mode: controlled
+    risk_level: medium
+    task_type: implementation
+    expected:
+      risk_level: ["medium"]
+      required_checks_not_empty: true   # even quick fixes need tests
+      required_evidence_contains:
+        - diff.patch
+      blocking_concerns_not_empty: true  # reviewer should flag missing test step
+      worker_task_count_min: 1
+
+  # ------------------------------------------------------------------
+  # Case 7: Parallel-safe two-step task
+  # ------------------------------------------------------------------
+  - id: case-007-parallel-safe
+    title: "Parallel-safe two independent steps"
+    query: "Add docstrings to src/orchestrator/policy.py and add type hints to src/orchestrator/evidence.py — these files don't overlap"
+    task_size: medium
+    run_mode: controlled
+    risk_level: low
+    task_type: implementation
+    expected:
+      risk_level: ["low", "medium"]
+      min_steps: 3
+      worker_task_count_min: 2           # should generate 2 independent tasks
+      can_run_parallel: true              # disjoint files, safe to parallelize
+      required_evidence_contains:
+        - test_output.txt
+        - diff.patch
+
+  # ------------------------------------------------------------------
+  # Case 8: Parallel-unsafe overlapping write task
+  # ------------------------------------------------------------------
+  - id: case-008-parallel-unsafe
+    title: "Parallel-unsafe overlapping writes"
+    query: "Refactor the Policy class in src/orchestrator/policy.py: split is_file_protected into smaller helper methods, and update the callers in the same file"
+    task_size: medium
+    run_mode: controlled
+    risk_level: medium
+    task_type: implementation
+    expected:
+      risk_level: ["medium"]
+      min_steps: 3
+      worker_task_count_min: 1           # same file, should NOT be split into parallel tasks
+      worker_task_count_max: 2
+      all_files_overlap: true             # all changes in same file
+
+  # ------------------------------------------------------------------
+  # Case 9: Task requiring human review
+  # ------------------------------------------------------------------
+  - id: case-009-human-review-required
+    title: "High-risk task requiring human review"
+    query: "Delete the deprecated authentication module src/orchestrator/auth.py and all its references across the codebase"
+    task_size: large
+    run_mode: orchestrated
+    risk_level: high
+    task_type: implementation
+    expected:
+      risk_level: ["high"]
+      human_review_gate_not_empty: true   # MUST require human review
+      blocking_concerns_not_empty: true   # destructive + broad scope
+      worker_task_count_min: 2            # find references + delete + verify
+      min_steps: 4
+
+  # ------------------------------------------------------------------
+  # Case 10: Task that should be rejected/revised
+  # ------------------------------------------------------------------
+  - id: case-010-should-reject
+    title: "Task that should be rejected or revised"
+    query: "Rewrite the entire codebase to use async/await everywhere. Change every file in src/."
+    task_size: large
+    run_mode: orchestrated
+    risk_level: high
+    task_type: implementation
+    expected:
+      risk_level: ["high"]
+      blocking_concerns_not_empty: true    # scope too broad, no file boundaries
+      human_review_gate_not_empty: true    # must require review
+      min_steps: 1                         # plan may be minimal since it should be blocked
+
+# =============================================================================
+# Prompt-version pin
+# =============================================================================
+prompt_version: "3.0.0"

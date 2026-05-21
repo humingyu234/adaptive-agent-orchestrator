@@ -16,10 +16,17 @@ from .project_context import ProjectContext
 from .live_view import build_live_view, is_terminal, render_live_view
 from .regression_compare import RegressionCompare, RegressionSignal, format_regression_report
 
+from .eval_prompts import (
+    EvalSummary,
+    eval_summary_to_dict,
+    render_eval_summary,
+    run_eval_cases,
+)
 from .mainline_executor import MainlineExecutor
 from .planning import (
     PlanningCouncil,
     PlanContract,
+    PlanningMode,
     build_default_council,
     plan_contract_to_dict,
     render_plan_contract,
@@ -58,7 +65,9 @@ def main() -> None:
     ask_parser.add_argument("--mode", choices=["off", "log", "controlled", "orchestrated"], help="Override the default run mode")
     ask_parser.add_argument("--force-run", action="store_true", help="Force workflow execution even for log/off routes")
     ask_parser.add_argument("--approve", action="store_true", help="Auto-approve plan for complex/orchestrated tasks")
-    ask_parser.add_argument("--worker-mode", choices=["fake", "packet"], help="Use mainline executor with specified worker (skips legacy YAML workflow)")
+    ask_parser.add_argument("--worker-mode", choices=["fake", "packet", "claude-code"], help="Use mainline executor with specified worker (skips legacy YAML workflow)")
+    ask_parser.add_argument("--planning-mode", choices=["deterministic", "llm"], default="deterministic", help="Planning Council mode (default: deterministic)")
+    ask_parser.add_argument("--max-workers", type=int, default=2, help="Maximum concurrent workers for multi-worker execution (default: 2)")
 
     review_parser = subparsers.add_parser("review", help="Approve or reject a paused human review task")
     review_parser.add_argument("--task-id", required=True, help="Task ID waiting for human review")
@@ -87,6 +96,8 @@ def main() -> None:
     run_parser.add_argument("--mode", choices=["off", "log", "controlled", "orchestrated"], help="Override the default run mode")
     run_parser.add_argument("--force-run", action="store_true", help="Force workflow execution even for log/off routes")
     run_parser.add_argument("--approve", action="store_true", help="Auto-approve plan for complex/orchestrated tasks")
+    run_parser.add_argument("--planning-mode", choices=["deterministic", "llm"], default="deterministic", help="Planning Council mode (default: deterministic)")
+    run_parser.add_argument("--max-workers", type=int, default=2, help="Maximum concurrent workers for multi-worker execution (default: 2)")
 
     analyze_parser = subparsers.add_parser("analyze", help="Analyze historical runs")
     analyze_subparsers = analyze_parser.add_subparsers(dest="analyze_command", required=True)
@@ -151,6 +162,18 @@ def main() -> None:
     plan_parser.add_argument("--format", choices=["json", "text"], default="json", help="Output format (default: json)")
     plan_parser.add_argument("--approve", action="store_true", help="Auto-approve the plan (skip approval prompt)")
     plan_parser.add_argument("--reject", action="store_true", help="Reject the plan")
+    plan_parser.add_argument("--planning-mode", choices=["deterministic", "llm"], default="deterministic", help="Planning Council mode (default: deterministic)")
+
+    eval_parser = subparsers.add_parser("eval-prompts", help="Evaluate prompt quality against golden planning cases")
+    eval_subparsers = eval_parser.add_subparsers(dest="eval_command", required=True)
+
+    eval_planning_parser = eval_subparsers.add_parser("planning", help="Evaluate planning prompts against golden cases")
+    eval_planning_parser.add_argument("--mode", choices=["deterministic", "llm"], default="deterministic", help="Planning mode (default: deterministic)")
+    eval_planning_parser.add_argument("--cases", default="tests/golden/planning_cases.yaml", help="Path to golden cases YAML (default: tests/golden/planning_cases.yaml)")
+    eval_planning_parser.add_argument("--repeat", type=int, default=1, help="Repeat count for statistical confidence (default: 1)")
+    eval_planning_parser.add_argument("--format", choices=["json", "text"], default="text", help="Output format (default: text)")
+    eval_planning_parser.add_argument("--verbose", action="store_true", help="Print per-case errors to stderr")
+    eval_planning_parser.add_argument("--provider", default="deepseek", help="LLM provider for all three advisors (default: deepseek; env vars AAO_PLANNER_PROVIDER etc. override per-role)")
 
     status_parser = subparsers.add_parser("status", help="Show live run status for a task")
     status_parser.add_argument("--task-id", required=True, help="Task ID to show status for")
@@ -203,6 +226,8 @@ def main() -> None:
         _handle_route_command(args)
     elif args.command == "plan":
         _handle_plan_command(args)
+    elif args.command == "eval-prompts":
+        _handle_eval_prompts_command(args)
     elif args.command == "status":
         _handle_status_command(args)
     elif args.command == "watch":
@@ -375,10 +400,12 @@ def _handle_route_command(args) -> None:
 
 def _handle_plan_command(args) -> None:
     """Generate a plan contract for a task — no execution."""
+    _load_optional_dotenv()
     explicit_mode = getattr(args, "mode", None)
     decision = route_task(args.query, explicit_mode=explicit_mode)
 
-    council = build_default_council()
+    planning_mode: PlanningMode = getattr(args, "planning_mode", "deterministic")
+    council = build_default_council(mode=planning_mode)
     plan = council.create_plan(
         args.query,
         task_size=decision.task_size,
@@ -402,6 +429,36 @@ def _handle_plan_command(args) -> None:
         print(json.dumps(output, ensure_ascii=False, indent=2))
 
 
+def _handle_eval_prompts_command(args) -> None:
+    """Evaluate prompt quality against golden planning cases."""
+    _load_optional_dotenv()
+
+    # Allow --provider to override env vars for convenience
+    provider = getattr(args, "provider", None)
+    if provider:
+        for var in ("AAO_PLANNER_PROVIDER", "AAO_RISK_REVIEWER_PROVIDER",
+                     "AAO_EXECUTION_PLANNER_PROVIDER"):
+            if var not in os.environ:
+                os.environ[var] = provider
+
+    cases_path = args.cases
+    if not Path(cases_path).is_absolute():
+        cases_path = str(Path.cwd() / cases_path)
+
+    summary = run_eval_cases(
+        cases_path,
+        mode=args.mode,
+        repeat=args.repeat,
+        verbose=getattr(args, "verbose", False),
+    )
+
+    fmt = getattr(args, "format", "text")
+    if fmt == "json":
+        print(json.dumps(eval_summary_to_dict(summary), ensure_ascii=False, indent=2))
+    else:
+        print(render_eval_summary(summary))
+
+
 def _prepare_approved_plan_for_command(
     args,
     decision,
@@ -417,11 +474,14 @@ def _prepare_approved_plan_for_command(
 
     Phase 14.5: extracted from duplicate logic in _handle_ask_command and
     _handle_run_command.
+
+    Phase 19: respects --planning-mode flag (deterministic or llm).
     """
     if not (decision.task_size == "large" and decision.run_mode in ("orchestrated", "controlled")):
         return None
 
-    council = build_default_council()
+    planning_mode: PlanningMode = getattr(args, "planning_mode", "deterministic")
+    council = build_default_council(mode=planning_mode)
     plan = council.create_plan(
         args.query,
         task_size=decision.task_size,
@@ -474,24 +534,33 @@ def _prepare_approved_plan_for_command(
     return plan
 
 
-def _handle_ask_mainline(args, decision, plan: PlanContract | None) -> None:
+def _handle_ask_mainline(
+    args,
+    decision,
+    plan: PlanContract | None,
+    *,
+    worker_mode: str = "fake",
+    max_workers: int | None = None,
+) -> None:
     """Execute the ask command through the mainline executor path.
 
     When *plan* is not None it was approved by the Planning Council gate.
     When *plan* is None the task was not large enough to trigger the gate,
     so we build a plan directly from the query.
     """
-    worker_mode = getattr(args, "worker_mode", "fake")
+    if max_workers is None:
+        max_workers = getattr(args, "max_workers", 2)
     executor = MainlineExecutor(Path.cwd())
 
     if plan is not None:
-        result = executor.execute(plan, worker_mode=worker_mode)
+        result = executor.execute(plan, worker_mode=worker_mode, max_workers=max_workers)
     else:
         result = executor.execute_from_query(
             args.query,
             worker_mode=worker_mode,
             run_mode=decision.run_mode,
             task_size=decision.task_size,
+            max_workers=max_workers,
         )
 
     output = result.to_dict()
@@ -540,6 +609,40 @@ def _print_mainline_result_text(result) -> None:
     print(sep)
 
 
+def _resolve_execution_path(
+    decision,
+    explicit_worker_mode: str | None = None,
+    force_run: bool = False,
+) -> tuple[str, str | None]:
+    """Determine which execution path to take for an ask command.
+
+    Returns ``(path, effective_worker_mode)`` where *path* is one of:
+
+    * ``"mainline"`` — use MainlineExecutor with *effective_worker_mode*
+    * ``"legacy"``  — use legacy Scheduler / YAML workflow
+    * ``"blocked"`` — execution blocked (orchestrated runner not ready)
+    * ``"noop"``    — no execution (off / log mode)
+    """
+    # Explicit --worker-mode always wins → mainline
+    if explicit_worker_mode is not None:
+        return ("mainline", explicit_worker_mode)
+
+    # Router says off/log → no execution (unless force_run)
+    if should_only_log(decision) and not force_run:
+        return ("noop", None)
+
+    # Orchestrated runner not ready → blocked
+    if requires_future_runner(decision) and not force_run:
+        return ("blocked", None)
+
+    # Controlled / orchestrated → mainline with default fake worker
+    if decision.run_mode in ("controlled", "orchestrated"):
+        return ("mainline", "fake")
+
+    # Everything else → legacy Scheduler / YAML workflow
+    return ("legacy", None)
+
+
 def _handle_ask_command(args) -> None:
     _load_optional_dotenv()
     project_root = Path.cwd()
@@ -548,8 +651,17 @@ def _handle_ask_command(args) -> None:
     explicit_mode = getattr(args, "mode", None)
     decision = route_task(args.query, explicit_mode=explicit_mode)
 
-    # Phase 9A: use shared mode semantics instead of ad-hoc checks
-    if should_only_log(decision) and not getattr(args, "force_run", False):
+    # P0.1: resolve execution path — explicit --worker-mode, router decision,
+    # or legacy fallback
+    worker_mode = getattr(args, "worker_mode", None)
+    force_run = getattr(args, "force_run", False)
+    path, effective_worker_mode = _resolve_execution_path(
+        decision,
+        explicit_worker_mode=worker_mode,
+        force_run=force_run,
+    )
+
+    if path == "noop":
         decision_dict = route_decision_to_dict(decision)
         fmt = getattr(args, "format", "json")
         if fmt == "text":
@@ -559,8 +671,7 @@ def _handle_ask_command(args) -> None:
             print(json.dumps(decision_dict, ensure_ascii=False, indent=2))
         return
 
-    # For orchestrated routes without an orchestrated runner, require --force-run
-    if requires_future_runner(decision) and not getattr(args, "force_run", False):
+    if path == "blocked":
         decision_dict = route_decision_to_dict(decision)
         fmt = getattr(args, "format", "json")
         if fmt == "text":
@@ -571,15 +682,13 @@ def _handle_ask_command(args) -> None:
             print(json.dumps(decision_dict, ensure_ascii=False, indent=2))
         return
 
-    # Phase 13: Planning Council gate
+    # Phase 13: Planning Council gate (for both mainline and legacy paths)
     plan = _prepare_approved_plan_for_command(args, decision, support_text_format=True)
     if plan is None and decision.task_size == "large" and decision.run_mode in ("orchestrated", "controlled"):
         return  # blocked by planning gate — message already printed
 
-    # Mainline executor path (--worker-mode fake|packet)
-    worker_mode = getattr(args, "worker_mode", None)
-    if worker_mode is not None:
-        _handle_ask_mainline(args, decision, plan)
+    if path == "mainline":
+        _handle_ask_mainline(args, decision, plan, worker_mode=effective_worker_mode)
         return
 
     llm_config = _parse_llm_config(args)
@@ -630,6 +739,29 @@ def _handle_ask_command(args) -> None:
 def _handle_review_command(args) -> None:
     _load_optional_dotenv()
     project_root = Path.cwd()
+
+    # ---- MainlineExecutor review path (Phase 18+) ----
+    from .mainline_executor import MainlineExecutor
+
+    mainline_review_path = project_root / "outputs" / "reviews" / f"{args.task_id}.json"
+    if mainline_review_path.exists():
+        result = MainlineExecutor.resume_from_review(
+            args.task_id,
+            decision=args.decision,
+            reason=args.reason,
+        )
+        if result is None:
+            print(f"Review task not found: {args.task_id}")
+            return
+        output = result.to_dict()
+        fmt = getattr(args, "format", "json")
+        if fmt == "text":
+            _print_mainline_result_text(result)
+        else:
+            print(json.dumps(output, ensure_ascii=False, indent=2))
+        return
+
+    # ---- Legacy Scheduler review path ----
     state_path = project_root / "outputs" / "states" / f"{args.task_id}.json"
     if not state_path.exists():
         print(f"State not found for task: {args.task_id}")

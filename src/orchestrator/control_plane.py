@@ -464,7 +464,7 @@ class ControlPlane:
         if evidence_status.worker_status == "failed":
             decision = ControlDecision(
                 passed=False,
-                action="fail",
+                action="retry",
                 reason=f"Worker reported failure: {evidence_status.reported_summary[:200]}",
                 severity="medium",
                 failure_category="task_quality_error",
