@@ -175,11 +175,37 @@ Workflow files: `deep_research.yaml`, `deep_research_supervised.yaml`,
 `deep_research_human_review.yaml`, `customer_support_brief.yaml`,
 `quick_search.yaml`, `real_research.yaml`, `code_review_pipeline.yaml`
 
+## Real Usage (LLM Planning + Claude Code Worker)
+
+```bash
+# Full end-to-end: LLM plans, you approve, Claude Code executes
+python -m orchestrator ask "Fix the typo in src/utils.py" \
+  --planning-mode llm --approve --worker-mode claude-code
+
+# Multi-worker for complex tasks (spawns multiple Claude Code workers)
+python -m orchestrator ask "Refactor error handling across modules" \
+  --planning-mode llm --approve --worker-mode claude-code --max-workers 2
+
+# Deterministic planning (no API cost) with fake worker (test/inspect)
+python -m orchestrator ask "Add unit tests for utils.py" \
+  --approve --worker-mode fake
+
+# Plan only — review the plan before deciding to execute
+python -m orchestrator plan "Refactor the auth module" \
+  --planning-mode llm --approve
+```
+
+Requires: `DEEPSEEK_API_KEY` in `.env` for LLM planning; Claude Code
+installed and logged in for real worker execution.
+
 ## CLI Quick Reference
 
 ```bash
 # Natural-language task entry
 py -m orchestrator ask "Research solid-state battery commercialization"
+
+# Full control chain: LLM planning → approval → worker → evidence → audit
+py -m orchestrator ask "<task>" --planning-mode llm --approve --worker-mode claude-code
 
 # Run a workflow file
 py -m orchestrator run --workflow workflows/deep_research.yaml --query "your task"
@@ -271,6 +297,10 @@ adaptive-agent-orchestrator/
 - **Phase 15**: LangGraph Runner
 - **Phase 16**: Golden Scenario Suite (22 scenarios, 49 tests)
 - **Phase 17**: Demo, README, and Release Proof Pack
+- **Phase 18**: Real Claude Code Worker Bridge
+- **Phase 19**: Real LLM Planning Council (DeepSeek-backed multi-advisor)
+- **Phase 20**: Multi-Worker Plan Execution (parallel + dependency-aware)
+- **Phase 21**: End-to-End Acceptance (15 acceptance tests, real CLI path)
 
 ## Docs
 
@@ -279,6 +309,7 @@ adaptive-agent-orchestrator/
 - [Architecture](docs/architecture.md) — current design baseline
 - [Proof Pack](docs/proof_pack.md) — claims → proof mapping
 - [Demo Script](docs/demo.md) — 3-5 minute recording script
+- [Acceptance](docs/acceptance.md) — end-to-end acceptance scenarios and commands
 - [Known Limitations](docs/known_limitations.md) — honest boundaries
 - [Golden Scenarios](docs/golden_scenarios.md) — contract-by-contract proof
 - [Decisions](docs/decisions/) — key design tradeoffs

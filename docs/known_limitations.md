@@ -83,10 +83,12 @@ Tests focus on the control layer's decisions, evidence handling, failure
 classification, and recovery behavior.  Some utility code, CLI output
 formatting, and optional integration adapters have lighter coverage.
 
-### No integration tests with live Claude Code
-The Claude Code worker bridge (Phase 12) has unit tests but integration
-tests require a live Claude Code session, which is inherently
-non-deterministic and requires user interaction.
+### Integration tests with live Claude Code are manual
+The Claude Code worker bridge (Phase 18) has unit tests and a documented
+acceptance path (docs/acceptance.md). Integration tests with live Claude
+Code still require a real Claude Code session, which is inherently
+non-deterministic and requires user interaction.  The acceptance test
+layer exercises the full control path with deterministic fake workers.
 
 ## What AAO Is Not
 
