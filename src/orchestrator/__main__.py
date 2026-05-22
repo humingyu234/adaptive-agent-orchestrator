@@ -1857,12 +1857,18 @@ def _handle_project_ask(args, store: ProjectSessionStore) -> None:
     # ---- Unknown ----
     else:
         answer = (
-            f"I don't have enough recorded information to answer this question. "
-            f"Current project has {len(ctx.recent_decisions)} decisions, "
-            f"{len(ctx.completed_milestones)} completed milestones. "
-            f"Check .aao/sessions/{pid}/ for detailed artifacts."
+            f"No recorded information found for this question. "
+            f"Suggest checking these artifact paths:\n"
+            f"  - .aao/sessions/{pid}/decision_log.jsonl (design decisions)\n"
+            f"  - .aao/sessions/{pid}/run_links.jsonl (execution runs)\n"
+            f"  - .aao/sessions/{pid}/milestones.json (milestone state)\n"
+            f"  - .aao/sessions/{pid}/session.json (project state)\n"
+            f"To make this answerable in the future, ensure the relevant "
+            f"phase records this data in DecisionLog, evidence artifacts, "
+            f"or milestone summaries."
         )
-        evidence.append(f"Session directory: .aao/sessions/{pid}/")
+        evidence.append(f".aao/sessions/{pid}/decision_log.jsonl")
+        evidence.append(f".aao/sessions/{pid}/run_links.jsonl")
 
     print(json.dumps({
         "question": question,
@@ -1990,6 +1996,14 @@ def _handle_project_continue(args, store: ProjectSessionStore) -> None:
     # Refresh milestone state
     ms = store.get_current_milestone(pid)
 
+    # Resume summary: last decision and pending approvals
+    recent_decisions = store.load_decisions(pid, limit=1)
+    last_decision = recent_decisions[0].to_dict() if recent_decisions else None
+    approvals = store.load_approvals(pid)
+    pending_approvals = [
+        a.to_dict() for a in approvals if a.status == "awaiting_approval"
+    ]
+
     output = {
         "project_id": pid,
         "goal": session.goal,
@@ -1998,6 +2012,8 @@ def _handle_project_continue(args, store: ProjectSessionStore) -> None:
         "run_status": result.status,
         "current_milestone": ms.to_dict() if ms else None,
         "completed_milestones": session.completed_milestones,
+        "last_decision": last_decision,
+        "pending_approvals": pending_approvals,
         "next_recommended_action": session.next_recommended_action,
         "_note": (
             "Milestone execution finished. Awaiting human approval — use "

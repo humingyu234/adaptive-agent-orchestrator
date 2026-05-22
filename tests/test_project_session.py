@@ -548,6 +548,121 @@ class TestCLIHandlers:
         data = json.loads(out)
         assert "src/utils.py" in data["answer"]
 
+    def test_ask_unknown_question_suggests_what_artifact_to_check(self, tmp_store, capsys):
+        """Unknown question must cite specific artifact paths, not just a directory."""
+        session = _create_active_session(tmp_store)
+
+        from orchestrator.__main__ import _handle_project_ask
+
+        class FakeArgs:
+            project_id = session.project_id
+            question = "What's the weather like?"
+
+        _handle_project_ask(FakeArgs(), tmp_store)
+        out = capsys.readouterr().out
+        data = json.loads(out)
+        assert "decision_log.jsonl" in data["answer"]
+        assert "run_links.jsonl" in data["answer"]
+        assert "milestones.json" in data["answer"]
+        assert "session.json" in data["answer"]
+        assert len(data["evidence"]) >= 2
+
+    def test_ask_does_not_launch_workers_or_modify_state(self, tmp_store, capsys):
+        """project ask is read-only — it must not change any state on disk."""
+        session = _create_active_session(tmp_store)
+        pid = session.project_id
+
+        # Snapshot before
+        s_before = tmp_store.load_session(pid)
+        ms_before = tmp_store.load_milestones(pid)
+        decisions_before = tmp_store.load_decisions(pid)
+        links_before = tmp_store.load_run_links(pid)
+
+        from orchestrator.__main__ import _handle_project_ask
+
+        class FakeArgs:
+            project_id = pid
+            question = "What files were changed?"
+
+        _handle_project_ask(FakeArgs(), tmp_store)
+
+        # Snapshot after
+        s_after = tmp_store.load_session(pid)
+        ms_after = tmp_store.load_milestones(pid)
+        decisions_after = tmp_store.load_decisions(pid)
+        links_after = tmp_store.load_run_links(pid)
+
+        # Nothing must change
+        assert s_after.goal == s_before.goal
+        assert s_after.status == s_before.status
+        assert s_after.current_milestone == s_before.current_milestone
+        assert len(ms_after) == len(ms_before)
+        assert len(decisions_after) == len(decisions_before)
+        assert len(links_after) == len(links_before)
+
+    def test_resume_continues_from_correct_milestone(self, tmp_store, capsys):
+        """Resume must execute the in_progress milestone, not a completed one."""
+        session = _create_active_session(tmp_store)
+        pid = session.project_id
+
+        # Add two milestones, mark first as completed
+        ms1 = tmp_store.get_current_milestone(pid)
+        ms2 = ProjectMilestone(
+            milestone_id="ms-2", name="Second milestone",
+            description="Phase 2", status="pending",
+        )
+        all_ms = tmp_store.load_milestones(pid)
+        tmp_store.save_milestones(pid, all_ms + [ms2])
+
+        # Complete ms1, activate ms2
+        tmp_store.advance_milestone(pid, ms1.milestone_id, "completed")
+        for m in tmp_store.load_milestones(pid):
+            if m.milestone_id == "ms-2":
+                m.status = "in_progress"
+                break
+        session.current_milestone = "ms-2"
+        session.status = "paused"
+        tmp_store.save_session(session)
+        tmp_store.save_milestones(pid, tmp_store.load_milestones(pid))
+
+        from orchestrator.__main__ import _handle_project_continue
+
+        class FakeArgs:
+            project_id = pid
+
+        _handle_project_continue(FakeArgs(), tmp_store)
+        out = capsys.readouterr().out
+        data = json.loads(out)
+
+        # Output must reference the correct milestone (ms2)
+        assert data["current_milestone"] is not None
+        assert data["current_milestone"]["name"] == "Second milestone"
+
+    def test_continue_output_includes_resume_summary(self, tmp_store, capsys):
+        """project continue output must include last_decision and pending_approvals."""
+        session = _create_active_session(tmp_store)
+        pid = session.project_id
+        ms = tmp_store.get_current_milestone(pid)
+
+        # First run: continue executes and submits for approval
+        session.status = "paused"
+        tmp_store.save_session(session)
+
+        from orchestrator.__main__ import _handle_project_continue
+
+        class FakeArgs:
+            project_id = pid
+
+        _handle_project_continue(FakeArgs(), tmp_store)
+        out = capsys.readouterr().out
+        data = json.loads(out)
+
+        # Resume summary fields must be present
+        assert "last_decision" in data
+        assert "pending_approvals" in data
+        assert "completed_milestones" in data
+        assert "next_recommended_action" in data
+
     def test_resolve_project_id_uses_latest_active(self, tmp_store):
         from orchestrator.__main__ import _resolve_project_id
 
