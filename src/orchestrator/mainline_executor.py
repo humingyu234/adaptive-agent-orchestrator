@@ -19,8 +19,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from .auto_repair import AutoRepairLoop, FixTask, ReviewFinding
 from .control_models import ControlDecision, WorkerEvidenceStatus
 from .control_plane import ControlPlane
+from .failure_taxonomy import FailureCategory, FailureReason
 from .planning import PlanContract, PlannedWorkerTask, plan_contract_to_dict
 from .policy import Policy
 from .worker_protocol import (
@@ -61,6 +63,7 @@ class MainlineResult:
     worker_result: dict[str, Any] = field(default_factory=dict)
     evidence_status: dict[str, Any] | None = None
     control_decisions: list[dict[str, Any]] = field(default_factory=list)
+    repair_rounds: list[dict[str, Any]] = field(default_factory=list)
     report_path: str = ""
     evidence_path: str = ""
     worker_packet_path: str = ""
@@ -78,6 +81,7 @@ class MainlineResult:
             "worker_result": self.worker_result,
             "evidence_status": self.evidence_status,
             "control_decisions": self.control_decisions,
+            "repair_rounds": self.repair_rounds,
             "report_path": self.report_path,
             "evidence_path": self.evidence_path,
             "worker_packet_path": self.worker_packet_path,
@@ -113,6 +117,7 @@ class MainlineExecutor:
     ) -> None:
         self.project_root = project_root or Path.cwd()
         self._policy = policy or self._load_policy()
+        self._repair_loop = AutoRepairLoop(max_attempts=2)
 
     @staticmethod
     def _load_policy() -> Policy:
@@ -284,6 +289,49 @@ class MainlineExecutor:
                 continue
             break
 
+        # 6b. Phase 22: auto-repair loop — before giving up, try bounded fix
+        #
+        # Only task-quality errors whose recovery action is "retry" are
+        # eligible.  "request_evidence" (missing evidence), "fail", and
+        # "needs_human_review" are not fixable by a code-change worker.
+        failed_decisions = [d for d in all_control_decisions if not d.passed]
+        repair_rounds: list[dict[str, Any]] = []
+
+        if failed_decisions and worker_mode != "packet":
+            primary = failed_decisions[0]
+            is_repairable = (
+                primary.failure_category == FailureCategory.TASK_QUALITY_ERROR.value
+                and primary.action == "retry"
+            )
+            if is_repairable:
+                affected_file = (
+                    packet.allowed_files[0] if packet.allowed_files
+                    else (final_evidence_status.changed_files[0]
+                          if final_evidence_status and final_evidence_status.changed_files
+                          else "")
+                )
+                finding = ReviewFinding.from_control_decision(
+                    step_id=task_id,
+                    reason=primary.reason,
+                    category=primary.failure_category,
+                    location=affected_file,
+                )
+                repair_result = self._try_auto_repair(
+                    finding=finding,
+                    worker_mode=worker_mode,
+                )
+                repair_rounds = [r.to_dict() for r in repair_result.rounds]
+                if repair_result.is_fixed:
+                    all_control_decisions = [
+                        ControlDecision(
+                            action="continue", passed=True,
+                            reason=(
+                                f"Auto-repair fixed issue in "
+                                f"{repair_result.total_rounds} round(s)"
+                            ),
+                        )
+                    ] + [d for d in all_control_decisions if d.passed]
+
         # 7. Generate audit report
         report_path, evidence_path = self._generate_report(
             plan=plan,
@@ -318,6 +366,7 @@ class MainlineExecutor:
             worker_result=final_worker_result,
             evidence_status=_evidence_status_to_dict(final_evidence_status),
             control_decisions=[_decision_to_dict(d) for d in all_control_decisions],
+            repair_rounds=repair_rounds,
             report_path=str(report_path),
             evidence_path=str(evidence_path),
             worker_packet_path=str(packet.packet_root),
@@ -520,6 +569,100 @@ class MainlineExecutor:
             report_path=mw_result.combined_report_path,
             evidence_path=mw_result.combined_evidence_path,
             summary=mw_result.summary,
+        )
+
+    # ------------------------------------------------------------------
+    # Phase 22 — Auto-Repair
+    # ------------------------------------------------------------------
+
+    def _try_auto_repair(
+        self,
+        *,
+        finding: ReviewFinding,
+        worker_mode: str = "fake",
+    ) -> Any:
+        """Attempt the auto-repair loop for a single blocking finding.
+
+        During dispatch, the FixTask's WorkerTaskPacket is captured so the
+        verify step can re-run test-output and evidence checks — not just an
+        empty ControlPlane evaluation.
+        """
+        # Capture packets as they are dispatched so verify_fn can use them
+        # for on-disk test-output and evidence checks.
+        packets: list[WorkerTaskPacket] = []
+
+        def _dispatch(fix_task: FixTask) -> dict[str, Any]:
+            packet = self._fix_task_to_packet(fix_task)
+            packets.append(packet)
+            return self._execute_worker(packet, worker_mode=worker_mode)
+
+        def _verify(result: dict[str, Any]) -> bool:
+            if not packets:
+                return False
+            return self._verify_fix(result, packets[-1])
+
+        return self._repair_loop.attempt_repair(
+            finding,
+            dispatch_fn=_dispatch,
+            verify_fn=_verify,
+            target_file=finding.location,
+        )
+
+    def _execute_fix_task(
+        self,
+        fix_task: FixTask,
+        *,
+        worker_mode: str = "fake",
+    ) -> dict[str, Any]:
+        """Build a WorkerTaskPacket from a FixTask and dispatch it."""
+        packet = self._fix_task_to_packet(fix_task)
+        return self._execute_worker(packet, worker_mode=worker_mode)
+
+    def _verify_fix(
+        self,
+        worker_result: dict[str, Any],
+        packet: WorkerTaskPacket,
+    ) -> bool:
+        """Verify a FixTask's output by re-running on-disk checks.
+
+        Unlike the previous empty-criteria ControlPlane call, this re-runs
+        the same checks the mainline path uses: test-output inspection and
+        evidence classification.
+        """
+        # Worker itself reported a hard failure
+        if worker_result.get("behaviour") in ("blocked", "failed"):
+            return False
+        if worker_result.get("worker_status") in ("blocked", "failed", "error"):
+            return False
+        # Re-run test-output check
+        test_decisions = self._check_test_results(packet)
+        if any(not d.passed for d in test_decisions):
+            return False
+        # Evidence classification must not report missing required checks
+        evidence_status = classify_worker_evidence_from_packet(packet)
+        if evidence_status.has_missing_required:
+            return False
+        return True
+
+    def _fix_task_to_packet(self, fix_task: FixTask) -> WorkerTaskPacket:
+        """Convert a FixTask into a bounded WorkerTaskPacket.
+
+        The packet is scoped to the single target file and verification
+        check, so the worker cannot drift into unrelated changes.
+        """
+        run_id = _utc_now_compact() + "-" + uuid.uuid4().hex[:6]
+        return WorkerTaskPacket.create(
+            project_root=str(self.project_root),
+            run_id=run_id,
+            task_id=fix_task.fix_id,
+            title=f"Auto-repair: {fix_task.fix_description[:80]}",
+            objective=fix_task.fix_description,
+            allowed_files=[fix_task.target_file],
+            protected_files=list(self._policy.protected_files),
+            required_checks=[fix_task.verification],
+            expected_evidence=["test_output.txt", "diff.patch"],
+            risk_level="low",
+            run_mode="controlled",
         )
 
     # ------------------------------------------------------------------
