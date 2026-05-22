@@ -16,6 +16,15 @@ from .project_context import ProjectContext
 from .live_view import build_live_view, is_terminal, render_live_view
 from .regression_compare import RegressionCompare, RegressionSignal, format_regression_report
 
+from .project_session import (
+    DecisionLog,
+    ProjectMilestone,
+    ProjectRunLink,
+    ProjectSessionStore,
+    SessionContext,
+    _new_id,
+    _now,
+)
 from .eval_prompts import (
     EvalSummary,
     eval_summary_to_dict,
@@ -202,6 +211,28 @@ def main() -> None:
     worker_inspect_parser = worker_subparsers.add_parser("inspect", help="Inspect a completed worker task packet")
     worker_inspect_parser.add_argument("path", help="Path to the packet directory (.aao/tasks/<run_id>/<task_id>)")
 
+    # ---- project (Phase 24) ----
+    project_parser = subparsers.add_parser("project", help="Manage project sessions")
+    project_subparsers = project_parser.add_subparsers(dest="project_command", required=True)
+
+    project_start_parser = project_subparsers.add_parser("start", help="Create a new project session")
+    project_start_parser.add_argument("goal", help="Project goal description")
+    project_start_parser.add_argument("--project-id", help="Custom project ID (auto-generated if omitted)")
+    project_start_parser.add_argument("--planning-mode", choices=["deterministic", "llm"], default="deterministic", help="Planning Council mode (default: deterministic)")
+
+    project_status_parser = project_subparsers.add_parser("status", help="Show current project status")
+    project_status_parser.add_argument("--project-id", help="Project ID (uses latest active if omitted)")
+
+    project_ask_parser = project_subparsers.add_parser("ask", help="Ask a question about project history")
+    project_ask_parser.add_argument("question", help="Question about the project")
+    project_ask_parser.add_argument("--project-id", help="Project ID (uses latest active if omitted)")
+
+    project_continue_parser = project_subparsers.add_parser("continue", help="Resume the current project")
+    project_continue_parser.add_argument("--project-id", help="Project ID (uses latest active if omitted)")
+
+    project_close_parser = project_subparsers.add_parser("close", help="Close the current project")
+    project_close_parser.add_argument("--project-id", help="Project ID (uses latest active if omitted)")
+
     args = parser.parse_args()
 
     if args.command == "ask":
@@ -234,6 +265,8 @@ def main() -> None:
         _handle_watch_command(args)
     elif args.command == "worker":
         _handle_worker_command(args)
+    elif args.command == "project":
+        _handle_project_command(args)
 
 
 def _handle_analyze_command(args) -> None:
@@ -1464,6 +1497,489 @@ def _handle_worker_command(args) -> None:
             "changed_files": evidence_status.changed_files,
             "denied_files_changed": evidence_status.denied_files_changed,
         }, ensure_ascii=False, indent=2))
+
+
+# =============================================================================
+# Phase 24 — Project Session CLI handlers
+# =============================================================================
+
+
+def _resolve_project_id(store: ProjectSessionStore, explicit: str | None = None) -> tuple[str | None, str | None]:
+    """Return ``(project_id, error_reason)``.
+
+    *project_id* is the resolved ID, or None when no suitable project is found.
+    *error_reason* is non-None only when *project_id* is None, indicating WHY:
+      ``"explicit_not_found"`` — the caller passed an explicit ID that doesn't exist
+      ``"no_active"`` — no explicit ID and no active sessions
+    """
+    if explicit:
+        session = store.load_session(explicit)
+        if session is None:
+            return None, "explicit_not_found"
+        return explicit, None
+
+    sessions = store.list_sessions()
+    active = [s for s in sessions if s.get("status") == "active"]
+    if not active:
+        return None, "no_active"
+    return active[0]["project_id"], None
+
+
+def _print_missing_project_error(reason: str | None, explicit_id: str | None) -> None:
+    """Print a context-appropriate error when no project is found."""
+    if reason == "explicit_not_found":
+        print(json.dumps({
+            "error": f"Project not found: {explicit_id}",
+        }, ensure_ascii=False, indent=2))
+    else:
+        print(json.dumps({
+            "error": "No active project session. Use 'project start <goal>' to create one.",
+        }, ensure_ascii=False, indent=2))
+
+
+def _handle_project_command(args) -> None:
+    _load_optional_dotenv()
+    store = ProjectSessionStore(Path.cwd())
+
+    if args.project_command == "start":
+        _handle_project_start(args, store)
+    elif args.project_command == "status":
+        _handle_project_status(args, store)
+    elif args.project_command == "ask":
+        _handle_project_ask(args, store)
+    elif args.project_command == "continue":
+        _handle_project_continue(args, store)
+    elif args.project_command == "close":
+        _handle_project_close(args, store)
+
+
+def _handle_project_start(args, store: ProjectSessionStore) -> None:
+    """Create a new project session and optionally generate a plan."""
+    session = store.create_session(
+        goal=args.goal,
+        project_id=getattr(args, "project_id", None) or None,
+    )
+
+    # Generate a plan via Planning Council
+    planning_mode: PlanningMode = getattr(args, "planning_mode", "deterministic")
+    council = build_default_council(mode=planning_mode)
+    plan = council.create_plan(
+        args.goal,
+        task_size="large",
+        run_mode="orchestrated",
+        risk_level="medium",
+        task_type="project",
+    )
+
+    # Convert plan steps (list[str]) to milestones
+    milestones: list[ProjectMilestone] = []
+    for i, step_text in enumerate(plan.steps):
+        m = ProjectMilestone(
+            milestone_id=_new_id(),
+            name=step_text if len(step_text) <= 80 else step_text[:77] + "...",
+            description=step_text,
+            plan_step_ids=[f"step-{i + 1}"],
+            approval_required=True,
+        )
+        milestones.append(m)
+
+    if milestones:
+        milestones[0].status = "in_progress"
+        session.current_milestone = milestones[0].milestone_id
+
+    store.save_milestones(session.project_id, milestones)
+    session.next_recommended_action = (
+        f"Review and approve milestone: {milestones[0].name}"
+        if milestones else "No milestones yet"
+    )
+    store.save_session(session)
+
+    # Log the creation decision
+    store.log_decision(session.project_id, DecisionLog(
+        entry_id=_new_id(),
+        timestamp=_now(),
+        decision=f"Project created: {args.goal}",
+        reason="User initiated project session",
+        made_by="human",
+    ))
+
+    print(json.dumps({
+        "project_id": session.project_id,
+        "goal": session.goal,
+        "status": session.status,
+        "milestones": [m.to_dict() for m in milestones],
+        "next": session.next_recommended_action,
+    }, ensure_ascii=False, indent=2))
+
+
+def _handle_project_status(args, store: ProjectSessionStore) -> None:
+    """Show current project status."""
+    pid, reason = _resolve_project_id(store, getattr(args, "project_id", None))
+    if pid is None:
+        _print_missing_project_error(reason, getattr(args, "project_id", None))
+        return
+
+    session = store.load_session(pid)
+    milestones = store.load_milestones(pid)
+    decisions = store.load_decisions(pid, limit=10)
+
+    # Determine current milestone detail
+    current_ms = None
+    for m in milestones:
+        if m.milestone_id == session.current_milestone:
+            current_ms = m.to_dict()
+            break
+
+    output = {
+        "project_id": session.project_id,
+        "goal": session.goal,
+        "status": session.status,
+        "created_at": session.created_at,
+        "last_active_at": session.last_active_at,
+        "current_milestone": current_ms,
+        "completed_milestones": session.completed_milestones,
+        "pending_decisions": session.pending_decisions,
+        "open_risks": session.open_risks,
+        "recent_decisions": [d.to_dict() for d in decisions[:5]],
+        "next_recommended_action": session.next_recommended_action,
+    }
+    print(json.dumps(output, ensure_ascii=False, indent=2))
+
+
+def _read_evidence_json(path_str: str, *, root: Path | None = None) -> dict | None:
+    """Try to read a JSON evidence file, returning None on any failure.
+
+    If *path_str* is relative and *root* is given, resolve against *root*.
+    """
+    if not path_str:
+        return None
+    p = Path(path_str)
+    if not p.is_absolute() and root is not None:
+        p = root / p
+    if not p.exists():
+        return None
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return None
+
+
+def _search_decisions(
+    question: str, decisions: list[DecisionLog]
+) -> list[DecisionLog]:
+    """Return decisions ordered by keyword overlap with *question*.
+
+    Simple bag-of-words overlap: more shared words → higher score.
+    Decisions with zero overlap are dropped.
+    """
+    q_words = set(question.lower().split())
+    if not q_words:
+        return list(decisions)
+    scored = []
+    for d in decisions:
+        d_text = f"{d.decision} {d.reason} {' '.join(d.alternatives)}".lower()
+        d_words = set(d_text.split())
+        overlap = len(q_words & d_words)
+        if overlap > 0:
+            scored.append((overlap, d))
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return [d for _, d in scored]
+
+
+def _handle_project_ask(args, store: ProjectSessionStore) -> None:
+    """Answer a question based on recorded project artifacts.
+
+    Reads real evidence files (test output, changed files, reviewer
+    findings, audit reports) referenced by run links.  Falls back to
+    honest "I don't know" when artifacts are missing.
+    """
+    pid, reason = _resolve_project_id(store, getattr(args, "project_id", None))
+    if pid is None:
+        _print_missing_project_error(reason, getattr(args, "project_id", None))
+        return
+
+    ctx = store.build_context(pid)
+    if ctx is None:
+        print(json.dumps({
+            "question": args.question,
+            "answer": "No project session found. Create one with 'project start'.",
+            "evidence": [],
+        }, ensure_ascii=False, indent=2))
+        return
+
+    question = args.question
+    question_lower = question.lower()
+    answer = ""
+    evidence: list[str] = []
+
+    # ---- Design / why questions: search all decisions ----
+    if any(kw in question_lower for kw in ("why", "选择", "方案", "choose", "design", "设计")):
+        matched = _search_decisions(question, ctx.recent_decisions)
+        # Fall back to most recent decision if no keyword match
+        if not matched and ctx.recent_decisions:
+            matched = [ctx.recent_decisions[0]]
+        if matched:
+            d = matched[0]
+            answer = f"Decision: {d.decision}. Reason: {d.reason}."
+            if d.alternatives:
+                answer += f" Alternatives considered: {', '.join(d.alternatives)}."
+            evidence.append(f"DecisionLog entry {d.entry_id} ({d.timestamp})")
+            if len(matched) > 1:
+                answer += f" ({len(matched) - 1} more matching decision(s) found.)"
+        else:
+            answer = "I have no record of design decisions matching this question."
+            evidence.append("DecisionLog is empty — no decisions recorded yet")
+
+    # ---- File changes: read evidence from run links ----
+    elif any(kw in question_lower for kw in ("改了什么", "changed", "file", "文件")):
+        ms = ctx.current_milestone
+        if ms:
+            answer = f"Current milestone '{ms.name}' covers step(s): {', '.join(ms.plan_step_ids)}."
+            evidence.append(f"Milestone {ms.milestone_id}")
+        run_links = store.load_run_links(pid)
+        changed_seen: set[str] = set()
+        for link in run_links:
+            ev = _read_evidence_json(link.evidence_path, root=store._root)
+            if ev:
+                cf = ev.get("changed_files", [])
+                if isinstance(cf, list):
+                    changed_seen.update(str(f) for f in cf)
+        if changed_seen:
+            answer += f" Files changed across runs: {', '.join(sorted(changed_seen))}."
+            evidence.extend(
+                link.evidence_path for link in run_links if link.evidence_path
+            )
+        elif not answer:
+            answer = "No file-change records available. Run links are empty."
+        else:
+            answer += " No changed-files detail in run evidence."
+
+    # ---- Test results: read test output from evidence ----
+    elif any(kw in question_lower for kw in ("test", "测试", "结果")):
+        run_links = store.load_run_links(pid)
+        found = False
+        for link in run_links:
+            ev = _read_evidence_json(link.evidence_path, root=store._root)
+            if ev:
+                test_out = ev.get("test_output", "")
+                if test_out:
+                    # Show first 500 chars of test output
+                    snippet = test_out[:500]
+                    answer = f"Test output from {link.run_id}: {snippet}"
+                    evidence.append(link.evidence_path)
+                    found = True
+                    break
+        if not found:
+            answer = "No test output found in run evidence."
+            if run_links:
+                evidence.extend(link.evidence_path for link in run_links if link.evidence_path)
+            else:
+                evidence.append("run_links.jsonl is empty")
+
+    # ---- Reviewer findings: read from evidence ----
+    elif any(kw in question_lower for kw in ("reviewer", "审查", "发现", "finding")):
+        run_links = store.load_run_links(pid)
+        findings_found = False
+        for link in run_links:
+            ev = _read_evidence_json(link.evidence_path, root=store._root)
+            if ev:
+                rf = ev.get("review_findings", [])
+                if rf:
+                    findings_found = True
+                    if isinstance(rf, list) and len(rf) > 0:
+                        item = rf[0]
+                        if isinstance(item, dict):
+                            answer = (
+                                f"Reviewer finding in {link.run_id}: "
+                                f"[{item.get('severity', '?')}] {item.get('description', str(item))}"
+                            )
+                        else:
+                            answer = f"Reviewer findings in {link.run_id}: {len(rf)} finding(s)."
+                    evidence.append(link.evidence_path)
+                    break
+        if not findings_found:
+            answer = "No reviewer findings recorded in run evidence."
+            evidence.append("Run evidence paths in run_links.jsonl")
+
+    # ---- Repair history: read audit reports from run links ----
+    elif any(kw in question_lower for kw in ("修了几轮", "repair", "修复", "修了")):
+        run_links = store.load_run_links(pid)
+        repair_info: list[str] = []
+        for link in run_links:
+            if link.audit_path:
+                audit = _read_evidence_json(link.audit_path, root=store._root)
+                if audit:
+                    rounds = audit.get("repair_rounds", audit.get("total_rounds", None))
+                    if rounds is not None:
+                        repair_info.append(f"{link.run_id}: {rounds} round(s)")
+                        evidence.append(link.audit_path)
+        if repair_info:
+            answer = f"Repair history: {'; '.join(repair_info)}."
+        else:
+            answer = "No repair history available — no audit reports with repair data found."
+            evidence.extend(
+                link.audit_path for link in run_links if link.audit_path
+            )
+
+    # ---- Risks ----
+    elif any(kw in question_lower for kw in ("风险", "risk")):
+        if ctx.open_risks:
+            answer = f"Open risks: {'; '.join(ctx.open_risks)}"
+        else:
+            answer = "No open risks recorded."
+        evidence.append("session.open_risks")
+
+    # ---- Next step ----
+    elif any(kw in question_lower for kw in ("下一步", "next", "接下来")):
+        s = store.load_session(pid)
+        answer = (s.next_recommended_action if s else None) or "No recommended action recorded."
+        evidence.append("session.next_recommended_action")
+
+    # ---- Unknown ----
+    else:
+        answer = (
+            f"I don't have enough recorded information to answer this question. "
+            f"Current project has {len(ctx.recent_decisions)} decisions, "
+            f"{len(ctx.completed_milestones)} completed milestones. "
+            f"Check .aao/sessions/{pid}/ for detailed artifacts."
+        )
+        evidence.append(f"Session directory: .aao/sessions/{pid}/")
+
+    print(json.dumps({
+        "question": question,
+        "answer": answer,
+        "evidence": evidence,
+    }, ensure_ascii=False, indent=2))
+
+
+def _handle_project_continue(args, store: ProjectSessionStore) -> None:
+    """Resume the current project — rebuild plan, execute the current milestone.
+
+    Loads session state, finds the current in-progress milestone, builds a
+    PlanContract from remaining milestones, dispatches execution via
+    MainlineExecutor, and links the resulting run.
+    """
+    pid, reason = _resolve_project_id(store, getattr(args, "project_id", None))
+    if pid is None:
+        _print_missing_project_error(reason, getattr(args, "project_id", None))
+        return
+
+    session = store.load_session(pid)
+    if session is None:
+        return
+
+    if session.status == "completed":
+        print(json.dumps({
+            "error": "Project is completed. Cannot continue a closed project.",
+            "project_id": pid,
+        }, ensure_ascii=False, indent=2))
+        return
+
+    # Check if milestone is awaiting approval (Phase 25 gate)
+    ms = store.get_current_milestone(pid)
+    if ms and ms.status == "paused_for_approval":
+        print(json.dumps({
+            "project_id": pid,
+            "status": "paused_for_approval",
+            "current_milestone": ms.to_dict(),
+            "_note": (
+                "Milestone is waiting for approval. Use 'project approve' "
+                "(coming in Phase 25) or check status for details."
+            ),
+        }, ensure_ascii=False, indent=2))
+        return
+
+    session.status = "active"
+    store.save_session(session)
+
+    # Build a PlanContract from remaining milestones and execute
+    if ms is None:
+        print(json.dumps({
+            "project_id": pid,
+            "status": session.status,
+            "_note": "No current milestone to execute. All milestones may be complete.",
+        }, ensure_ascii=False, indent=2))
+        return
+
+    # Construct a plan from session state
+    milestones = store.load_milestones(pid)
+    remaining = [m for m in milestones if m.status != "completed"]
+
+    from .planning import PlanContract
+    plan = PlanContract(
+        plan_id=f"resume-{pid}",
+        objective=f"{session.goal} — {ms.name}",
+        task_size="medium",
+        planning_mode="deterministic",
+        steps=[m.description for m in remaining],
+        risks=session.open_risks,
+    )
+
+    # Execute via MainlineExecutor
+    executor = MainlineExecutor(Path.cwd())
+    result = executor.execute(plan, worker_mode="fake")
+
+    # Link the run to the current milestone
+    run_link = ProjectRunLink(
+        milestone_id=ms.milestone_id,
+        run_id=result.run_id,
+        evidence_path=result.evidence_path or "",
+        audit_path=result.report_path or "",
+        status=result.status,
+    )
+    store.link_run(pid, run_link)
+
+    # If execution succeeded, advance milestone
+    if result.status == "completed":
+        store.advance_milestone(pid, ms.milestone_id, "completed")
+        remaining = [m for m in remaining if m.milestone_id != ms.milestone_id]
+        if remaining:
+            next_ms = remaining[0]
+            next_ms.status = "in_progress"
+            store.save_milestones(pid, [m for m in milestones if m.milestone_id != next_ms.milestone_id] + [next_ms])
+            session.next_recommended_action = f"Execute milestone: {next_ms.name}"
+            store.save_session(session)
+
+    # Log the decision
+    store.log_decision(pid, DecisionLog(
+        entry_id=_new_id(),
+        timestamp=_now(),
+        decision=f"Resumed execution of milestone: {ms.name}",
+        reason=f"Project continue — status: {result.status}",
+        made_by="control_plane",
+        evidence_refs=[result.evidence_path or "", result.report_path or ""],
+    ))
+
+    output = {
+        "project_id": pid,
+        "goal": session.goal,
+        "status": session.status,
+        "run_id": result.run_id,
+        "run_status": result.status,
+        "current_milestone": ms.to_dict(),
+        "completed_milestones": session.completed_milestones,
+        "next_recommended_action": session.next_recommended_action,
+        "_note": f"Milestone execution finished with status: {result.status}.",
+    }
+    print(json.dumps(output, ensure_ascii=False, indent=2))
+
+
+def _handle_project_close(args, store: ProjectSessionStore) -> None:
+    """Close the current project."""
+    pid, reason = _resolve_project_id(store, getattr(args, "project_id", None))
+    if pid is None:
+        _print_missing_project_error(reason, getattr(args, "project_id", None))
+        return
+
+    session = store.close_session(pid)
+    if session is None:
+        return
+
+    print(json.dumps({
+        "project_id": pid,
+        "status": "completed",
+        "_note": "Project closed. Use 'project continue' to resume is no longer possible.",
+    }, ensure_ascii=False, indent=2))
 
 
 if __name__ == "__main__":
