@@ -218,7 +218,7 @@ def main() -> None:
     project_start_parser = project_subparsers.add_parser("start", help="Create a new project session")
     project_start_parser.add_argument("goal", help="Project goal description")
     project_start_parser.add_argument("--project-id", help="Custom project ID (auto-generated if omitted)")
-    project_start_parser.add_argument("--planning-mode", choices=["deterministic", "llm"], default="deterministic", help="Planning Council mode (default: deterministic)")
+    project_start_parser.add_argument("--planning-mode", choices=["deterministic", "llm"], default="llm", help="Planning Council mode (default: llm)")
 
     project_status_parser = project_subparsers.add_parser("status", help="Show current project status")
     project_status_parser.add_argument("--project-id", help="Project ID (uses latest active if omitted)")
@@ -229,6 +229,9 @@ def main() -> None:
 
     project_continue_parser = project_subparsers.add_parser("continue", help="Resume the current project")
     project_continue_parser.add_argument("--project-id", help="Project ID (uses latest active if omitted)")
+    project_continue_parser.add_argument("--worker-mode", choices=["fake", "packet", "claude-code"], default="claude-code", help="Worker execution mode (default: claude-code)")
+    project_continue_parser.add_argument("--planning-mode", choices=["deterministic", "llm"], default="llm", help="Planning Council mode (default: llm)")
+    project_continue_parser.add_argument("--max-workers", type=int, default=2, help="Maximum concurrent workers (default: 2)")
 
     project_close_parser = project_subparsers.add_parser("close", help="Close the current project")
     project_close_parser.add_argument("--project-id", help="Project ID (uses latest active if omitted)")
@@ -1589,7 +1592,7 @@ def _handle_project_start(args, store: ProjectSessionStore) -> None:
     )
 
     # Generate a plan via Planning Council
-    planning_mode: PlanningMode = getattr(args, "planning_mode", "deterministic")
+    planning_mode: PlanningMode = getattr(args, "planning_mode", "llm")
     council = build_default_council(mode=planning_mode)
     plan = council.create_plan(
         args.goal,
@@ -1981,12 +1984,16 @@ def _handle_project_continue(args, store: ProjectSessionStore) -> None:
     milestones = store.load_milestones(pid)
     remaining = [m for m in milestones if m.status != "completed"]
 
+    worker_mode = getattr(args, "worker_mode", "claude-code")
+    planning_mode = getattr(args, "planning_mode", "llm")
+    max_workers = getattr(args, "max_workers", 2)
+
     from .planning import PlanContract
     plan = PlanContract(
         plan_id=f"resume-{pid}",
         objective=f"{session.goal} — {ms.name}",
         task_size="medium",
-        planning_mode="deterministic",
+        planning_mode=planning_mode,
         steps=[m.description for m in remaining],
         risks=session.open_risks,
     )
@@ -1994,7 +2001,7 @@ def _handle_project_continue(args, store: ProjectSessionStore) -> None:
 
     # Execute via MainlineExecutor
     executor = MainlineExecutor(Path.cwd())
-    result = executor.execute(plan, worker_mode="fake")
+    result = executor.execute(plan, worker_mode=worker_mode, max_workers=max_workers)
 
     # Link the run to the current milestone
     run_link = ProjectRunLink(

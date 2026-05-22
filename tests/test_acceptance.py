@@ -630,6 +630,9 @@ class TestV2CollaborationAcceptance:
         # Execute the first milestone
         class FakeArgsContinue:
             project_id = pid
+            worker_mode = "fake"
+            planning_mode = "deterministic"
+            max_workers = 2
 
         _handle_project_continue(FakeArgsContinue(), store)
 
@@ -756,6 +759,9 @@ class TestV2CollaborationAcceptance:
         # Execute first milestone → paused
         class FakeArgsContinue:
             project_id = pid
+            worker_mode = "fake"
+            planning_mode = "deterministic"
+            max_workers = 2
 
         _handle_project_continue(FakeArgsContinue(), store)
         capsys.readouterr()  # consume continue output
@@ -816,6 +822,9 @@ class TestV2CollaborationAcceptance:
         # Continue still works with the new store
         class FakeArgsContinue:
             project_id = pid
+            worker_mode = "fake"
+            planning_mode = "deterministic"
+            max_workers = 2
 
         _handle_project_continue(FakeArgsContinue(), store2)
 
@@ -877,6 +886,9 @@ class TestV2CollaborationAcceptance:
         # Execute milestone 1
         class FakeArgsContinue:
             project_id = pid
+            worker_mode = "fake"
+            planning_mode = "deterministic"
+            max_workers = 2
 
         _handle_project_continue(FakeArgsContinue(), store)
 
@@ -982,6 +994,9 @@ class TestV2CollaborationAcceptance:
         # ---- Step 2-4: Execute ----
         class FakeArgsContinue:
             project_id = pid
+            worker_mode = "fake"
+            planning_mode = "deterministic"
+            max_workers = 2
 
         _handle_project_continue(FakeArgsContinue(), store)
         capsys.readouterr()  # consume output

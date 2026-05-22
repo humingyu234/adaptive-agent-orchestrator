@@ -127,15 +127,10 @@ The acceptance tests exercise a 13-step end-to-end scenario:
   with dependency-aware scheduling (Phase 20)
 - LangGraph runner: `_execute_langgraph()` wired in mainline executor (Phase 15+29)
 
-All four capabilities are built and tested. They are not used in the v2
-project session flow because `_handle_project_continue` currently hardcodes
-`worker_mode="fake"` — a wiring choice, not a capability gap.
-
-**What's genuinely not done:**
-
-- Project flow doesn't yet accept `--worker-mode` or `--planning-mode` flags
-  to opt into real workers/LLM — the CLI surface for project commands is
-  minimal
+All four capabilities are built, tested, and wired into the project session flow.
+`project start` and `project continue` default to real workers (`--worker-mode claude-code`)
+and real LLM planning (`--planning-mode llm`). Use `--worker-mode fake
+--planning-mode deterministic` for deterministic testing.
 
 ## What AAO Is Not
 

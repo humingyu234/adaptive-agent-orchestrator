@@ -1193,6 +1193,29 @@ class MainlineExecutor:
 
     def _execute_claude_code_worker(self, packet: WorkerTaskPacket) -> dict[str, Any]:
         """Launch a real Claude Code subprocess as the worker."""
+        import shutil
+
+        if not shutil.which("claude"):
+            return {
+                "run_id": _new_run_id(),
+                "task_id": packet.task_id,
+                "packet_dir": str(packet.packet_root),
+                "behaviour": "claude-code",
+                "exit_code": -1,
+                "timed_out": False,
+                "worker_status": "infrastructure_error",
+                "changed_files": [],
+                "summary": "",
+                "error": "Claude Code CLI not found. Install with: npm install -g @anthropic-ai/claude-code",
+                "observed_paths": [],
+                "stdout_path": "",
+                "stderr_path": "",
+                "transcript_path": "",
+                "result_md_path": "",
+                "status_json_path": "",
+                "command": "claude (not found)",
+            }
+
         from .workers.claude_code import (
             ClaudeCodeWorkerConfig,
             run_claude_code_worker,

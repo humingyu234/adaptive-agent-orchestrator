@@ -424,6 +424,9 @@ class TestCLIHandlers:
 
         class FakeArgs:
             project_id = pid
+            worker_mode = "fake"
+            planning_mode = "deterministic"
+            max_workers = 2
 
         _handle_project_continue(FakeArgs(), tmp_store)
         out = capsys.readouterr().out
@@ -632,6 +635,9 @@ class TestCLIHandlers:
 
         class FakeArgs:
             project_id = pid
+            worker_mode = "fake"
+            planning_mode = "deterministic"
+            max_workers = 2
 
         _handle_project_continue(FakeArgs(), tmp_store)
         out = capsys.readouterr().out
@@ -655,6 +661,9 @@ class TestCLIHandlers:
 
         class FakeArgs:
             project_id = pid
+            worker_mode = "fake"
+            planning_mode = "deterministic"
+            max_workers = 2
 
         _handle_project_continue(FakeArgs(), tmp_store)
         out = capsys.readouterr().out
