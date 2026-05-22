@@ -110,19 +110,32 @@ The acceptance tests exercise a 13-step end-to-end scenario:
 - Self-check: 6 categories of system issue detection run against live
   session state; protected-path proposals are blocked
 
-**What's mock:**
+**What the acceptance tests exercise (v2 project flow with fakes):**
 
-- Workers: deterministic fake workers (no real Claude Code subprocess)
-- Planning: deterministic planner (no real LLM planning council)
-- Evidence: fake evidence artifacts produced by fake workers
+- Workers: deterministic fake workers — but `worker_mode="claude-code"` and
+  `worker_mode="packet"` both exist and work (Phase 18)
+- Planning: deterministic planner — but `planning_mode="llm"` exists and works (Phase 19)
 
-**What remains (not in scope for v2):**
+**What's real but not exercised by these specific tests:**
 
-- Real multi-worker parallel execution (multi_worker.py exists but not
-  wired into the mainline project flow)
-- Real Claude Code worker bridge in the project flow
-- Real LLM planning council in the project flow
-- LangGraph runner integration for orchestrated mode
+- Real Claude Code subprocess worker: `run_claude_code_worker()` in
+  `workers/claude_code.py` launches actual subprocess, captures
+  stdout/stderr/exit code (Phase 18)
+- Real LLM planning council: `build_default_council(mode="llm")` calls
+  configured LLM providers with structured prompts (Phase 19)
+- Multi-worker parallel execution: `multi_worker.py` uses ThreadPoolExecutor
+  with dependency-aware scheduling (Phase 20)
+- LangGraph runner: `_execute_langgraph()` wired in mainline executor (Phase 15+29)
+
+All four capabilities are built and tested. They are not used in the v2
+project session flow because `_handle_project_continue` currently hardcodes
+`worker_mode="fake"` — a wiring choice, not a capability gap.
+
+**What's genuinely not done:**
+
+- Project flow doesn't yet accept `--worker-mode` or `--planning-mode` flags
+  to opt into real workers/LLM — the CLI surface for project commands is
+  minimal
 
 ## What AAO Is Not
 
