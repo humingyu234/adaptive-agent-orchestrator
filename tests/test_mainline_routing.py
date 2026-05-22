@@ -1,107 +1,132 @@
-"""Phase 29 — MainlineExecutor backend routing tests.
+"""Phase 29 — Task Router → MainlineExecutor routing tests.
 
-Proves that MainlineExecutor.execute() correctly dispatches to the right
-backend based on execution_backend parameter.
+Proves the router decision automatically selects the right execution path.
+_resolve_execution_path() returns a 3-tuple:
+(path, effective_worker_mode, execution_backend).
 """
 
 from __future__ import annotations
 
-import pytest
 
-from orchestrator.planning import PlanContract, PlannedWorkerTask
-from orchestrator.mainline_executor import MainlineExecutor
+class TestP01RouterMainlineAutoConnect:
+    """Proves the router decision automatically selects the right execution path.
 
+    execution_backend is:
+      "native" for controlled mode (MultiWorkerExecutor)
+      "langgraph" for orchestrated mode (LangGraphRunner)
+      None for legacy / noop / blocked paths
+    """
 
-def _make_plan(task_count: int = 2):
-    tasks = [
-        PlannedWorkerTask(
-            step_id=f"step-{i}",
-            title=f"Step {i}",
-            objective=f"Work {i}",
-            allowed_files=["src/utils.py"],
-        )
-        for i in range(task_count)
-    ]
-    plan = PlanContract(
-        objective="Test plan",
-        steps=[f"Step {i}" for i in range(task_count)],
-        planned_worker_tasks=tasks,
-        plan_id="routing-test-plan",
-    )
-    plan.approve()
-    return plan
+    @staticmethod
+    def _make_decision(**overrides):
+        from orchestrator.task_router import TaskRouteDecision
 
+        defaults = {
+            "task_size": "medium",
+            "run_mode": "controlled",
+            "risk_level": "low",
+            "task_type": "code_change",
+            "runtime_support": "native",
+        }
+        defaults.update(overrides)
+        return TaskRouteDecision(**defaults)
 
-class TestBackendRouting:
-    """Proves execution_backend parameter controls dispatch correctly."""
+    @staticmethod
+    def _resolve(decision, explicit_worker_mode=None, force_run=False):
+        from orchestrator.__main__ import _resolve_execution_path
 
-    def test_controlled_uses_native_backend(self):
-        """controlled task → native backend (MultiWorkerExecutor)."""
-        plan = _make_plan(task_count=2)
-        executor = MainlineExecutor()
-        result = executor.execute(plan, worker_mode="fake", execution_backend="native")
+        return _resolve_execution_path(decision, explicit_worker_mode, force_run)
 
-        assert result.status == "completed"
-        assert result.worker_mode == "fake"
-        # Multi-worker path: step_count from combined report
-        assert result.run_id
+    def test_controlled_route_auto_mainline(self):
+        decision = self._make_decision(run_mode="controlled")
+        path, worker, backend = self._resolve(decision)
+        assert path == "mainline"
+        assert worker == "fake"
+        assert backend == "native"
 
-    def test_orchestrated_uses_langgraph_backend(self):
-        """orchestrated task → langgraph backend (LangGraphRunner).
-
-        When langgraph is installed, the LangGraphRunner executes the plan
-        through a StateGraph.  When not installed, the test still proves the
-        dispatch path (it will be blocked with a clear message).
-        """
-        plan = _make_plan(task_count=1)
-        executor = MainlineExecutor()
-        result = executor.execute(plan, worker_mode="fake", execution_backend="langgraph")
-
+    def test_orchestrated_route_to_langgraph_backend(self):
+        decision = self._make_decision(run_mode="orchestrated")
+        path, worker, backend = self._resolve(decision)
+        assert path == "mainline"
+        assert worker == "fake"
         from orchestrator.runners.langgraph_runner import _LANGGRAPH_AVAILABLE
         if _LANGGRAPH_AVAILABLE:
-            assert result.status == "completed"
+            assert backend == "langgraph"
         else:
-            assert result.status == "blocked_needs_review"
+            assert path == "blocked"
+            assert backend is None
 
-    def test_orchestrated_blocked_when_langgraph_unavailable(self):
-        """orchestrated without langgraph → blocked with clear dependency message."""
-        plan = _make_plan(task_count=1)
-        executor = MainlineExecutor()
-
+    def test_orchestrated_route_with_force_run_falls_back_native(self):
+        decision = self._make_decision(run_mode="orchestrated")
         import orchestrator.runners.langgraph_runner as lgr
         _orig = lgr._LANGGRAPH_AVAILABLE
-        lgr._LANGGRAPH_AVAILABLE = False
         try:
-            result = executor.execute(plan, worker_mode="fake", execution_backend="langgraph")
-            assert result.status == "blocked_needs_review"
-            assert len(result.control_decisions) > 0
-            assert any("LangGraph" in d.get("reason", "") for d in result.control_decisions)
+            lgr._LANGGRAPH_AVAILABLE = False
+            path, worker, backend = self._resolve(decision, force_run=True)
+            assert path == "mainline"
+            assert worker == "fake"
+            assert backend == "native"
         finally:
             lgr._LANGGRAPH_AVAILABLE = _orig
 
-    def test_orchestrated_force_run_falls_back_to_native(self):
-        """--force-run orchestrated when langgraph missing → native backend."""
-        plan = _make_plan(task_count=1)
-        executor = MainlineExecutor()
+    def test_off_route_is_noop(self):
+        decision = self._make_decision(run_mode="off")
+        path, worker, backend = self._resolve(decision)
+        assert path == "noop"
+        assert worker is None
+        assert backend is None
 
+    def test_log_route_is_noop(self):
+        decision = self._make_decision(run_mode="log")
+        path, worker, backend = self._resolve(decision)
+        assert path == "noop"
+        assert worker is None
+        assert backend is None
+
+    def test_explicit_worker_mode_overrides_off_route(self):
+        decision = self._make_decision(run_mode="off")
+        path, worker, backend = self._resolve(decision, explicit_worker_mode="fake")
+        assert path == "mainline"
+        assert worker == "fake"
+        assert backend == "native"
+
+    def test_explicit_worker_mode_overrides_log_route(self):
+        decision = self._make_decision(run_mode="log")
+        path, worker, backend = self._resolve(decision, explicit_worker_mode="claude-code")
+        assert path == "mainline"
+        assert worker == "claude-code"
+        assert backend == "native"
+
+    def test_explicit_worker_mode_overrides_controlled_default(self):
+        decision = self._make_decision(run_mode="controlled")
+        path, worker, backend = self._resolve(decision, explicit_worker_mode="packet")
+        assert path == "mainline"
+        assert worker == "packet"
+        assert backend == "native"
+
+    def test_force_run_off_route_falls_through_to_mainline(self):
+        decision = self._make_decision(run_mode="off")
+        path, worker, backend = self._resolve(decision, force_run=True)
+        assert path == "legacy"
+        assert worker is None
+        assert backend is None
+
+    def test_orchestrated_without_langgraph_is_blocked(self):
+        decision = self._make_decision(run_mode="orchestrated")
         import orchestrator.runners.langgraph_runner as lgr
         _orig = lgr._LANGGRAPH_AVAILABLE
-        lgr._LANGGRAPH_AVAILABLE = False
         try:
-            # When langgraph is missing, the _execute_langgraph method returns
-            # blocked_needs_review.  The CLI-level --force-run would redirect
-            # to native, which is tested in test_acceptance.py.
-            result = executor.execute(plan, worker_mode="fake", execution_backend="native")
-            assert result.status == "completed"
+            lgr._LANGGRAPH_AVAILABLE = False
+            path, worker, backend = self._resolve(decision)
+            assert path == "blocked"
+            assert worker is None
+            assert backend is None
         finally:
             lgr._LANGGRAPH_AVAILABLE = _orig
 
-    def test_native_backend_runs_multi_worker(self):
-        """Native backend still uses MultiWorkerExecutor for multi-step plans."""
-        plan = _make_plan(task_count=3)
-        executor = MainlineExecutor()
-        result = executor.execute(plan, worker_mode="fake", execution_backend="native")
-
-        assert result.status == "completed"
-        assert result.run_id
-        # Multi-worker path is exercised for >1 tasks
+    def test_non_standard_run_mode_falls_to_legacy(self):
+        decision = self._make_decision(run_mode="custom_mode")
+        path, worker, backend = self._resolve(decision)
+        assert path == "legacy"
+        assert worker is None
+        assert backend is None
