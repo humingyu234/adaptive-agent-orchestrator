@@ -248,6 +248,11 @@ def main() -> None:
     project_request_changes_parser.add_argument("--notes", default="", help="Notes describing what needs to change")
     project_request_changes_parser.add_argument("--project-id", help="Project ID (uses latest active if omitted)")
 
+    # Phase 27 — Self-Check
+    project_self_check_parser = project_subparsers.add_parser("self-check", help="Check AAO control chain for system issues")
+    project_self_check_parser.add_argument("--project-id", help="Project ID (uses latest active if omitted)")
+    project_self_check_parser.add_argument("--category", choices=["evidence_false_positive", "isolation_violation", "resume_broken", "worker_bridge_bypass", "plan_reality_drift", "decision_inconsistency"], help="Run a specific self-check category only")
+
     args = parser.parse_args()
 
     if args.command == "ask":
@@ -1572,6 +1577,8 @@ def _handle_project_command(args) -> None:
         _handle_project_reject(args, store)
     elif args.project_command == "request-changes":
         _handle_project_request_changes(args, store)
+    elif args.project_command == "self-check":
+        _handle_project_self_check(args, store)
 
 
 def _handle_project_start(args, store: ProjectSessionStore) -> None:
@@ -2164,6 +2171,53 @@ def _handle_project_request_changes(args, store: ProjectSessionStore) -> None:
         "requested_at": approval.approved_at,
         "next_recommended_action": session.next_recommended_action if session else None,
     }, ensure_ascii=False, indent=2))
+
+
+def _handle_project_self_check(args, store: ProjectSessionStore) -> None:
+    """Run AAO self-check against a project session (Phase 27)."""
+    pid, reason = _resolve_project_id(store, getattr(args, "project_id", None))
+    if pid is None:
+        _print_missing_project_error(reason, getattr(args, "project_id", None))
+        return
+
+    from .self_check import generate_repair_proposal, run_self_check
+
+    category = getattr(args, "category", None)
+    findings = run_self_check(store, pid, category=category)
+
+    # Generate repair proposals where possible (blocked for protected paths)
+    proposals: list[dict] = []
+    blocked_count = 0
+    for f in findings:
+        proposal = generate_repair_proposal(f)
+        if proposal is not None:
+            proposals.append(proposal.to_dict())
+        else:
+            blocked_count += 1
+        # Record finding in session
+        store.record_system_issue(pid, f, proposal)
+
+    session = store.load_session(pid)
+
+    output = {
+        "project_id": pid,
+        "findings": [f.to_dict() for f in findings],
+        "proposals": proposals,
+        "blocked_proposals": blocked_count,
+        "status": session.status if session else "unknown",
+        "_note": (
+            f"{len(findings)} system issue(s) detected."
+            if findings
+            else "No system issues detected."
+        ),
+    }
+    if blocked_count:
+        output["_note"] += (
+            f" {blocked_count} repair proposal(s) blocked — "
+            "they target AAO core files. Manual developer review required."
+        )
+
+    print(json.dumps(output, ensure_ascii=False, indent=2))
 
 
 if __name__ == "__main__":

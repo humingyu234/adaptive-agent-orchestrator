@@ -201,6 +201,88 @@ class MilestoneApproval:
 
 
 @dataclass
+class SystemFinding:
+    """A problem detected in AAO's own control chain (Phase 27).
+
+    Unlike TaskIssue (test failures, lint errors), SystemFindings are
+    about the orchestrator itself — broken evidence, reviewer isolation
+    violations, plan-reality drift, etc.  They must NEVER be auto-fixed.
+    """
+
+    finding_id: str
+    category: str  # control_chain_gap | isolation_violation | evidence_false_positive | resume_broken | worker_bridge_bypass | plan_reality_drift | decision_inconsistency
+    severity: str = "medium"  # critical | high | medium
+    description: str = ""
+    evidence_refs: list[str] = field(default_factory=list)
+    affected_components: list[str] = field(default_factory=list)
+    detected_at: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "finding_id": self.finding_id,
+            "category": self.category,
+            "severity": self.severity,
+            "description": self.description,
+            "evidence_refs": list(self.evidence_refs),
+            "affected_components": list(self.affected_components),
+            "detected_at": self.detected_at,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> SystemFinding:
+        return cls(
+            finding_id=d.get("finding_id", ""),
+            category=d.get("category", ""),
+            severity=d.get("severity", "medium"),
+            description=d.get("description", ""),
+            evidence_refs=d.get("evidence_refs", []),
+            affected_components=d.get("affected_components", []),
+            detected_at=d.get("detected_at", ""),
+        )
+
+
+@dataclass
+class SelfRepairProposal:
+    """A suggested fix for a SystemFinding (Phase 27).
+
+    Proposals that touch AAO core files (src/orchestrator/*.py,
+    CLAUDE.md, etc.) must be BLOCKED at generation time.
+    Proposals always require human approval before execution.
+    """
+
+    proposal_id: str
+    triggered_by: list[str] = field(default_factory=list)  # SystemFinding IDs
+    summary: str = ""
+    affected_files: list[str] = field(default_factory=list)
+    risks: list[str] = field(default_factory=list)
+    test_plan: str = ""
+    requires_human_approval: bool = True
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "proposal_id": self.proposal_id,
+            "triggered_by": list(self.triggered_by),
+            "summary": self.summary,
+            "affected_files": list(self.affected_files),
+            "risks": list(self.risks),
+            "test_plan": self.test_plan,
+            "requires_human_approval": self.requires_human_approval,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> SelfRepairProposal:
+        return cls(
+            proposal_id=d.get("proposal_id", ""),
+            triggered_by=d.get("triggered_by", []),
+            summary=d.get("summary", ""),
+            affected_files=d.get("affected_files", []),
+            risks=d.get("risks", []),
+            test_plan=d.get("test_plan", ""),
+            requires_human_approval=d.get("requires_human_approval", True),
+        )
+
+
+@dataclass
 class SessionContext:
     """Assembled at resume/ask time to answer questions.
 
@@ -324,6 +406,12 @@ class ProjectSessionStore:
 
     def _context_path(self, project_id: str) -> Path:
         return self._session_dir(project_id) / "project_context.json"
+
+    def _findings_path(self, project_id: str) -> Path:
+        return self._session_dir(project_id) / "system_findings.json"
+
+    def _proposals_path(self, project_id: str) -> Path:
+        return self._session_dir(project_id) / "self_repair_proposals.json"
 
     # ------------------------------------------------------------------
     # Session CRUD
@@ -812,3 +900,83 @@ class ProjectSessionStore:
             return json.loads(path.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, OSError):
             return None
+
+    # ------------------------------------------------------------------
+    # System findings & self-repair proposals (Phase 27)
+    # ------------------------------------------------------------------
+
+    def save_findings(self, project_id: str, findings: list[SystemFinding]) -> None:
+        path = self._findings_path(project_id)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps([f.to_dict() for f in findings], ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+
+    def load_findings(self, project_id: str) -> list[SystemFinding]:
+        path = self._findings_path(project_id)
+        if not path.exists():
+            return []
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            return [SystemFinding.from_dict(d) for d in data]
+        except (json.JSONDecodeError, OSError):
+            return []
+
+    def save_proposals(self, project_id: str, proposals: list[SelfRepairProposal]) -> None:
+        path = self._proposals_path(project_id)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps([p.to_dict() for p in proposals], ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+
+    def load_proposals(self, project_id: str) -> list[SelfRepairProposal]:
+        path = self._proposals_path(project_id)
+        if not path.exists():
+            return []
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            return [SelfRepairProposal.from_dict(d) for d in data]
+        except (json.JSONDecodeError, OSError):
+            return []
+
+    def record_system_issue(
+        self,
+        project_id: str,
+        finding: SystemFinding,
+        proposal: SelfRepairProposal | None = None,
+    ) -> None:
+        """Record a system finding and optionally a repair proposal.
+
+        Sets the session status to ``blocked_needs_review`` so the human
+        can review and decide.
+        """
+        findings = self.load_findings(project_id)
+        findings.append(finding)
+        self.save_findings(project_id, findings)
+
+        if proposal is not None:
+            proposals = self.load_proposals(project_id)
+            proposals.append(proposal)
+            self.save_proposals(project_id, proposals)
+
+        session = self.load_session(project_id)
+        if session:
+            session.status = "blocked_needs_review"
+            session.pending_decisions.append(
+                f"System issue: {finding.category} — {finding.description[:100]}"
+            )
+            session.next_recommended_action = (
+                f"Review SystemFinding {finding.finding_id}: {finding.description}"
+            )
+            self.save_session(session)
+
+        self.log_decision(project_id, DecisionLog(
+            entry_id=_new_id(),
+            timestamp=_now(),
+            decision=f"System issue detected: {finding.category}",
+            reason=finding.description,
+            made_by="control_plane",
+            evidence_refs=list(finding.evidence_refs),
+        ))

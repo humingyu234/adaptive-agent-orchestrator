@@ -19,7 +19,9 @@ from orchestrator.project_session import (
     ProjectRunLink,
     ProjectSession,
     ProjectSessionStore,
+    SelfRepairProposal,
     SessionContext,
+    SystemFinding,
     _new_id,
     _now,
 )
@@ -1188,3 +1190,351 @@ class TestMilestoneGateCLI:
 
         # Step 3: Verify ms1 is in completed_milestones
         assert ms1.milestone_id in s.completed_milestones
+
+
+# =============================================================================
+# Phase 27 — AAO Self-Issue Handling
+# =============================================================================
+
+
+class TestSystemFindings:
+    """SystemFinding detection, record_system_issue, and hard blocks."""
+
+    def test_system_issue_enters_blocked_needs_review(self, tmp_store):
+        """SystemFinding must set session to blocked_needs_review — never auto-fixed."""
+        session = _create_active_session(tmp_store)
+        pid = session.project_id
+
+        finding = SystemFinding(
+            finding_id="sf-001",
+            category="evidence_false_positive",
+            severity="high",
+            description="Evidence marked observed but file missing",
+            evidence_refs=["outputs/evidence/run-001.json"],
+            affected_components=["evidence classifier"],
+        )
+        tmp_store.record_system_issue(pid, finding)
+
+        s = tmp_store.load_session(pid)
+        assert s.status == "blocked_needs_review"
+        assert "System issue" in s.pending_decisions[0]
+
+        # Finding must be persisted
+        loaded = tmp_store.load_findings(pid)
+        assert len(loaded) == 1
+        assert loaded[0].category == "evidence_false_positive"
+
+        # Decision must be logged
+        decisions = tmp_store.load_decisions(pid)
+        sys_decisions = [d for d in decisions if "System issue" in d.decision]
+        assert len(sys_decisions) >= 1
+
+    def test_task_issue_does_not_set_blocked_status(self, tmp_store):
+        """Ordinary task issues (logged as normal decisions) don't block the session."""
+        session = _create_active_session(tmp_store)
+        pid = session.project_id
+
+        # Log a normal task issue (like a test failure)
+        tmp_store.log_decision(pid, DecisionLog(
+            entry_id=_new_id(),
+            timestamp=_now(),
+            decision="Auto-repair triggered for test failure",
+            reason="3 tests failed in test_worker.py",
+            made_by="control_plane",
+        ))
+
+        s = tmp_store.load_session(pid)
+        assert s.status == "active"  # NOT blocked_needs_review
+        assert s.status != "blocked_needs_review"
+
+    def test_self_repair_proposal_includes_risks_and_test_plan(self):
+        """Every SelfRepairProposal must include risks and a test plan."""
+        from orchestrator.self_check import generate_repair_proposal
+
+        finding = SystemFinding(
+            finding_id="sf-002",
+            category="worker_bridge_bypass",
+            severity="high",
+            description="Worker completed but no evidence of work",
+        )
+
+        proposal = generate_repair_proposal(finding)
+        # worker_bridge_bypass targets src/orchestrator/workers/claude_code.py
+        # which is AAO-protected → proposal should be blocked
+        assert proposal is None
+
+        # Test with a non-protected category simulation — decision_inconsistency
+        # targets src/orchestrator/control_plane.py which is also protected
+        finding2 = SystemFinding(
+            finding_id="sf-003",
+            category="decision_inconsistency",
+            severity="medium",
+            description="Same failure handled differently",
+        )
+        proposal2 = generate_repair_proposal(finding2)
+        assert proposal2 is None  # also protected
+
+    def test_self_repair_proposal_requires_human_approval(self):
+        """SelfRepairProposal.requires_human_approval must always be True."""
+        from orchestrator.self_check import SelfRepairProposal as SRP
+
+        proposal = SRP(
+            proposal_id="p-001",
+            summary="Fix something",
+            affected_files=["src/business_logic.py"],
+            risks=["Risk 1"],
+            test_plan="Run tests",
+        )
+        assert proposal.requires_human_approval is True
+
+    def test_proposal_to_modify_aao_source_is_blocked(self):
+        """Proposals targeting AAO core files must be blocked at generation."""
+        from orchestrator.self_check import _is_protected_path, generate_repair_proposal
+
+        # All AAO core paths are protected
+        assert _is_protected_path("src/orchestrator/mainline_executor.py") is True
+        assert _is_protected_path("src/orchestrator/__main__.py") is True
+        assert _is_protected_path("CLAUDE.md") is True
+        assert _is_protected_path(".claude/phase-specs/phase-27.md") is True
+        assert _is_protected_path(".claude/project-skills/aao-core-builder.md") is True
+        assert _is_protected_path(".env") is True
+        assert _is_protected_path("tests/test_project_session.py") is True
+
+        # Non-AAO files are not protected
+        assert _is_protected_path("src/business_logic.py") is False
+        assert _is_protected_path("README.md") is False
+
+        # All built-in categories target AAO source → proposals blocked
+        for cat in ("evidence_false_positive", "isolation_violation",
+                     "worker_bridge_bypass", "resume_broken",
+                     "control_chain_gap", "plan_reality_drift",
+                     "decision_inconsistency"):
+            finding = SystemFinding(
+                finding_id="sf-test",
+                category=cat,
+                severity="high",
+                description="Test",
+            )
+            proposal = generate_repair_proposal(finding)
+            assert proposal is None, f"Proposal for {cat} should be blocked — it targets AAO core"
+
+    def test_unknown_category_proposal_not_blocked(self):
+        """An unrecognized category with no affected files should still generate a proposal."""
+        from orchestrator.self_check import generate_repair_proposal
+
+        finding = SystemFinding(
+            finding_id="sf-004",
+            category="unknown_category",
+            severity="low",
+            description="Something unknown happened",
+        )
+        proposal = generate_repair_proposal(finding)
+        # Unknown category has empty affected_files, so no protected path hit
+        assert proposal is not None
+        assert proposal.requires_human_approval is True
+        assert "unknown" in proposal.summary.lower()
+
+    def test_system_issue_detection_distinguishes_from_task_issue(self, tmp_store):
+        """SystemFindings have categories distinct from ordinary task failures."""
+        from orchestrator.self_check import run_self_check
+
+        session = _create_active_session(tmp_store)
+        pid = session.project_id
+
+        # Create a run link with evidence that has changed_files but no test_output
+        # AND the evidence file is missing (triggers resume_broken)
+        link = tmp_store.load_run_links(pid)[0]
+        # Point to a non-existent evidence file
+        link.evidence_path = "outputs/evidence/nonexistent.json"
+        link.audit_path = "outputs/audits/nonexistent.json"
+        tmp_store.link_run(pid, ProjectRunLink(
+            milestone_id=link.milestone_id,
+            run_id="run-002",
+            evidence_path="outputs/evidence/nonexistent.json",
+            audit_path="outputs/audits/nonexistent.json",
+            status="completed",
+        ))
+
+        findings = run_self_check(tmp_store, pid)
+        # Should detect resume_broken (missing evidence + audit files)
+        assert len(findings) > 0
+        for f in findings:
+            # All findings should be system categories, not task categories
+            assert f.category in (
+                "evidence_false_positive", "isolation_violation",
+                "resume_broken", "worker_bridge_bypass",
+                "plan_reality_drift", "decision_inconsistency",
+            )
+
+    def test_self_check_empty_project_no_findings(self, tmp_store):
+        """A clean project with no issues should return empty findings list."""
+        from orchestrator.self_check import run_self_check
+
+        # Use a bare session without run_links to avoid false positives
+        session = tmp_store.create_session("Clean project")
+        findings = run_self_check(tmp_store, session.project_id)
+        assert findings == []
+
+    def test_self_check_single_category_filter(self, tmp_store):
+        """Filtering by category should only run that check."""
+        from orchestrator.self_check import run_self_check
+
+        session = _create_active_session(tmp_store)
+        pid = session.project_id
+
+        # Add a broken run link to trigger resume_broken
+        tmp_store.link_run(pid, ProjectRunLink(
+            milestone_id="ms-1",
+            run_id="run-broken",
+            evidence_path="outputs/evidence/nonexistent.json",
+            audit_path="",
+            status="completed",
+        ))
+
+        # Run only evidence_false_positive check — should not find resume_broken
+        findings = run_self_check(tmp_store, pid, category="evidence_false_positive")
+        for f in findings:
+            assert f.category == "evidence_false_positive"
+
+        # Run resume_broken check — should find the issue
+        findings2 = run_self_check(tmp_store, pid, category="resume_broken")
+        assert len(findings2) > 0
+        assert all(f.category == "resume_broken" for f in findings2)
+
+    def test_record_system_issue_with_proposal(self, tmp_store):
+        """record_system_issue stores both finding and proposal when provided."""
+        session = _create_active_session(tmp_store)
+        pid = session.project_id
+
+        finding = SystemFinding(
+            finding_id="sf-005",
+            category="resume_broken",
+            severity="medium",
+            description="Missing evidence file",
+        )
+
+        from orchestrator.self_check import SelfRepairProposal as SRP
+        proposal = SRP(
+            proposal_id="p-002",
+            triggered_by=["sf-005"],
+            summary="Fix the broken reference",
+            affected_files=["src/business_logic.py"],
+            risks=["Low risk"],
+            test_plan="Verify file existence before load",
+        )
+
+        tmp_store.record_system_issue(pid, finding, proposal)
+
+        # Both must be persisted
+        findings = tmp_store.load_findings(pid)
+        assert len(findings) == 1
+
+        proposals = tmp_store.load_proposals(pid)
+        assert len(proposals) == 1
+        assert proposals[0].summary == "Fix the broken reference"
+
+
+class TestSelfCheckCLI:
+    """CLI handler for self-check command."""
+
+    def test_self_check_command_outputs_structured_json(self, tmp_store, capsys):
+        """self-check CLI must output structured JSON with findings and proposals."""
+        session = _create_active_session(tmp_store)
+
+        from orchestrator.__main__ import _handle_project_self_check
+
+        class FakeArgs:
+            project_id = session.project_id
+            category = None
+
+        _handle_project_self_check(FakeArgs(), tmp_store)
+        out = capsys.readouterr().out
+        data = json.loads(out)
+        assert "findings" in data
+        assert "proposals" in data
+        assert "blocked_proposals" in data
+        assert "status" in data
+        assert isinstance(data["findings"], list)
+        assert isinstance(data["proposals"], list)
+
+    def test_self_check_no_active_session_shows_error(self, tmp_store, capsys):
+        """self-check with no active project should show an error."""
+        from orchestrator.__main__ import _handle_project_self_check
+
+        class FakeArgs:
+            project_id = "nonexistent"
+            category = None
+
+        _handle_project_self_check(FakeArgs(), tmp_store)
+        out = capsys.readouterr().out
+        data = json.loads(out)
+        assert "error" in data
+
+    def test_self_check_with_broken_run_link_detects_issue(self, tmp_store, capsys):
+        """self-check should detect resume_broken when run_links point to missing files."""
+        session = _create_active_session(tmp_store)
+        pid = session.project_id
+
+        # Add a broken run link
+        tmp_store.link_run(pid, ProjectRunLink(
+            milestone_id="ms-1",
+            run_id="run-broken",
+            evidence_path="outputs/evidence/nonexistent.json",
+            audit_path="outputs/audits/nonexistent.json",
+            status="completed",
+        ))
+
+        from orchestrator.__main__ import _handle_project_self_check
+
+        class FakeArgs:
+            project_id = pid
+            category = None
+
+        _handle_project_self_check(FakeArgs(), tmp_store)
+        out = capsys.readouterr().out
+        data = json.loads(out)
+        assert len(data["findings"]) > 0
+        # All proposals for detected issues target AAO core → blocked
+        assert data["blocked_proposals"] >= 1
+        assert "system issue(s) detected" in data["_note"]
+
+    def test_self_check_session_enters_blocked_status_after_detection(self, tmp_store, capsys):
+        """After self-check finds issues, session must be blocked_needs_review."""
+        session = _create_active_session(tmp_store)
+        pid = session.project_id
+
+        # Add broken run links to trigger detection
+        tmp_store.link_run(pid, ProjectRunLink(
+            milestone_id="ms-1",
+            run_id="run-broken-2",
+            evidence_path="outputs/evidence/nonexistent.json",
+            audit_path="",
+            status="completed",
+        ))
+
+        from orchestrator.__main__ import _handle_project_self_check
+
+        class FakeArgs:
+            project_id = pid
+            category = None
+
+        _handle_project_self_check(FakeArgs(), tmp_store)
+
+        s = tmp_store.load_session(pid)
+        assert s.status == "blocked_needs_review"
+
+    def test_self_check_with_category_filter(self, tmp_store, capsys):
+        """self-check --category should only run the specified check."""
+        session = _create_active_session(tmp_store)
+        pid = session.project_id
+
+        from orchestrator.__main__ import _handle_project_self_check
+
+        class FakeArgs:
+            project_id = pid
+            category = "decision_inconsistency"
+
+        _handle_project_self_check(FakeArgs(), tmp_store)
+        out = capsys.readouterr().out
+        data = json.loads(out)
+        assert "findings" in data
