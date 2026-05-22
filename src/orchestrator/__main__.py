@@ -1643,6 +1643,7 @@ def _handle_project_status(args, store: ProjectSessionStore) -> None:
     session = store.load_session(pid)
     milestones = store.load_milestones(pid)
     decisions = store.load_decisions(pid, limit=10)
+    approvals = store.load_approvals(pid)
 
     # Determine current milestone detail
     current_ms = None
@@ -1650,6 +1651,10 @@ def _handle_project_status(args, store: ProjectSessionStore) -> None:
         if m.milestone_id == session.current_milestone:
             current_ms = m.to_dict()
             break
+
+    pending_approvals = [
+        a.to_dict() for a in approvals if a.status == "awaiting_approval"
+    ]
 
     output = {
         "project_id": session.project_id,
@@ -1660,6 +1665,7 @@ def _handle_project_status(args, store: ProjectSessionStore) -> None:
         "current_milestone": current_ms,
         "completed_milestones": session.completed_milestones,
         "pending_decisions": session.pending_decisions,
+        "pending_approvals": pending_approvals,
         "open_risks": session.open_risks,
         "recent_decisions": [d.to_dict() for d in decisions[:5]],
         "next_recommended_action": session.next_recommended_action,
@@ -1683,6 +1689,22 @@ def _read_evidence_json(path_str: str, *, root: Path | None = None) -> dict | No
         return json.loads(p.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError):
         return None
+
+
+def _evidence_label(evidence_dict: dict | None, key: str) -> str:
+    """Return ``[observed]`` or ``[reported]`` for an evidence key.
+
+    Looks up *key* in the evidence_status items written by the evidence
+    classifier.  Returns ``[reported]`` when the classification is not
+    available (default: trust nothing without classifier confirmation).
+    """
+    if evidence_dict is None:
+        return "[reported]"
+    items = evidence_dict.get("evidence_status", {}).get("items", [])
+    for item in items:
+        if isinstance(item, dict) and item.get("key") == key:
+            return f"[{item['status']}]"
+    return "[reported]"
 
 
 def _search_decisions(
@@ -1757,14 +1779,16 @@ def _handle_project_ask(args, store: ProjectSessionStore) -> None:
             evidence.append(f"Milestone {ms.milestone_id}")
         run_links = store.load_run_links(pid)
         changed_seen: set[str] = set()
+        obs_label = "[reported]"
         for link in run_links:
             ev = _read_evidence_json(link.evidence_path, root=store._root)
             if ev:
                 cf = ev.get("changed_files", [])
                 if isinstance(cf, list):
                     changed_seen.update(str(f) for f in cf)
+                obs_label = _evidence_label(ev, "changed_files")
         if changed_seen:
-            answer += f" Files changed across runs: {', '.join(sorted(changed_seen))}."
+            answer += f" Files changed across runs ({obs_label}): {', '.join(sorted(changed_seen))}."
             evidence.extend(
                 link.evidence_path for link in run_links if link.evidence_path
             )
@@ -1782,9 +1806,9 @@ def _handle_project_ask(args, store: ProjectSessionStore) -> None:
             if ev:
                 test_out = ev.get("test_output", "")
                 if test_out:
-                    # Show first 500 chars of test output
+                    label = _evidence_label(ev, "test_output")
                     snippet = test_out[:500]
-                    answer = f"Test output from {link.run_id}: {snippet}"
+                    answer = f"Test output from {link.run_id} ({label}): {snippet}"
                     evidence.append(link.evidence_path)
                     found = True
                     break
@@ -1805,15 +1829,16 @@ def _handle_project_ask(args, store: ProjectSessionStore) -> None:
                 rf = ev.get("review_findings", [])
                 if rf:
                     findings_found = True
+                    label = _evidence_label(ev, "review_findings")
                     if isinstance(rf, list) and len(rf) > 0:
                         item = rf[0]
                         if isinstance(item, dict):
                             answer = (
-                                f"Reviewer finding in {link.run_id}: "
+                                f"Reviewer finding in {link.run_id} ({label}): "
                                 f"[{item.get('severity', '?')}] {item.get('description', str(item))}"
                             )
                         else:
-                            answer = f"Reviewer findings in {link.run_id}: {len(rf)} finding(s)."
+                            answer = f"Reviewer findings in {link.run_id} ({label}): {len(rf)} finding(s)."
                     evidence.append(link.evidence_path)
                     break
         if not findings_found:
@@ -1824,6 +1849,7 @@ def _handle_project_ask(args, store: ProjectSessionStore) -> None:
     elif any(kw in question_lower for kw in ("修了几轮", "repair", "修复", "修了")):
         run_links = store.load_run_links(pid)
         repair_info: list[str] = []
+        audit_label = "[reported]"
         for link in run_links:
             if link.audit_path:
                 audit = _read_evidence_json(link.audit_path, root=store._root)
@@ -1832,8 +1858,9 @@ def _handle_project_ask(args, store: ProjectSessionStore) -> None:
                     if rounds is not None:
                         repair_info.append(f"{link.run_id}: {rounds} round(s)")
                         evidence.append(link.audit_path)
+                        audit_label = _evidence_label(audit, "repair_rounds")
         if repair_info:
-            answer = f"Repair history: {'; '.join(repair_info)}."
+            answer = f"Repair history ({audit_label}): {'; '.join(repair_info)}."
         else:
             answer = "No repair history available — no audit reports with repair data found."
             evidence.extend(
@@ -1856,14 +1883,30 @@ def _handle_project_ask(args, store: ProjectSessionStore) -> None:
 
     # ---- Unknown ----
     else:
+        # Build targeted artifact suggestions based on question keywords.
+        # These keywords must NOT overlap with the known-branch keywords above
+        # so that only genuinely unhandled questions reach this path.
+        suggested_paths: list[str] = []
+        if any(kw in question_lower for kw in ("history", "记录", "log", "decision", "choice", "选择")):
+            suggested_paths.append(f"  - .aao/sessions/{pid}/decision_log.jsonl (design decisions)")
+        if any(kw in question_lower for kw in ("progress", "status", "state", "进度", "状态")):
+            suggested_paths.append(f"  - .aao/sessions/{pid}/milestones.json (milestone state)")
+        if any(kw in question_lower for kw in ("execution", "执行", "timeline", "时间线")):
+            suggested_paths.append(f"  - .aao/sessions/{pid}/run_links.jsonl (execution runs)")
+        if any(kw in question_lower for kw in ("approval", "approve", "pending", "审批", "待审批")):
+            suggested_paths.append(f"  - .aao/sessions/{pid}/session.json (approval state)")
+        if not suggested_paths:
+            suggested_paths = [
+                f"  - .aao/sessions/{pid}/decision_log.jsonl (design decisions)",
+                f"  - .aao/sessions/{pid}/run_links.jsonl (execution runs)",
+                f"  - .aao/sessions/{pid}/milestones.json (milestone state)",
+                f"  - .aao/sessions/{pid}/session.json (project state)",
+            ]
         answer = (
             f"No recorded information found for this question. "
             f"Suggest checking these artifact paths:\n"
-            f"  - .aao/sessions/{pid}/decision_log.jsonl (design decisions)\n"
-            f"  - .aao/sessions/{pid}/run_links.jsonl (execution runs)\n"
-            f"  - .aao/sessions/{pid}/milestones.json (milestone state)\n"
-            f"  - .aao/sessions/{pid}/session.json (project state)\n"
-            f"To make this answerable in the future, ensure the relevant "
+            + "\n".join(suggested_paths) +
+            f"\nTo make this answerable in the future, ensure the relevant "
             f"phase records this data in DecisionLog, evidence artifacts, "
             f"or milestone summaries."
         )

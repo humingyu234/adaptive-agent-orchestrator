@@ -363,6 +363,7 @@ class TestCLIHandlers:
         assert data["project_id"] == session.project_id
         assert data["goal"] == "Test project"
         assert data["current_milestone"] is not None
+        assert "pending_approvals" in data
 
     def test_project_ask_answers_from_decision_log(self, tmp_store, capsys):
         session = _create_active_session(tmp_store)
@@ -662,6 +663,111 @@ class TestCLIHandlers:
         assert "pending_approvals" in data
         assert "completed_milestones" in data
         assert "next_recommended_action" in data
+
+    def test_unknown_question_gives_targeted_paths_by_keyword(self, tmp_store, capsys):
+        """Unknown questions should suggest artifact paths relevant to the question topic."""
+        session = _create_active_session(tmp_store)
+
+        from orchestrator.__main__ import _handle_project_ask
+
+        # Question about "history" → should suggest decision_log but not all paths
+        class FakeArgs:
+            project_id = session.project_id
+            question = "What is the project history?"
+
+        _handle_project_ask(FakeArgs(), tmp_store)
+        out = capsys.readouterr().out
+        data = json.loads(out)
+        assert "decision_log.jsonl" in data["answer"]
+        # Should NOT contain unrelated paths
+        assert "run_links.jsonl" not in data["answer"]
+        assert "milestones.json" not in data["answer"]
+
+        # Question about "execution" → should suggest run_links
+        class FakeArgs2:
+            project_id = session.project_id
+            question = "Show me the execution timeline?"
+
+        _handle_project_ask(FakeArgs2(), tmp_store)
+        out2 = capsys.readouterr().out
+        data2 = json.loads(out2)
+        assert "run_links.jsonl" in data2["answer"]
+        assert "decision_log.jsonl" not in data2["answer"]
+
+    def test_reviewer_findings_include_evidence_label(self, tmp_store, capsys):
+        """Reviewer findings answer must include [observed] or [reported] label."""
+        session = _create_active_session(tmp_store)
+        pid = session.project_id
+
+        # Create evidence file with review_findings
+        link = tmp_store.load_run_links(pid)[0]
+        ev_path = Path(tmp_store._root) / link.evidence_path
+        ev_path.parent.mkdir(parents=True, exist_ok=True)
+        ev_path.write_text(json.dumps({
+            "review_findings": [
+                {"severity": "P1", "description": "Missing error handling"}
+            ],
+        }), encoding="utf-8")
+
+        from orchestrator.__main__ import _handle_project_ask
+
+        class FakeArgs:
+            project_id = pid
+            question = "What did the reviewer find?"
+
+        _handle_project_ask(FakeArgs(), tmp_store)
+        out = capsys.readouterr().out
+        data = json.loads(out)
+        # Must have an evidence label
+        assert "[observed]" in data["answer"] or "[reported]" in data["answer"]
+        assert "P1" in data["answer"]
+
+    def test_repair_history_includes_evidence_label(self, tmp_store, capsys):
+        """Repair history answer must include [observed] or [reported] label."""
+        session = _create_active_session(tmp_store)
+        pid = session.project_id
+
+        # Create audit file with repair_rounds
+        link = tmp_store.load_run_links(pid)[0]
+        audit_path = Path(tmp_store._root) / link.audit_path
+        audit_path.parent.mkdir(parents=True, exist_ok=True)
+        audit_path.write_text(json.dumps({
+            "repair_rounds": 2,
+        }), encoding="utf-8")
+
+        from orchestrator.__main__ import _handle_project_ask
+
+        class FakeArgs:
+            project_id = pid
+            question = "How many repair rounds?"
+
+        _handle_project_ask(FakeArgs(), tmp_store)
+        out = capsys.readouterr().out
+        data = json.loads(out)
+        assert "[observed]" in data["answer"] or "[reported]" in data["answer"]
+        assert "2 round(s)" in data["answer"]
+
+    def test_status_includes_pending_approvals_field(self, tmp_store, capsys):
+        """project status must include pending_approvals list."""
+        session = _create_active_session(tmp_store)
+        pid = session.project_id
+        ms = tmp_store.get_current_milestone(pid)
+
+        # Submit for approval to create a pending approval record
+        tmp_store.submit_for_approval(pid, ms.milestone_id)
+
+        from orchestrator.__main__ import _handle_project_status
+
+        class FakeArgs:
+            project_id = pid
+
+        _handle_project_status(FakeArgs(), tmp_store)
+        out = capsys.readouterr().out
+        data = json.loads(out)
+        assert "pending_approvals" in data
+        assert isinstance(data["pending_approvals"], list)
+        assert len(data["pending_approvals"]) == 1
+        assert data["pending_approvals"][0]["status"] == "awaiting_approval"
 
     def test_resolve_project_id_uses_latest_active(self, tmp_store):
         from orchestrator.__main__ import _resolve_project_id
