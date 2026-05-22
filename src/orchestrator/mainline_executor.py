@@ -64,6 +64,7 @@ class MainlineResult:
     evidence_status: dict[str, Any] | None = None
     control_decisions: list[dict[str, Any]] = field(default_factory=list)
     repair_rounds: list[dict[str, Any]] = field(default_factory=list)
+    review_findings: list[dict[str, Any]] = field(default_factory=list)
     report_path: str = ""
     evidence_path: str = ""
     worker_packet_path: str = ""
@@ -82,6 +83,7 @@ class MainlineResult:
             "evidence_status": self.evidence_status,
             "control_decisions": self.control_decisions,
             "repair_rounds": self.repair_rounds,
+            "review_findings": self.review_findings,
             "report_path": self.report_path,
             "evidence_path": self.evidence_path,
             "worker_packet_path": self.worker_packet_path,
@@ -114,10 +116,12 @@ class MainlineExecutor:
         project_root: Path | None = None,
         *,
         policy: Policy | None = None,
+        reviewer: Any = None,
     ) -> None:
         self.project_root = project_root or Path.cwd()
         self._policy = policy or self._load_policy()
         self._repair_loop = AutoRepairLoop(max_attempts=2)
+        self._reviewer = reviewer  # None → use RuleBasedReviewer at call time
 
     @staticmethod
     def _load_policy() -> Policy:
@@ -316,7 +320,7 @@ class MainlineExecutor:
                     category=primary.failure_category,
                     location=affected_file,
                 )
-                repair_result = self._try_auto_repair(
+                repair_result, fix_packet = self._try_auto_repair(
                     finding=finding,
                     worker_mode=worker_mode,
                 )
@@ -331,6 +335,110 @@ class MainlineExecutor:
                             ),
                         )
                     ] + [d for d in all_control_decisions if d.passed]
+                    # Point follow-up inspection (Phase 23 reviewer) at the
+                    # fix evidence, not the stale original packet.
+                    if fix_packet is not None:
+                        packet = fix_packet
+
+        # 6c. Phase 23: run reviewer on observed evidence
+        #
+        # The reviewer inspects the same on-disk evidence the control plane
+        # checked (diff, test output, result.md).  It produces ReviewFindings
+        # that are independent of worker self-assessments.  Blocking findings
+        # trigger a bounded auto-repair attempt; non-blocking ones are recorded.
+        review_finding_dicts: list[dict[str, Any]] = []
+        if worker_mode != "packet":
+            review_findings = self._run_reviewer(packet)
+            for finding in review_findings:
+                finding_dict: dict[str, Any] = {
+                    "finding_id": finding.finding_id,
+                    "step_id": finding.step_id,
+                    "severity": finding.severity,
+                    "category": finding.category,
+                    "description": finding.description,
+                    "location": finding.location,
+                    "suggested_fix": finding.suggested_fix,
+                    "source": finding.source,
+                }
+                if finding.is_blocking:
+                    repair_result, _fix_pkt = self._try_auto_repair(
+                        finding=finding,
+                        worker_mode=worker_mode,
+                    )
+                    repair_rounds.extend([r.to_dict() for r in repair_result.rounds])
+                    finding_dict["repair_result"] = repair_result.status
+                    finding_dict["repair_status"] = (
+                        "fixed" if repair_result.is_fixed else "still_failing"
+                    )
+                else:
+                    finding_dict["repair_status"] = "recorded"
+                review_finding_dicts.append(finding_dict)
+
+            # Escalate unrepaired blocking reviewer findings to human review.
+            # These are evidence-level issues the auto-repair loop could not fix.
+            unrepaired = [
+                f for f in review_finding_dicts
+                if f.get("severity") == "blocking" and f.get("repair_status") != "fixed"
+            ]
+            if unrepaired:
+                all_control_decisions = all_control_decisions + [
+                    ControlDecision(
+                        passed=False,
+                        action="needs_human_review",
+                        reason=(
+                            f"Reviewer found {len(unrepaired)} unrepaired blocking "
+                            f"issue(s): "
+                            + "; ".join(
+                                f["description"][:80] for f in unrepaired[:3]
+                            )
+                        ),
+                        severity="high",
+                        failure_category="task_quality_error",
+                        failure_origin="control_plane",
+                        recovery_hint="needs_human_review",
+                    )
+                ]
+
+            # 6d. Phase 30: Layer 2 — Codex LLM reviewer (conditional)
+            #
+            # The Codex reviewer in a read-only sandbox provides a semantic
+            # second opinion.  It is only invoked when the risk/cost trade-off
+            # justifies the extra LLM call (large task, high risk, or Layer 1
+            # found issues).  When unavailable or skipped, the pipeline
+            # continues without it.
+            if worker_mode != "fake" and self._should_invoke_codex_reviewer(
+                task_size=getattr(plan, "task_size", "medium"),
+                risk_level=packet.risk_level,
+                rule_findings=list(review_findings),
+                repair_history=repair_rounds if repair_rounds else None,
+            ):
+                codex_findings = self._run_codex_reviewer(packet)
+                for finding in codex_findings:
+                    cf_dict: dict[str, Any] = {
+                        "finding_id": finding.finding_id,
+                        "step_id": finding.step_id or packet.task_id,
+                        "severity": finding.severity,
+                        "category": finding.category,
+                        "description": finding.description,
+                        "location": finding.location,
+                        "suggested_fix": finding.suggested_fix,
+                        "source": "codex_reviewer",
+                    }
+                    if finding.is_blocking:
+                        repair_result, _fp = self._try_auto_repair(
+                            finding=finding,
+                            worker_mode=worker_mode,
+                        )
+                        repair_rounds.extend(
+                            [r.to_dict() for r in repair_result.rounds]
+                        )
+                        cf_dict["repair_result"] = repair_result.status
+                        cf_dict["repair_status"] = (
+                            "fixed" if repair_result.is_fixed else "still_failing"
+                        )
+                    else:
+                        cf_dict["repair_status"] = "recorded"
+                    review_finding_dicts.append(cf_dict)
 
         # 7. Generate audit report
         report_path, evidence_path = self._generate_report(
@@ -367,6 +475,7 @@ class MainlineExecutor:
             evidence_status=_evidence_status_to_dict(final_evidence_status),
             control_decisions=[_decision_to_dict(d) for d in all_control_decisions],
             repair_rounds=repair_rounds,
+            review_findings=review_finding_dicts,
             report_path=str(report_path),
             evidence_path=str(evidence_path),
             worker_packet_path=str(packet.packet_root),
@@ -580,43 +689,33 @@ class MainlineExecutor:
         *,
         finding: ReviewFinding,
         worker_mode: str = "fake",
-    ) -> Any:
+    ) -> tuple[Any, WorkerTaskPacket | None]:
         """Attempt the auto-repair loop for a single blocking finding.
 
-        During dispatch, the FixTask's WorkerTaskPacket is captured so the
-        verify step can re-run test-output and evidence checks — not just an
-        empty ControlPlane evaluation.
+        Returns (repair_result, last_fix_packet).  *last_fix_packet* is the
+        WorkerTaskPacket from the final repair round, so the caller can
+        direct follow-up inspection (e.g. Phase 23 reviewer) at the fixed
+        evidence instead of the stale original packet.
         """
-        # Capture packets as they are dispatched so verify_fn can use them
-        # for on-disk test-output and evidence checks.
         packets: list[WorkerTaskPacket] = []
 
         def _dispatch(fix_task: FixTask) -> dict[str, Any]:
-            packet = self._fix_task_to_packet(fix_task)
-            packets.append(packet)
-            return self._execute_worker(packet, worker_mode=worker_mode)
+            fix_packet = self._fix_task_to_packet(fix_task)
+            packets.append(fix_packet)
+            return self._execute_worker(fix_packet, worker_mode=worker_mode)
 
         def _verify(result: dict[str, Any]) -> bool:
             if not packets:
                 return False
             return self._verify_fix(result, packets[-1])
 
-        return self._repair_loop.attempt_repair(
+        repair_result = self._repair_loop.attempt_repair(
             finding,
             dispatch_fn=_dispatch,
             verify_fn=_verify,
             target_file=finding.location,
         )
-
-    def _execute_fix_task(
-        self,
-        fix_task: FixTask,
-        *,
-        worker_mode: str = "fake",
-    ) -> dict[str, Any]:
-        """Build a WorkerTaskPacket from a FixTask and dispatch it."""
-        packet = self._fix_task_to_packet(fix_task)
-        return self._execute_worker(packet, worker_mode=worker_mode)
+        return repair_result, packets[-1] if packets else None
 
     def _verify_fix(
         self,
@@ -664,6 +763,149 @@ class MainlineExecutor:
             risk_level="low",
             run_mode="controlled",
         )
+
+    # ------------------------------------------------------------------
+    # Phase 23 — Isolated Reviewer
+    # ------------------------------------------------------------------
+
+    def _run_reviewer(self, packet: WorkerTaskPacket) -> list[ReviewFinding]:
+        """Run the reviewer on a completed packet's observed evidence.
+
+        Builds an EvidenceBundle from on-disk files (diff, test output,
+        result.md) and runs the configured reviewer (default: RuleBasedReviewer).
+        The reviewer receives a read-only snapshot — it cannot mutate the
+        packet or write code.
+        """
+        from .reviewer import EvidenceBundle, RuleBasedReviewer
+
+        # Read observed evidence from packet
+        diff_path = packet.packet_root / PacketFiles.DIFF
+        test_output_path = packet.packet_root / PacketFiles.TEST_OUTPUT
+        result_md_path = packet.packet_root / PacketFiles.RESULT
+
+        diff_content = ""
+        if diff_path.exists():
+            diff_content = diff_path.read_text(encoding="utf-8", errors="replace")
+
+        test_output = ""
+        if test_output_path.exists():
+            test_output = test_output_path.read_text(encoding="utf-8", errors="replace")
+
+        result_md = ""
+        if result_md_path.exists():
+            result_md = result_md_path.read_text(encoding="utf-8", errors="replace")
+
+        evidence_status = classify_worker_evidence_from_packet(packet)
+
+        bundle = EvidenceBundle.from_packet(
+            task_id=packet.task_id,
+            step_id=packet.task_id,
+            changed_files=evidence_status.changed_files,
+            diff_content=diff_content,
+            test_output=test_output,
+            result_md=result_md,
+            allowed_files=packet.allowed_files,
+            denied_files=packet.denied_files,
+            required_checks=packet.required_checks,
+            worker_status=evidence_status.worker_status,
+        )
+
+        reviewer = self._reviewer or RuleBasedReviewer()
+        return reviewer.review(bundle)
+
+    # ------------------------------------------------------------------
+    # Phase 30 — Codex LLM Reviewer (Layer 2)
+    # ------------------------------------------------------------------
+
+    def _run_codex_reviewer(
+        self, packet: WorkerTaskPacket,
+    ) -> list[ReviewFinding]:
+        """Run Codex CLI read-only sandbox reviewer on the packet evidence.
+
+        Returns findings from the Codex review.  Returns empty list when
+        Codex is unavailable or the review fails — the caller treats this
+        as "no additional findings."
+        """
+        from .reviewer import CodexReviewer, EvidenceBundle
+
+        diff_path = packet.packet_root / PacketFiles.DIFF
+        test_output_path = packet.packet_root / PacketFiles.TEST_OUTPUT
+        result_md_path = packet.packet_root / PacketFiles.RESULT
+
+        diff_content = ""
+        if diff_path.exists():
+            diff_content = diff_path.read_text(encoding="utf-8", errors="replace")
+
+        test_output = ""
+        if test_output_path.exists():
+            test_output = test_output_path.read_text(encoding="utf-8", errors="replace")
+
+        result_md = ""
+        if result_md_path.exists():
+            result_md = result_md_path.read_text(encoding="utf-8", errors="replace")
+
+        evidence_status = classify_worker_evidence_from_packet(packet)
+
+        bundle = EvidenceBundle.from_packet(
+            task_id=packet.task_id,
+            step_id=packet.task_id,
+            changed_files=evidence_status.changed_files,
+            diff_content=diff_content,
+            test_output=test_output,
+            result_md=result_md,
+            allowed_files=packet.allowed_files,
+            denied_files=packet.denied_files,
+            required_checks=packet.required_checks,
+            worker_status=evidence_status.worker_status,
+        )
+
+        reviewer = CodexReviewer()
+        return reviewer.review(bundle)
+
+    @staticmethod
+    def _should_invoke_codex_reviewer(
+        *,
+        task_size: str = "medium",
+        risk_level: str = "low",
+        rule_findings: list[ReviewFinding] | None = None,
+        repair_history: list[dict[str, Any]] | None = None,
+    ) -> bool:
+        """Determine whether Layer 2 (Codex LLM) review is warranted.
+
+        Layer 2 is additive to Layer 1 (RuleBasedReviewer) and is only
+        triggered when the risk/cost trade-off justifies an extra LLM call.
+
+        Always-trigger conditions:
+          - task_size == "large"
+          - risk_level == "high"
+
+        Suspicious-signal triggers:
+          - Layer 1 found ANY finding (rules fired — worth a second look)
+          - Previous repair round failed then current one "passed"
+        """
+        # Hard gate: codex must be on PATH
+        import shutil
+        if not shutil.which("codex"):
+            return False
+
+        # Always invoke for high-stakes work
+        if task_size == "large" or risk_level == "high":
+            return True
+
+        # Layer 1 found something — worth a semantic second opinion
+        if rule_findings:
+            return True
+
+        # Repair history: failed then "passed" — suspicious
+        if repair_history and len(repair_history) >= 2:
+            recent = repair_history[-2:]
+            if (
+                recent[0].get("retest_result") == "failed"
+                and recent[-1].get("retest_result") == "passed"
+            ):
+                return True
+
+        return False
 
     # ------------------------------------------------------------------
     # LangGraph backend

@@ -1,0 +1,40 @@
+{
+  "type": "object",
+  "properties": {
+    "findings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "severity": {
+            "enum": ["blocking", "non_blocking", "info"]
+          },
+          "category": {
+            "type": "string",
+            "description": "e.g. test_failure, evidence_contradiction, protected_action, logic_error, incomplete_fix"
+          },
+          "description": {
+            "type": "string",
+            "description": "What is wrong, citing concrete evidence"
+          },
+          "location": {
+            "type": "string",
+            "description": "file:line or evidence path, e.g. src/utils.py:42 or observed/test_output.txt"
+          },
+          "suggested_fix": {
+            "type": "string",
+            "description": "One-sentence suggestion for how to fix"
+          }
+        },
+        "required": ["severity", "category", "description", "location"],
+        "additionalProperties": false
+      }
+    },
+    "overall_pass": {
+      "type": "boolean",
+      "description": "true if no blocking issues found"
+    }
+  },
+  "required": ["findings", "overall_pass"],
+  "additionalProperties": false
+}
