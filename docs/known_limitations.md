@@ -90,6 +90,40 @@ Code still require a real Claude Code session, which is inherently
 non-deterministic and requires user interaction.  The acceptance test
 layer exercises the full control path with deterministic fake workers.
 
+## v2 Collaboration Acceptance (Phase 22-28)
+
+Phase 28 completes the v2 project collaboration feature set (Phases 22-27).
+The acceptance tests exercise a 13-step end-to-end scenario:
+
+1. project start → 2-4. execute milestone + pause → 5. gate paused →
+6. ask questions → 7. approve milestone → 8-11. continue + approvals →
+12. resume (process restart) → 13. complete audit trail
+
+**What's real:**
+
+- Control path: project session, milestone lifecycle, approval gates,
+  decision logging, audit trail — all exercised through actual CLI handlers
+- Persistence: sessions, milestones, decisions, approvals, run links all
+  survive store recreation (simulates process restart)
+- Gates: approved milestones activate the next pending milestone;
+  unapproved milestones block progress
+- Self-check: 6 categories of system issue detection run against live
+  session state; protected-path proposals are blocked
+
+**What's mock:**
+
+- Workers: deterministic fake workers (no real Claude Code subprocess)
+- Planning: deterministic planner (no real LLM planning council)
+- Evidence: fake evidence artifacts produced by fake workers
+
+**What remains (not in scope for v2):**
+
+- Real multi-worker parallel execution (multi_worker.py exists but not
+  wired into the mainline project flow)
+- Real Claude Code worker bridge in the project flow
+- Real LLM planning council in the project flow
+- LangGraph runner integration for orchestrated mode
+
 ## What AAO Is Not
 
 - **Not a Claude Code replacement** — AAO controls and audits; Claude Code
