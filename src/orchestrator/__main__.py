@@ -232,6 +232,7 @@ def main() -> None:
     project_continue_parser.add_argument("--worker-mode", choices=["fake", "packet", "claude-code"], default="claude-code", help="Worker execution mode (default: claude-code)")
     project_continue_parser.add_argument("--planning-mode", choices=["deterministic", "llm"], default="llm", help="Planning Council mode (default: llm)")
     project_continue_parser.add_argument("--max-workers", type=int, default=2, help="Maximum concurrent workers (default: 2)")
+    project_continue_parser.add_argument("--execution-backend", choices=["native", "langgraph"], default="native", help="Execution backend: native (MultiWorkerExecutor) or langgraph (LangGraphRunner)")
 
     project_close_parser = project_subparsers.add_parser("close", help="Close the current project")
     project_close_parser.add_argument("--project-id", help="Project ID (uses latest active if omitted)")
@@ -1987,6 +1988,7 @@ def _handle_project_continue(args, store: ProjectSessionStore) -> None:
     worker_mode = getattr(args, "worker_mode", "claude-code")
     planning_mode = getattr(args, "planning_mode", "llm")
     max_workers = getattr(args, "max_workers", 2)
+    execution_backend = getattr(args, "execution_backend", "native")
 
     from .planning import PlanContract
     plan = PlanContract(
@@ -2001,7 +2003,10 @@ def _handle_project_continue(args, store: ProjectSessionStore) -> None:
 
     # Execute via MainlineExecutor
     executor = MainlineExecutor(Path.cwd())
-    result = executor.execute(plan, worker_mode=worker_mode, max_workers=max_workers)
+    result = executor.execute(
+        plan, worker_mode=worker_mode, max_workers=max_workers,
+        execution_backend=execution_backend,
+    )
 
     # Link the run to the current milestone
     run_link = ProjectRunLink(
