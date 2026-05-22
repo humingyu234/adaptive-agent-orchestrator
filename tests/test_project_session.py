@@ -14,6 +14,7 @@ import pytest
 
 from orchestrator.project_session import (
     DecisionLog,
+    MilestoneApproval,
     ProjectMilestone,
     ProjectRunLink,
     ProjectSession,
@@ -409,7 +410,9 @@ class TestCLIHandlers:
         assert "next_recommended_action" in str(data["evidence"])
 
     def test_project_continue_resumes_active(self, tmp_store, capsys):
+        """After continue + successful execution, session is paused_for_approval."""
         session = _create_active_session(tmp_store)
+        pid = session.project_id
         # Pause first
         session.status = "paused"
         tmp_store.save_session(session)
@@ -417,12 +420,51 @@ class TestCLIHandlers:
         from orchestrator.__main__ import _handle_project_continue
 
         class FakeArgs:
-            project_id = session.project_id
+            project_id = pid
 
         _handle_project_continue(FakeArgs(), tmp_store)
         out = capsys.readouterr().out
         data = json.loads(out)
-        assert data["status"] == "active"
+
+        # After successful fake-worker execution, submit_for_approval pauses the session
+        assert data["run_id"]
+        s = tmp_store.load_session(pid)
+        assert s.status == "paused"  # gate tripped
+
+        # Run link must be created
+        links = tmp_store.load_run_links(pid)
+        run_links = [l for l in links if l.run_id == data["run_id"]]
+        assert len(run_links) == 1
+
+        # Decision must be logged
+        decisions = tmp_store.load_decisions(pid)
+        resume_decisions = [d for d in decisions if "Resumed execution" in d.decision]
+        assert len(resume_decisions) >= 1
+
+        # Milestone must be paused_for_approval
+        ms = tmp_store.get_current_milestone(pid)
+        assert ms is not None
+        assert ms.status == "paused_for_approval"
+
+    def test_project_continue_paused_for_approval_is_blocked(self, tmp_store, capsys):
+        """When milestone is already paused_for_approval, continue is blocked."""
+        session = _create_active_session(tmp_store)
+        pid = session.project_id
+        ms = tmp_store.get_current_milestone(pid)
+
+        # Submit for approval to trigger the gate
+        tmp_store.submit_for_approval(pid, ms.milestone_id)
+
+        from orchestrator.__main__ import _handle_project_continue
+
+        class FakeArgs:
+            project_id = pid
+
+        _handle_project_continue(FakeArgs(), tmp_store)
+        out = capsys.readouterr().out
+        data = json.loads(out)
+        assert data["status"] == "paused_for_approval"
+        assert "waiting for approval" in data["_note"].lower()
 
     def test_project_close_marks_completed(self, tmp_store, capsys):
         session = _create_active_session(tmp_store)
@@ -462,7 +504,8 @@ class TestCLIHandlers:
         _handle_project_ask(FakeArgs(), tmp_store)
         out = capsys.readouterr().out
         data = json.loads(out)
-        assert "error" in data or "No active" in data.get("answer", "")
+        assert "error" in data
+        assert "not found" in data["error"].lower() or "nonexistent" in data["error"]
 
     def test_project_ask_about_risks(self, tmp_store, capsys):
         session = _create_active_session(tmp_store)
@@ -529,3 +572,398 @@ class TestCLIHandlers:
         pid, reason = _resolve_project_id(tmp_store, explicit="nonexistent")
         assert pid is None
         assert reason == "explicit_not_found"
+
+
+# =============================================================================
+# Phase 25 — Milestone Gate / Human Approval
+# =============================================================================
+
+
+class TestMilestoneGate:
+    """Milestone gate: submit → human decision → advance/re-block/re-execute."""
+
+    def test_submit_for_approval_creates_record_and_pauses(self, tmp_store):
+        session = _create_active_session(tmp_store)
+        ms = tmp_store.get_current_milestone(session.project_id)
+
+        approval = tmp_store.submit_for_approval(
+            session.project_id,
+            ms.milestone_id,
+            evidence_summary="Built feature X",
+            files_changed=["src/x.py"],
+            test_results_summary="5 passed",
+            reviewer_findings=["minor: docstring missing"],
+            repair_history=["round-1: fixed import"],
+            open_risks=["performance regression risk"],
+        )
+
+        assert approval is not None
+        assert approval.status == "awaiting_approval"
+        assert approval.evidence_summary == "Built feature X"
+        assert approval.files_changed == ["src/x.py"]
+
+        # Milestone should be paused_for_approval, NOT completed
+        ms_refreshed = tmp_store.get_current_milestone(session.project_id)
+        assert ms_refreshed is not None
+        assert ms_refreshed.status == "paused_for_approval"
+
+        # Session should be paused
+        s = tmp_store.load_session(session.project_id)
+        assert s.status == "paused"
+
+    def test_milestone_completed_does_not_auto_continue_to_next(self, tmp_store):
+        """Gate requirement: completing execution must pause, not auto-advance."""
+        session = _create_active_session(tmp_store)
+        pid = session.project_id
+
+        # Add a second pending milestone
+        ms2 = ProjectMilestone(
+            milestone_id="ms-2", name="Second milestone",
+            description="Phase 2", status="pending",
+        )
+        all_ms = tmp_store.load_milestones(pid)
+        tmp_store.save_milestones(pid, all_ms + [ms2])
+
+        ms1 = tmp_store.get_current_milestone(pid)
+        tmp_store.submit_for_approval(pid, ms1.milestone_id)
+
+        # ms1 must be paused_for_approval, ms2 must still be pending
+        ms_list = tmp_store.load_milestones(pid)
+        ms1_data = next(m for m in ms_list if m.milestone_id == ms1.milestone_id)
+        ms2_data = next(m for m in ms_list if m.milestone_id == "ms-2")
+        assert ms1_data.status == "paused_for_approval"
+        assert ms2_data.status == "pending"
+
+    def test_approve_unlocks_next_milestone(self, tmp_store):
+        session = _create_active_session(tmp_store)
+        pid = session.project_id
+        ms1 = tmp_store.get_current_milestone(pid)
+
+        # Add a second pending milestone
+        ms2 = ProjectMilestone(
+            milestone_id="ms-2", name="Second milestone",
+            description="Phase 2", status="pending",
+        )
+        all_ms = tmp_store.load_milestones(pid)
+        tmp_store.save_milestones(pid, all_ms + [ms2])
+
+        # Submit and then approve
+        tmp_store.submit_for_approval(pid, ms1.milestone_id)
+        approval = tmp_store.approve_milestone(pid, ms1.milestone_id)
+
+        assert approval is not None
+        assert approval.status == "approved"
+        assert approval.approved_by == "human"
+
+        # ms1 should now be completed
+        ms_list = tmp_store.load_milestones(pid)
+        ms1_data = next(m for m in ms_list if m.milestone_id == ms1.milestone_id)
+        assert ms1_data.status == "completed"
+        assert ms1.milestone_id in tmp_store.load_session(pid).completed_milestones
+
+        # ms2 should now be in_progress
+        ms2_data = next(m for m in ms_list if m.milestone_id == "ms-2")
+        assert ms2_data.status == "in_progress"
+
+        # session should be active
+        s = tmp_store.load_session(pid)
+        assert s.status == "active"
+
+    def test_approve_last_milestone_clears_current_and_completes_session(self, tmp_store):
+        """When the last milestone is approved, current_milestone → None, session → completed."""
+        session = _create_active_session(tmp_store)
+        pid = session.project_id
+        ms = tmp_store.get_current_milestone(pid)
+
+        # This is the ONLY milestone — no more pending
+        tmp_store.submit_for_approval(pid, ms.milestone_id)
+        tmp_store.approve_milestone(pid, ms.milestone_id)
+
+        s = tmp_store.load_session(pid)
+        assert s.current_milestone is None
+        assert s.status == "completed"
+        assert s.next_recommended_action == "All milestones completed."
+
+    def test_reject_generates_adjustment_task(self, tmp_store):
+        session = _create_active_session(tmp_store)
+        pid = session.project_id
+        ms = tmp_store.get_current_milestone(pid)
+
+        tmp_store.submit_for_approval(pid, ms.milestone_id)
+        approval = tmp_store.reject_milestone(
+            pid, ms.milestone_id, reason="Design doesn't match requirements"
+        )
+
+        assert approval is not None
+        assert approval.status == "rejected"
+        assert "requirements" in approval.rejection_reason
+
+        # Milestone should be blocked
+        ms_refreshed = tmp_store.get_current_milestone(pid)
+        assert ms_refreshed.status == "blocked"
+
+        # Session should note re-plan required
+        s = tmp_store.load_session(pid)
+        assert "Re-plan required" in s.next_recommended_action
+
+    def test_request_changes_enters_repair_path(self, tmp_store):
+        session = _create_active_session(tmp_store)
+        pid = session.project_id
+        ms = tmp_store.get_current_milestone(pid)
+
+        tmp_store.submit_for_approval(pid, ms.milestone_id)
+        approval = tmp_store.request_changes_milestone(
+            pid, ms.milestone_id, notes="Add more test coverage for edge cases"
+        )
+
+        assert approval is not None
+        assert approval.status == "changes_requested"
+        assert "test coverage" in approval.changes_requested_notes
+
+        # Milestone should be back to in_progress for re-execution
+        ms_refreshed = tmp_store.get_current_milestone(pid)
+        assert ms_refreshed.status == "in_progress"
+
+        # Session should be active
+        s = tmp_store.load_session(pid)
+        assert s.status == "active"
+
+    def test_audit_records_human_approval(self, tmp_store):
+        """Approve must log a DecisionLog entry with made_by='human'."""
+        session = _create_active_session(tmp_store)
+        pid = session.project_id
+        ms = tmp_store.get_current_milestone(pid)
+
+        tmp_store.submit_for_approval(pid, ms.milestone_id)
+        tmp_store.approve_milestone(pid, ms.milestone_id)
+
+        decisions = tmp_store.load_decisions(pid)
+        approval_decisions = [
+            d for d in decisions
+            if "Approved milestone" in d.decision and d.made_by == "human"
+        ]
+        assert len(approval_decisions) >= 1
+
+    def test_cannot_skip_gate_even_if_all_checks_pass(self, tmp_store):
+        """Even with perfect evidence, submit_for_approval must pause."""
+        session = _create_active_session(tmp_store)
+        pid = session.project_id
+        ms = tmp_store.get_current_milestone(pid)
+
+        # Simulate "perfect" evidence
+        tmp_store.submit_for_approval(
+            pid, ms.milestone_id,
+            evidence_summary="All checks passed",
+            files_changed=["src/a.py"],
+            test_results_summary="100 passed, 0 failed",
+            reviewer_findings=[],  # no findings = clean
+            repair_history=[],     # no repairs needed
+            open_risks=[],
+        )
+
+        ms_refreshed = tmp_store.get_current_milestone(pid)
+        assert ms_refreshed.status == "paused_for_approval"
+
+        s = tmp_store.load_session(pid)
+        assert s.status == "paused"
+
+    def test_rejection_reason_preserved_in_session(self, tmp_store):
+        session = _create_active_session(tmp_store)
+        pid = session.project_id
+        ms = tmp_store.get_current_milestone(pid)
+
+        tmp_store.submit_for_approval(pid, ms.milestone_id)
+        rejection_reason = "Security review required before proceeding"
+        tmp_store.reject_milestone(pid, ms.milestone_id, reason=rejection_reason)
+
+        # Reason preserved in approval record
+        approvals = tmp_store.load_approvals(pid)
+        assert len(approvals) == 1
+        assert approvals[0].rejection_reason == rejection_reason
+
+        # Reason preserved in decision log
+        decisions = tmp_store.load_decisions(pid)
+        reject_decisions = [d for d in decisions if "Rejected milestone" in d.decision]
+        assert len(reject_decisions) >= 1
+        assert rejection_reason in reject_decisions[0].reason
+
+    def test_approval_required_but_not_given_blocks_all_subsequent_milestones(self, tmp_store):
+        session = _create_active_session(tmp_store)
+        pid = session.project_id
+        ms1 = tmp_store.get_current_milestone(pid)
+
+        # Add two more pending milestones
+        ms2 = ProjectMilestone(
+            milestone_id="ms-2", name="Second", status="pending",
+        )
+        ms3 = ProjectMilestone(
+            milestone_id="ms-3", name="Third", status="pending",
+        )
+        all_ms = tmp_store.load_milestones(pid)
+        tmp_store.save_milestones(pid, all_ms + [ms2, ms3])
+
+        # Submit ms1 for approval but don't approve
+        tmp_store.submit_for_approval(pid, ms1.milestone_id)
+
+        # ms2 and ms3 must still be pending
+        ms_list = tmp_store.load_milestones(pid)
+        ms2_data = next(m for m in ms_list if m.milestone_id == "ms-2")
+        ms3_data = next(m for m in ms_list if m.milestone_id == "ms-3")
+        assert ms2_data.status == "pending"
+        assert ms3_data.status == "pending"
+
+    def test_submit_nonexistent_milestone_returns_none(self, tmp_store):
+        session = _create_active_session(tmp_store)
+        result = tmp_store.submit_for_approval(session.project_id, "nonexistent")
+        assert result is None
+
+    def test_submit_nonexistent_session_returns_none(self, tmp_store):
+        result = tmp_store.submit_for_approval("nonexistent", "ms-1")
+        assert result is None
+
+    def test_approve_nonexistent_returns_none(self, tmp_store):
+        assert tmp_store.approve_milestone("nonexistent", "ms-1") is None
+
+    def test_reject_nonexistent_returns_none(self, tmp_store):
+        assert tmp_store.reject_milestone("nonexistent", "ms-1") is None
+
+    def test_request_changes_nonexistent_returns_none(self, tmp_store):
+        assert tmp_store.request_changes_milestone("nonexistent", "ms-1") is None
+
+
+class TestMilestoneGateCLI:
+    """CLI handlers for milestone approval gate."""
+
+    def test_project_approve_unlocks_next(self, tmp_store, capsys):
+        session = _create_active_session(tmp_store)
+        pid = session.project_id
+        ms = tmp_store.get_current_milestone(pid)
+
+        # Add second milestone and submit for approval
+        ms2 = ProjectMilestone(
+            milestone_id="ms-2", name="Second", status="pending",
+        )
+        all_ms = tmp_store.load_milestones(pid)
+        tmp_store.save_milestones(pid, all_ms + [ms2])
+        tmp_store.submit_for_approval(pid, ms.milestone_id)
+
+        from orchestrator.__main__ import _handle_project_approve
+
+        class FakeArgs:
+            milestone_id = ms.milestone_id
+            project_id = pid
+
+        _handle_project_approve(FakeArgs(), tmp_store)
+        out = capsys.readouterr().out
+        data = json.loads(out)
+        assert data["status"] == "approved"
+        assert data["approved_by"] == "human"
+        assert data["next_milestone"] is not None
+
+    def test_project_reject_with_reason(self, tmp_store, capsys):
+        session = _create_active_session(tmp_store)
+        pid = session.project_id
+        ms = tmp_store.get_current_milestone(pid)
+        tmp_store.submit_for_approval(pid, ms.milestone_id)
+
+        from orchestrator.__main__ import _handle_project_reject
+
+        class FakeArgs:
+            milestone_id = ms.milestone_id
+            project_id = pid
+            reason = "Wrong approach"
+
+        _handle_project_reject(FakeArgs(), tmp_store)
+        out = capsys.readouterr().out
+        data = json.loads(out)
+        assert data["status"] == "rejected"
+        assert data["reason"] == "Wrong approach"
+
+    def test_project_request_changes_with_notes(self, tmp_store, capsys):
+        session = _create_active_session(tmp_store)
+        pid = session.project_id
+        ms = tmp_store.get_current_milestone(pid)
+        tmp_store.submit_for_approval(pid, ms.milestone_id)
+
+        from orchestrator.__main__ import _handle_project_request_changes
+
+        class FakeArgs:
+            milestone_id = ms.milestone_id
+            project_id = pid
+            notes = "Add integration tests"
+
+        _handle_project_request_changes(FakeArgs(), tmp_store)
+        out = capsys.readouterr().out
+        data = json.loads(out)
+        assert data["status"] == "changes_requested"
+        assert "integration tests" in data["notes"]
+
+    def test_project_approve_no_awaiting_record(self, tmp_store, capsys):
+        session = _create_active_session(tmp_store)
+
+        from orchestrator.__main__ import _handle_project_approve
+
+        class FakeArgs:
+            milestone_id = "nonexistent"
+            project_id = session.project_id
+
+        _handle_project_approve(FakeArgs(), tmp_store)
+        out = capsys.readouterr().out
+        data = json.loads(out)
+        assert "error" in data
+
+    def test_project_reject_no_awaiting_record(self, tmp_store, capsys):
+        session = _create_active_session(tmp_store)
+
+        from orchestrator.__main__ import _handle_project_reject
+
+        class FakeArgs:
+            milestone_id = "nonexistent"
+            project_id = session.project_id
+            reason = ""
+
+        _handle_project_reject(FakeArgs(), tmp_store)
+        out = capsys.readouterr().out
+        data = json.loads(out)
+        assert "error" in data
+
+    def test_project_approve_no_session(self, tmp_store, capsys):
+        from orchestrator.__main__ import _handle_project_approve
+
+        class FakeArgs:
+            milestone_id = "ms-1"
+            project_id = "nonexistent"
+
+        _handle_project_approve(FakeArgs(), tmp_store)
+        out = capsys.readouterr().out
+        data = json.loads(out)
+        assert "error" in data or "not found" in data.get("error", "").lower()
+
+    def test_project_continue_after_approval_flow(self, tmp_store, capsys):
+        """Full flow: continue → execute → submit → approve → continue next."""
+        session = _create_active_session(tmp_store)
+        pid = session.project_id
+        ms1 = tmp_store.get_current_milestone(pid)
+
+        # Add second milestone
+        ms2 = ProjectMilestone(
+            milestone_id="ms-2", name="Second", status="pending",
+        )
+        all_ms = tmp_store.load_milestones(pid)
+        tmp_store.save_milestones(pid, all_ms + [ms2])
+
+        # Step 1: Submit for approval (simulating what project continue does after execution)
+        tmp_store.submit_for_approval(pid, ms1.milestone_id)
+        s = tmp_store.load_session(pid)
+        assert s.status == "paused"
+
+        # Step 2: Approve
+        tmp_store.approve_milestone(pid, ms1.milestone_id)
+        s = tmp_store.load_session(pid)
+        assert s.status == "active"
+        ms_list = tmp_store.load_milestones(pid)
+        ms2_data = next(m for m in ms_list if m.milestone_id == "ms-2")
+        assert ms2_data.status == "in_progress"
+
+        # Step 3: Verify ms1 is in completed_milestones
+        assert ms1.milestone_id in s.completed_milestones

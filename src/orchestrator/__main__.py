@@ -233,6 +233,21 @@ def main() -> None:
     project_close_parser = project_subparsers.add_parser("close", help="Close the current project")
     project_close_parser.add_argument("--project-id", help="Project ID (uses latest active if omitted)")
 
+    # Phase 25 — Milestone Gate
+    project_approve_parser = project_subparsers.add_parser("approve", help="Approve a milestone and continue to the next")
+    project_approve_parser.add_argument("milestone_id", help="Milestone ID to approve")
+    project_approve_parser.add_argument("--project-id", help="Project ID (uses latest active if omitted)")
+
+    project_reject_parser = project_subparsers.add_parser("reject", help="Reject a milestone with a reason")
+    project_reject_parser.add_argument("milestone_id", help="Milestone ID to reject")
+    project_reject_parser.add_argument("--reason", default="", help="Reason for rejection")
+    project_reject_parser.add_argument("--project-id", help="Project ID (uses latest active if omitted)")
+
+    project_request_changes_parser = project_subparsers.add_parser("request-changes", help="Request changes to a milestone")
+    project_request_changes_parser.add_argument("milestone_id", help="Milestone ID to request changes for")
+    project_request_changes_parser.add_argument("--notes", default="", help="Notes describing what needs to change")
+    project_request_changes_parser.add_argument("--project-id", help="Project ID (uses latest active if omitted)")
+
     args = parser.parse_args()
 
     if args.command == "ask":
@@ -1551,6 +1566,12 @@ def _handle_project_command(args) -> None:
         _handle_project_continue(args, store)
     elif args.project_command == "close":
         _handle_project_close(args, store)
+    elif args.project_command == "approve":
+        _handle_project_approve(args, store)
+    elif args.project_command == "reject":
+        _handle_project_reject(args, store)
+    elif args.project_command == "request-changes":
+        _handle_project_request_changes(args, store)
 
 
 def _handle_project_start(args, store: ProjectSessionStore) -> None:
@@ -1700,11 +1721,9 @@ def _handle_project_ask(args, store: ProjectSessionStore) -> None:
 
     ctx = store.build_context(pid)
     if ctx is None:
-        print(json.dumps({
-            "question": args.question,
-            "answer": "No project session found. Create one with 'project start'.",
-            "evidence": [],
-        }, ensure_ascii=False, indent=2))
+        # Session was deleted between _resolve_project_id and build_context
+        # (TOCTOU race — practically won't happen, but guard anyway).
+        _print_missing_project_error("explicit_not_found", pid)
         return
 
     question = args.question
@@ -1883,8 +1902,8 @@ def _handle_project_continue(args, store: ProjectSessionStore) -> None:
             "status": "paused_for_approval",
             "current_milestone": ms.to_dict(),
             "_note": (
-                "Milestone is waiting for approval. Use 'project approve' "
-                "(coming in Phase 25) or check status for details."
+                "Milestone is waiting for approval. Use 'project approve', "
+                "'project reject', or 'project request-changes' to proceed."
             ),
         }, ensure_ascii=False, indent=2))
         return
@@ -1895,9 +1914,10 @@ def _handle_project_continue(args, store: ProjectSessionStore) -> None:
     # Build a PlanContract from remaining milestones and execute
     if ms is None:
         print(json.dumps({
+            "error": "No current milestone to execute.",
             "project_id": pid,
             "status": session.status,
-            "_note": "No current milestone to execute. All milestones may be complete.",
+            "_hint": "All milestones may be complete. Check 'project status' for details.",
         }, ensure_ascii=False, indent=2))
         return
 
@@ -1914,6 +1934,7 @@ def _handle_project_continue(args, store: ProjectSessionStore) -> None:
         steps=[m.description for m in remaining],
         risks=session.open_risks,
     )
+    plan.approve()  # resume plan is pre-approved — derived from existing milestones
 
     # Execute via MainlineExecutor
     executor = MainlineExecutor(Path.cwd())
@@ -1929,16 +1950,32 @@ def _handle_project_continue(args, store: ProjectSessionStore) -> None:
     )
     store.link_run(pid, run_link)
 
-    # If execution succeeded, advance milestone
+    # If execution succeeded, submit for human approval (Phase 25 gate)
     if result.status == "completed":
-        store.advance_milestone(pid, ms.milestone_id, "completed")
-        remaining = [m for m in remaining if m.milestone_id != ms.milestone_id]
-        if remaining:
-            next_ms = remaining[0]
-            next_ms.status = "in_progress"
-            store.save_milestones(pid, [m for m in milestones if m.milestone_id != next_ms.milestone_id] + [next_ms])
-            session.next_recommended_action = f"Execute milestone: {next_ms.name}"
-            store.save_session(session)
+        # Collect evidence from run artifacts
+        evidence_data = _read_evidence_json(result.evidence_path, root=store._root) or {}
+
+        store.submit_for_approval(
+            pid,
+            ms.milestone_id,
+            evidence_summary=result.summary or "",
+            files_changed=list(result.changed_files),
+            test_results_summary=evidence_data.get("test_output", ""),
+            reviewer_findings=[
+                f.get("description", str(f)) if isinstance(f, dict) else str(f)
+                for f in result.review_findings
+            ],
+            repair_history=[
+                str(r.get("round", r)) if isinstance(r, dict) else str(r)
+                for r in result.repair_rounds
+            ],
+            open_risks=list(session.open_risks),
+        )
+        # session was mutated on disk by submit_for_approval — reload is
+        # mandatory before any further use of the session object below.
+        session = store.load_session(pid)
+        if session is None:
+            return
 
     # Log the decision
     store.log_decision(pid, DecisionLog(
@@ -1950,16 +1987,24 @@ def _handle_project_continue(args, store: ProjectSessionStore) -> None:
         evidence_refs=[result.evidence_path or "", result.report_path or ""],
     ))
 
+    # Refresh milestone state
+    ms = store.get_current_milestone(pid)
+
     output = {
         "project_id": pid,
         "goal": session.goal,
         "status": session.status,
         "run_id": result.run_id,
         "run_status": result.status,
-        "current_milestone": ms.to_dict(),
+        "current_milestone": ms.to_dict() if ms else None,
         "completed_milestones": session.completed_milestones,
         "next_recommended_action": session.next_recommended_action,
-        "_note": f"Milestone execution finished with status: {result.status}.",
+        "_note": (
+            "Milestone execution finished. Awaiting human approval — use "
+            "'project approve/reject/request-changes' to continue."
+            if result.status == "completed"
+            else f"Milestone execution finished with status: {result.status}."
+        ),
     }
     print(json.dumps(output, ensure_ascii=False, indent=2))
 
@@ -1979,6 +2024,86 @@ def _handle_project_close(args, store: ProjectSessionStore) -> None:
         "project_id": pid,
         "status": "completed",
         "_note": "Project closed. Use 'project continue' to resume is no longer possible.",
+    }, ensure_ascii=False, indent=2))
+
+
+def _handle_project_approve(args, store: ProjectSessionStore) -> None:
+    """Approve a milestone — unlocks the next one."""
+    pid, reason = _resolve_project_id(store, getattr(args, "project_id", None))
+    if pid is None:
+        _print_missing_project_error(reason, getattr(args, "project_id", None))
+        return
+
+    approval = store.approve_milestone(pid, args.milestone_id)
+    if approval is None:
+        print(json.dumps({
+            "error": f"No awaiting approval record found for milestone: {args.milestone_id}",
+            "project_id": pid,
+        }, ensure_ascii=False, indent=2))
+        return
+
+    session = store.load_session(pid)
+    ms = store.get_current_milestone(pid)
+    print(json.dumps({
+        "project_id": pid,
+        "milestone_id": args.milestone_id,
+        "status": "approved",
+        "approved_by": "human",
+        "approved_at": approval.approved_at,
+        "next_milestone": ms.to_dict() if ms else None,
+        "next_recommended_action": session.next_recommended_action if session else None,
+    }, ensure_ascii=False, indent=2))
+
+
+def _handle_project_reject(args, store: ProjectSessionStore) -> None:
+    """Reject a milestone — generates a need for re-planning."""
+    pid, reason = _resolve_project_id(store, getattr(args, "project_id", None))
+    if pid is None:
+        _print_missing_project_error(reason, getattr(args, "project_id", None))
+        return
+
+    approval = store.reject_milestone(pid, args.milestone_id, reason=args.reason)
+    if approval is None:
+        print(json.dumps({
+            "error": f"No awaiting approval record found for milestone: {args.milestone_id}",
+            "project_id": pid,
+        }, ensure_ascii=False, indent=2))
+        return
+
+    session = store.load_session(pid)
+    print(json.dumps({
+        "project_id": pid,
+        "milestone_id": args.milestone_id,
+        "status": "rejected",
+        "reason": approval.rejection_reason,
+        "rejected_at": approval.approved_at,
+        "next_recommended_action": session.next_recommended_action if session else None,
+    }, ensure_ascii=False, indent=2))
+
+
+def _handle_project_request_changes(args, store: ProjectSessionStore) -> None:
+    """Request changes to a milestone — enters repair path."""
+    pid, reason = _resolve_project_id(store, getattr(args, "project_id", None))
+    if pid is None:
+        _print_missing_project_error(reason, getattr(args, "project_id", None))
+        return
+
+    approval = store.request_changes_milestone(pid, args.milestone_id, notes=args.notes)
+    if approval is None:
+        print(json.dumps({
+            "error": f"No awaiting approval record found for milestone: {args.milestone_id}",
+            "project_id": pid,
+        }, ensure_ascii=False, indent=2))
+        return
+
+    session = store.load_session(pid)
+    print(json.dumps({
+        "project_id": pid,
+        "milestone_id": args.milestone_id,
+        "status": "changes_requested",
+        "notes": approval.changes_requested_notes,
+        "requested_at": approval.approved_at,
+        "next_recommended_action": session.next_recommended_action if session else None,
     }, ensure_ascii=False, indent=2))
 
 

@@ -129,6 +129,78 @@ class ProjectRunLink:
 
 
 @dataclass
+class MilestoneApproval:
+    """Approval record for a milestone gate (Phase 25).
+
+    Created when a milestone finishes execution.  The human reviews the
+    evidence package and chooses approve / reject / request-changes.
+    """
+
+    milestone_id: str
+    status: str = "awaiting_approval"  # awaiting_approval | approved | rejected | changes_requested
+    approved_by: str | None = None  # "human"
+    approved_at: str = ""
+    rejection_reason: str = ""
+    changes_requested_notes: str = ""
+
+    # Evidence package — what the human is approving
+    evidence_summary: str = ""
+    files_changed: list[str] = field(default_factory=list)
+    test_results_summary: str = ""
+    reviewer_findings: list[str] = field(default_factory=list)
+    repair_history: list[str] = field(default_factory=list)
+    open_risks: list[str] = field(default_factory=list)
+
+    def approve(self) -> None:
+        self.status = "approved"
+        self.approved_by = "human"
+        self.approved_at = _now()
+
+    def reject(self, reason: str = "") -> None:
+        self.status = "rejected"
+        self.rejection_reason = reason
+        self.approved_at = _now()
+
+    def request_changes(self, notes: str = "") -> None:
+        self.status = "changes_requested"
+        self.changes_requested_notes = notes
+        self.approved_at = _now()
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "milestone_id": self.milestone_id,
+            "status": self.status,
+            "approved_by": self.approved_by,
+            "approved_at": self.approved_at,
+            "rejection_reason": self.rejection_reason,
+            "changes_requested_notes": self.changes_requested_notes,
+            "evidence_summary": self.evidence_summary,
+            "files_changed": self.files_changed,
+            "test_results_summary": self.test_results_summary,
+            "reviewer_findings": self.reviewer_findings,
+            "repair_history": self.repair_history,
+            "open_risks": self.open_risks,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> MilestoneApproval:
+        return cls(
+            milestone_id=d.get("milestone_id", ""),
+            status=d.get("status", "awaiting_approval"),
+            approved_by=d.get("approved_by"),
+            approved_at=d.get("approved_at", ""),
+            rejection_reason=d.get("rejection_reason", ""),
+            changes_requested_notes=d.get("changes_requested_notes", ""),
+            evidence_summary=d.get("evidence_summary", ""),
+            files_changed=d.get("files_changed", []),
+            test_results_summary=d.get("test_results_summary", ""),
+            reviewer_findings=d.get("reviewer_findings", []),
+            repair_history=d.get("repair_history", []),
+            open_risks=d.get("open_risks", []),
+        )
+
+
+@dataclass
 class SessionContext:
     """Assembled at resume/ask time to answer questions.
 
@@ -357,6 +429,241 @@ class ProjectSessionStore:
         session.current_milestone = milestone_id
         self.save_session(session)
         return session
+
+    # ------------------------------------------------------------------
+    # Milestone gate / approval (Phase 25)
+    # ------------------------------------------------------------------
+
+    def _approval_path(self, project_id: str) -> Path:
+        return self._session_dir(project_id) / "milestone_approvals.json"
+
+    def load_approvals(self, project_id: str) -> list[MilestoneApproval]:
+        """Load all milestone approval records."""
+        path = self._approval_path(project_id)
+        if not path.exists():
+            return []
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            return [MilestoneApproval.from_dict(a) for a in data]
+        except (json.JSONDecodeError, OSError):
+            return []
+
+    def _save_approvals(self, project_id: str, approvals: list[MilestoneApproval]) -> None:
+        path = self._approval_path(project_id)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps([a.to_dict() for a in approvals], ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+
+    def submit_for_approval(
+        self,
+        project_id: str,
+        milestone_id: str,
+        *,
+        evidence_summary: str = "",
+        files_changed: list[str] | None = None,
+        test_results_summary: str = "",
+        reviewer_findings: list[str] | None = None,
+        repair_history: list[str] | None = None,
+        open_risks: list[str] | None = None,
+    ) -> MilestoneApproval | None:
+        """Submit a completed milestone for human approval.
+
+        Creates the approval record, sets the milestone status to
+        ``paused_for_approval``, and pauses the session.
+        Returns None if the milestone doesn't exist.
+        """
+        session = self.load_session(project_id)
+        if session is None:
+            return None
+
+        milestones = self.load_milestones(project_id)
+        found = False
+        for m in milestones:
+            if m.milestone_id == milestone_id:
+                m.status = "paused_for_approval"
+                found = True
+                break
+        if not found:
+            return None
+
+        self.save_milestones(project_id, milestones)
+
+        approval = MilestoneApproval(
+            milestone_id=milestone_id,
+            status="awaiting_approval",
+            evidence_summary=evidence_summary,
+            files_changed=list(files_changed or []),
+            test_results_summary=test_results_summary,
+            reviewer_findings=list(reviewer_findings or []),
+            repair_history=list(repair_history or []),
+            open_risks=list(open_risks or []),
+        )
+
+        approvals = self.load_approvals(project_id)
+        # Replace existing approval for same milestone if present
+        approvals = [a for a in approvals if a.milestone_id != milestone_id]
+        approvals.append(approval)
+        self._save_approvals(project_id, approvals)
+
+        session.status = "paused"
+        session.pending_decisions.append(f"Approve milestone: {milestone_id}")
+        self.save_session(session)
+
+        return approval
+
+    def approve_milestone(self, project_id: str, milestone_id: str) -> MilestoneApproval | None:
+        """Approve a milestone and unlock the next one.
+
+        Sets milestone → completed, approval → approved, session → active.
+        Returns None if no awaiting approval record exists.
+        """
+        approvals = self.load_approvals(project_id)
+        target = None
+        for a in approvals:
+            if a.milestone_id == milestone_id and a.status == "awaiting_approval":
+                target = a
+                break
+        if target is None:
+            return None
+
+        target.approve()
+        self._save_approvals(project_id, approvals)
+
+        # Advance milestone
+        self.advance_milestone(project_id, milestone_id, "completed")
+
+        # Activate next pending milestone
+        milestones = self.load_milestones(project_id)
+        found_next = False
+        for m in milestones:
+            if m.status == "pending":
+                m.status = "in_progress"
+                session = self.load_session(project_id)
+                if session:
+                    session.current_milestone = m.milestone_id
+                    session.status = "active"
+                    session.pending_decisions = [
+                        d for d in session.pending_decisions
+                        if f"Approve milestone: {milestone_id}" not in d
+                    ]
+                    session.next_recommended_action = f"Execute milestone: {m.name}"
+                    self.save_session(session)
+                self.save_milestones(project_id, milestones)
+                found_next = True
+                break
+
+        if not found_next:
+            session = self.load_session(project_id)
+            if session:
+                session.current_milestone = None
+                session.status = "completed"
+                session.next_recommended_action = "All milestones completed."
+                self.save_session(session)
+
+        # Log the decision
+        self.log_decision(project_id, DecisionLog(
+            entry_id=_new_id(),
+            timestamp=_now(),
+            decision=f"Approved milestone: {milestone_id}",
+            reason="Human approved the milestone gate",
+            made_by="human",
+        ))
+
+        return target
+
+    def reject_milestone(
+        self, project_id: str, milestone_id: str, reason: str = ""
+    ) -> MilestoneApproval | None:
+        """Reject a milestone — generates a need for re-planning."""
+        approvals = self.load_approvals(project_id)
+        target = None
+        for a in approvals:
+            if a.milestone_id == milestone_id and a.status == "awaiting_approval":
+                target = a
+                break
+        if target is None:
+            return None
+
+        target.reject(reason)
+        self._save_approvals(project_id, approvals)
+
+        # Mark milestone as blocked
+        milestones = self.load_milestones(project_id)
+        for m in milestones:
+            if m.milestone_id == milestone_id:
+                m.status = "blocked"
+                break
+        self.save_milestones(project_id, milestones)
+
+        session = self.load_session(project_id)
+        if session:
+            session.status = "active"
+            session.pending_decisions = [
+                d for d in session.pending_decisions
+                if f"Approve milestone: {milestone_id}" not in d
+            ]
+            session.next_recommended_action = (
+                f"Milestone {milestone_id} rejected: {reason}. Re-plan required."
+            )
+            self.save_session(session)
+
+        self.log_decision(project_id, DecisionLog(
+            entry_id=_new_id(),
+            timestamp=_now(),
+            decision=f"Rejected milestone: {milestone_id}",
+            reason=reason or "No reason provided",
+            made_by="human",
+        ))
+
+        return target
+
+    def request_changes_milestone(
+        self, project_id: str, milestone_id: str, notes: str = ""
+    ) -> MilestoneApproval | None:
+        """Request changes to a milestone — enters repair path."""
+        approvals = self.load_approvals(project_id)
+        target = None
+        for a in approvals:
+            if a.milestone_id == milestone_id and a.status == "awaiting_approval":
+                target = a
+                break
+        if target is None:
+            return None
+
+        target.request_changes(notes)
+        self._save_approvals(project_id, approvals)
+
+        # Keep milestone in_progress so it can be re-executed
+        milestones = self.load_milestones(project_id)
+        for m in milestones:
+            if m.milestone_id == milestone_id:
+                m.status = "in_progress"
+                break
+        self.save_milestones(project_id, milestones)
+
+        session = self.load_session(project_id)
+        if session:
+            session.status = "active"
+            session.pending_decisions = [
+                d for d in session.pending_decisions
+                if f"Approve milestone: {milestone_id}" not in d
+            ]
+            session.next_recommended_action = (
+                f"Changes requested for milestone {milestone_id}: {notes}"
+            )
+            self.save_session(session)
+
+        self.log_decision(project_id, DecisionLog(
+            entry_id=_new_id(),
+            timestamp=_now(),
+            decision=f"Requested changes to milestone: {milestone_id}",
+            reason=notes or "No details provided",
+            made_by="human",
+        ))
+
+        return target
 
     # ------------------------------------------------------------------
     # Decisions (append-only JSONL)
