@@ -1626,6 +1626,31 @@ def _handle_project_start(args, store: ProjectSessionStore) -> None:
         task_type="project",
     )
 
+    # Check for blocking concerns BEFORE creating milestones.
+    # If any advisor (planner, reviewer, execution planner) raised
+    # blocking issues, we must show them and stop — not create an
+    # empty or broken project.
+    if plan.has_blocking_concerns:
+        store.log_decision(session.project_id, DecisionLog(
+            entry_id=_new_id(),
+            timestamp=_now(),
+            decision="Project creation blocked by planning council concerns",
+            reason="; ".join(plan.blocking_concerns[:5]),
+            made_by="planning_council",
+        ))
+        print(json.dumps({
+            "project_id": session.project_id,
+            "goal": session.goal,
+            "status": session.status,
+            "error": "Planning Council found blocking concerns — cannot create milestones.",
+            "blocking_concerns": plan.blocking_concerns,
+            "next": (
+                "Resolve the blocking concerns above and try again, "
+                "or use --planning-mode deterministic to bypass LLM planning."
+            ),
+        }, ensure_ascii=False, indent=2))
+        return
+
     # Convert plan steps (list[str]) to milestones
     milestones: list[ProjectMilestone] = []
     for i, step_text in enumerate(plan.steps):
