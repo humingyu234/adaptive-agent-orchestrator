@@ -47,6 +47,7 @@ class ClaudeCodeTaskRenderer:
     def render(self, packet: WorkerTaskPacket) -> str:
         lines: list[str] = []
         self._append_header(lines, packet)
+        self._append_worker_rules(lines)
         self._append_objective(lines, packet)
         self._append_allowed_files(lines, packet)
         self._append_denied_files(lines, packet)
@@ -67,6 +68,12 @@ class ClaudeCodeTaskRenderer:
             f"**Run ID**: `{packet.run_id}`",
             f"**Risk level**: {packet.risk_level}",
             f"**Mode**: {packet.run_mode}",
+            "",
+        ])
+
+    def _append_worker_rules(self, lines: list[str]) -> None:
+        lines.extend([
+            "你是 AAO worker，非交互模式。用工具验证信息，不要猜。写完 result.md 就停。",
             "",
         ])
 
@@ -268,7 +275,7 @@ class ClaudeCodeWorkerConfig:
     timeout_seconds: int = 600
     prompt_mode: str = "stdin"  # stdin | file
     project_root: str = ""
-    extra_args: list[str] = field(default_factory=lambda: ["-p", "--verbose"])
+    extra_args: list[str] = field(default_factory=lambda: ["-p", "--verbose", "--permission-mode", "auto"])
 
     @classmethod
     def from_env(cls, project_root: str = "") -> "ClaudeCodeWorkerConfig":
