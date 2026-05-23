@@ -2098,10 +2098,13 @@ def _handle_project_continue(args, store: ProjectSessionStore) -> None:
     from .planning import PlanContract
     plan = PlanContract(
         plan_id=f"resume-{pid}",
-        objective=f"{session.goal} — {ms.name}",
+        objective=(
+            f"Project goal: {session.goal}\n\n"
+            f"Current milestone (ONLY do this one): {ms.description}"
+        ),
         task_size="medium",
         planning_mode=planning_mode,
-        steps=[m.description for m in remaining],
+        steps=[ms.description],
         risks=session.open_risks,
         planned_worker_tasks=[milestone_task] if milestone_task else [],
     )
