@@ -7,6 +7,7 @@ No LLM calls, no filesystem access, no network.  Pure and testable.
 from __future__ import annotations
 
 import re
+import shlex
 from dataclasses import dataclass, field
 from typing import Literal
 
@@ -360,6 +361,116 @@ def route_decision_to_dict(decision: TaskRouteDecision) -> dict[str, object]:
         "workflow_hint": decision.workflow_hint,
         "runtime_support": decision.runtime_support,
     }
+
+
+# =============================================================================
+# Front Door recommendation
+# =============================================================================
+
+def front_door_recommendation(
+    query: str,
+    decision: TaskRouteDecision,
+) -> dict[str, object]:
+    """Turn a route decision into an operator-facing AAO entry recommendation.
+
+    This is intentionally light: it does not execute, plan, inspect files, or call
+    an LLM.  It gives Claude Code/Codex sessions a stable first step so medium
+    and large AAO work does not silently bypass the control layer.
+    """
+    quoted = shlex.quote(query)
+    startup_checks = [
+        "Read CLAUDE.md and AAO_FRONT_DOOR.md before AAO project work.",
+        "Run git status --short before editing.",
+        "Read task-scoped source before saying a feature is missing or complete.",
+        "Do not claim tests/evidence/audit passed unless the artifact exists.",
+    ]
+
+    if decision.run_mode == "orchestrated":
+        path = "project_session"
+        planning = (
+            "Planning Council is expected through project start/plan; use llm "
+            "mode when provider keys are configured."
+        )
+        commands = [
+            f"python -m orchestrator project status",
+            f"python -m orchestrator project start {quoted} --planning-mode llm",
+            "python -m orchestrator project continue --worker-mode claude-code",
+        ]
+        notes = [
+            "Use project status first when a project may already exist.",
+            "Large work should produce milestones, approval gates, resume state, evidence, and audit.",
+        ]
+    elif decision.run_mode == "controlled":
+        path = "controlled"
+        planning = (
+            "Medium controlled work uses a lightweight PlanContract by default; "
+            "it does not need multi-model Planning Council unless the task is high-risk."
+        )
+        commands = [
+            f"python -m orchestrator ask {quoted} --worker-mode claude-code --approve",
+        ]
+        notes = [
+            "Use --worker-mode claude-code for a real worker; fake/packet modes are for tests or handoff.",
+            "Expected output: worker packet, observed evidence, control decisions, and audit report.",
+        ]
+    else:
+        path = "direct"
+        planning = "No Planning Council. Keep it fast, but still read the relevant source before factual claims."
+        commands = [
+            f"python -m orchestrator route {quoted}",
+        ]
+        notes = [
+            "Small/log/off work may be handled directly by Claude Code/Codex.",
+            "Escalate to controlled if the task grows into multi-file changes, tests, policy, evidence, or worker behavior.",
+        ]
+
+    return {
+        "recommended_path": path,
+        "route_decision": route_decision_to_dict(decision),
+        "startup_checks": startup_checks,
+        "planning": planning,
+        "recommended_commands": commands,
+        "notes": notes,
+    }
+
+
+def render_front_door_recommendation(payload: dict[str, object]) -> str:
+    """Render a front-door recommendation in terminal-friendly text."""
+    decision = payload["route_decision"]
+    assert isinstance(decision, dict)
+
+    lines = [
+        "=" * 64,
+        "AAO Front Door",
+        "=" * 64,
+        f"  Recommended Path: {payload['recommended_path']}",
+        f"  Task Size:        {decision['task_size']}",
+        f"  Run Mode:         {decision['run_mode']}",
+        f"  Risk Level:       {decision['risk_level']}",
+        f"  Task Type:        {decision['task_type']}",
+        "",
+        "Startup Checks:",
+    ]
+    for item in payload["startup_checks"]:
+        lines.append(f"  - {item}")
+
+    lines.extend([
+        "",
+        "Planning:",
+        f"  {payload['planning']}",
+        "",
+        "Recommended Commands:",
+    ])
+    for cmd in payload["recommended_commands"]:
+        lines.append(f"  {cmd}")
+
+    lines.append("")
+    lines.append("Notes:")
+    for note in payload["notes"]:
+        lines.append(f"  - {note}")
+
+    lines.append("=" * 64)
+    return "\n".join(lines)
 
 
 # =============================================================================

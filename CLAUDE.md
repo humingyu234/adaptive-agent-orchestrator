@@ -4,6 +4,27 @@ AAO 项目级操作指南。改代码前先读这个。遵循它除非用户明�
 
 ---
 
+## 0. 新会话 Front Door
+
+新开 Claude Code / Codex 会话接管 AAO 时，不要直接凭记忆判断功能状态。
+
+先读 `AAO_FRONT_DOOR.md`，再做：
+
+```bash
+git status --short
+python -m orchestrator front-door "<当前任务>"
+```
+
+Front Door 只做轻量分流：
+
+- **small**：直接做，但先读相关源码再回答。
+- **medium**：走 AAO controlled，使用真实 worker 时必须显式 `--worker-mode claude-code`。
+- **large**：走 project session / milestone / resume。
+
+没有源码、测试、或 artifact 证据前，不要说“没有这个功能”“已经接通”“测试通过”。
+
+---
+
 ## 1. AAO 是什么
 
 AAO 是 **Agent Runtime Control Plane**（Agent 运行时控制层）。

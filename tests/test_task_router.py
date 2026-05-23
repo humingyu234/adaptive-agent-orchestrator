@@ -11,7 +11,9 @@ from unittest.mock import patch
 from orchestrator.task_router import (
     TaskRouteDecision,
     effective_run_mode,
+    front_door_recommendation,
     render_route_decision,
+    render_front_door_recommendation,
     requires_future_runner,
     route_decision_to_dict,
     route_task,
@@ -179,6 +181,46 @@ class RouterUnitTest(unittest.TestCase):
         self.assertIn("Runtime:", text)
         self.assertIn("Reasons:", text)
 
+    def test_front_door_medium_recommends_controlled_claude_code(self):
+        decision = route_task("fix worker timeout and add tests")
+        payload = front_door_recommendation(
+            "fix worker timeout and add tests",
+            decision,
+        )
+
+        self.assertEqual(payload["recommended_path"], "controlled")
+        self.assertIn("does not need multi-model", payload["planning"])
+        self.assertTrue(any(
+            "--worker-mode claude-code" in cmd
+            for cmd in payload["recommended_commands"]
+        ))
+
+    def test_front_door_large_recommends_project_session(self):
+        decision = route_task("implement full project workflow with resume audit")
+        payload = front_door_recommendation(
+            "implement full project workflow with resume audit",
+            decision,
+        )
+
+        self.assertEqual(payload["recommended_path"], "project_session")
+        self.assertTrue(any(
+            "project start" in cmd
+            for cmd in payload["recommended_commands"]
+        ))
+        self.assertTrue(any(
+            "project continue --worker-mode claude-code" in cmd
+            for cmd in payload["recommended_commands"]
+        ))
+
+    def test_render_front_door_recommendation_includes_startup_checks(self):
+        decision = route_task("explain guardrails.py")
+        payload = front_door_recommendation("explain guardrails.py", decision)
+        text = render_front_door_recommendation(payload)
+
+        self.assertIn("AAO Front Door", text)
+        self.assertIn("Startup Checks:", text)
+        self.assertIn("Recommended Commands:", text)
+
     def test_explicit_workflow_hint_is_passed_through(self):
         decision = route_task("do research", explicit_workflow="deep_research")
         self.assertEqual(decision.workflow_hint, "deep_research")
@@ -281,6 +323,35 @@ class RouteCommandTest(unittest.TestCase):
             sys.stdout = old
 
         self.assertIn("Route Decision", captured.getvalue())
+
+    def test_front_door_command_prints_controlled_json(self):
+        import argparse
+        import io
+        import sys
+        from orchestrator.__main__ import _handle_front_door_command
+
+        args = argparse.Namespace(
+            query="fix worker timeout and add tests",
+            mode=None,
+            format="json",
+            command="front-door",
+        )
+
+        captured = io.StringIO()
+        old = sys.stdout
+        sys.stdout = captured
+        try:
+            _handle_front_door_command(args)
+        finally:
+            sys.stdout = old
+
+        data = json.loads(captured.getvalue())
+        self.assertEqual(data["recommended_path"], "controlled")
+        self.assertEqual(data["route_decision"]["run_mode"], "controlled")
+        self.assertTrue(any(
+            "--worker-mode claude-code" in cmd
+            for cmd in data["recommended_commands"]
+        ))
 
 
 class AskRouteIntegrationTest(unittest.TestCase):
