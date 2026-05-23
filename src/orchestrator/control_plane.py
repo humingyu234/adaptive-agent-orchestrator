@@ -622,10 +622,23 @@ class ControlPlane:
             return decision
 
         # --- planned worker task without boundaries ---
+        # allowed_files=[] + denied_files=[] is ambiguous:
+        #   a) The task is intentionally read-only (audit, inspect, etc.)
+        #   b) Boundaries were genuinely forgotten
+        # We use objective keywords to distinguish the two cases.
+        _READ_ONLY_INTENT_SIGNALS = (
+            "read", "examine", "audit", "inspect", "trace",
+            "search", "check", "analyze", "review",
+        )
         for wt in plan.planned_worker_tasks:
             if not isinstance(wt, PlannedWorkerTask):
                 continue
             if not wt.allowed_files and not wt.denied_files:
+                obj_lower = wt.objective.lower()
+                is_read_only = obj_lower.startswith(_READ_ONLY_INTENT_SIGNALS)
+                if is_read_only:
+                    # Intentional read-only boundary — not an error
+                    continue
                 decision = ControlDecision(
                     passed=False,
                     action="replan",

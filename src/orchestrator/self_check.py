@@ -117,6 +117,15 @@ def _build_proposal_parts(
             ["May flag legitimate context-dependent decisions as inconsistent"],
             "Collect decision pairs with same failure category and verify consistency logic.",
         )
+    elif finding.category == "file_boundary_violation":
+        return (
+            "Fix the file boundary enforcement pipeline to detect and block "
+            "unauthorized file modifications during read-only milestones.",
+            ["src/orchestrator/reviewer.py",
+             "src/orchestrator/mainline_executor.py"],
+            ["Tightening boundary checks may block legitimate edge cases"],
+            "Run boundary enforcement tests and golden scenario suite.",
+        )
     else:
         return (
             f"Investigate and resolve system finding: {finding.description}",
@@ -284,6 +293,70 @@ def _check_plan_drift(store: ProjectSessionStore, pid: str) -> list[SystemFindin
     return findings
 
 
+# Milestone description prefixes that indicate a read-only operation.
+# Any milestone whose description starts with one of these must not
+# produce file changes.
+_READ_ONLY_PREFIXES = (
+    "read", "examine", "audit", "inspect", "trace",
+    "search", "check", "analyze", "review",
+)
+
+
+def _is_read_only_milestone(description: str) -> bool:
+    """Return True if the milestone description signals a read-only operation."""
+    lowered = description.strip().lower()
+    return lowered.startswith(_READ_ONLY_PREFIXES)
+
+
+def _check_file_boundary_violation(
+    store: ProjectSessionStore, pid: str,
+) -> list[SystemFinding]:
+    """Check for file_boundary_violation: read-only milestones that produced
+    file changes, or bounded milestones whose changes exceed their scope."""
+    findings: list[SystemFinding] = []
+    milestones = {m.milestone_id: m for m in store.load_milestones(pid)}
+    links = store.load_run_links(pid)
+
+    for link in links:
+        ms = milestones.get(link.milestone_id)
+        if not ms:
+            continue
+        if ms.status not in ("completed", "paused_for_approval"):
+            continue
+        if not link.evidence_path:
+            continue
+
+        ev_path = store._root / link.evidence_path
+        if not ev_path.exists():
+            continue
+
+        try:
+            import json
+            ev = json.loads(ev_path.read_text(encoding="utf-8"))
+            changed = ev.get("changed_files", [])
+        except Exception:
+            continue
+
+        if not changed:
+            continue
+
+        if _is_read_only_milestone(ms.description):
+            findings.append(SystemFinding(
+                finding_id=_new_id(),
+                category="file_boundary_violation",
+                severity="critical",
+                description=(
+                    f"Read-only milestone '{ms.name}' ({ms.milestone_id}) "
+                    f"produced file changes: {changed}"
+                ),
+                evidence_refs=[str(ev_path)],
+                affected_components=["mainline_executor", "reviewer", "worker"],
+                detected_at=_now(),
+            ))
+
+    return findings
+
+
 def _check_decision_consistency(store: ProjectSessionStore, pid: str) -> list[SystemFinding]:
     """Check for decision_inconsistency: same failure handled differently."""
     findings: list[SystemFinding] = []
@@ -322,6 +395,7 @@ _CHECKS: dict[str, Any] = {
     "worker_bridge_bypass": _check_worker_bypass,
     "plan_reality_drift": _check_plan_drift,
     "decision_inconsistency": _check_decision_consistency,
+    "file_boundary_violation": _check_file_boundary_violation,
 }
 
 

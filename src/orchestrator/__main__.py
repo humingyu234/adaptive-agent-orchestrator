@@ -36,11 +36,14 @@ from .planning import (
     PlanningCouncil,
     PlanContract,
     PlanningMode,
+    PlannedWorkerTask,
     build_default_council,
     plan_contract_to_dict,
     render_plan_contract,
 )
 from .task_router import (
+    front_door_recommendation,
+    render_front_door_recommendation,
     requires_future_runner,
     route_task,
     render_route_decision,
@@ -165,6 +168,11 @@ def main() -> None:
     route_parser.add_argument("--mode", choices=["off", "log", "controlled", "orchestrated"], help="Override the default run mode")
     route_parser.add_argument("--format", choices=["json", "text"], default="json", help="Output format (default: json)")
 
+    front_door_parser = subparsers.add_parser("front-door", help="Recommend the AAO entry path for a task")
+    front_door_parser.add_argument("query", help="Task request in natural language")
+    front_door_parser.add_argument("--mode", choices=["off", "log", "controlled", "orchestrated"], help="Override the default run mode")
+    front_door_parser.add_argument("--format", choices=["json", "text"], default="json", help="Output format (default: json)")
+
     plan_parser = subparsers.add_parser("plan", help="Generate a plan contract for a complex task")
     plan_parser.add_argument("query", help="Task request in natural language")
     plan_parser.add_argument("--mode", choices=["off", "log", "controlled", "orchestrated"], help="Override the default run mode")
@@ -279,6 +287,8 @@ def main() -> None:
         _handle_project_context_command(args)
     elif args.command == "route":
         _handle_route_command(args)
+    elif args.command == "front-door":
+        _handle_front_door_command(args)
     elif args.command == "plan":
         _handle_plan_command(args)
     elif args.command == "eval-prompts":
@@ -453,6 +463,19 @@ def _handle_route_command(args) -> None:
         print(render_route_decision(decision))
     else:
         print(json.dumps(route_decision_to_dict(decision), ensure_ascii=False, indent=2))
+
+
+def _handle_front_door_command(args) -> None:
+    """Recommend the right AAO entry path without executing the task."""
+    explicit_mode = getattr(args, "mode", None)
+    decision = route_task(args.query, explicit_mode=explicit_mode)
+    payload = front_door_recommendation(args.query, decision)
+
+    fmt = getattr(args, "format", "json")
+    if fmt == "text":
+        print(render_front_door_recommendation(payload))
+    else:
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
 
 
 def _handle_plan_command(args) -> None:
@@ -1931,6 +1954,82 @@ def _handle_project_ask(args, store: ProjectSessionStore) -> None:
     }, ensure_ascii=False, indent=2))
 
 
+def _extract_files_from_text(text: str) -> list[str]:
+    """Extract file path references from arbitrary text.
+
+    Matches patterns like ``src/foo.py``, ``tests/test_bar.py``, etc.
+    Used to infer allowed_files from milestone descriptions.
+    """
+    import re
+    pattern = re.compile(r"([\w\-/]+\.[a-z]{1,10})", re.IGNORECASE)
+    seen: set[str] = set()
+    result: list[str] = []
+    for match in pattern.finditer(text):
+        path = match.group(1).strip()
+        if path and path not in seen and len(path) > 3:
+            seen.add(path)
+            result.append(path)
+    return result
+
+
+def _parse_milestone_intent(description: str) -> tuple[str, list[str]]:
+    """Return (action_type, allowed_files) inferred from a milestone description.
+
+    - ``Read ...`` / ``Examine ...`` / ``Audit ...`` etc. → ("read", []) — worker must not modify any files.
+    - ``Modify ...`` or ``Run ...`` or ``Review ...`` → ("modify", [paths]).
+    - Anything else → ("unknown", [paths]) — backward-compatible.
+    """
+    _READ_ONLY_VERBS = (
+        "read", "examine", "audit", "inspect", "trace",
+        "search", "check", "analyze",
+    )
+    desc = description.strip()
+    desc_lower = desc.lower()
+    if desc_lower.startswith(_READ_ONLY_VERBS):
+        return ("read", [])
+    elif desc_lower.startswith(("modify", "run ", "run\n", "review")):
+        return ("modify", _extract_files_from_text(desc))
+    else:
+        return ("unknown", _extract_files_from_text(desc))
+
+
+def _milestone_to_worker_task(
+    ms: ProjectMilestone,
+) -> PlannedWorkerTask | None:
+    """Convert a project milestone into a PlannedWorkerTask with intent-
+    aware file boundaries.
+
+    Read-only milestones produce ``allowed_files=[]`` so the control
+    plane can detect and block unexpected file modifications.
+    Unknown-intent milestones get a broad default file scope so the
+    boundary check does not misfire on unclassified descriptions.
+    """
+    intent, allowed_files = _parse_milestone_intent(ms.description)
+    if intent == "unknown":
+        allowed_files = allowed_files or ["src/**", "tests/**"]
+
+    # Protected paths that workers must never touch regardless of intent.
+    # These are the minimum safety net — the full policy.protected_files
+    # is merged later in _plan_to_packet.
+    _DEFAULT_DENIED = [
+        ".env", ".env.*", "*.secret", "*.key", "*.pem",
+        "config/secrets.*", "credentials.*",
+        "outputs/", ".claude/", ".git/",
+    ]
+
+    return PlannedWorkerTask(
+        step_id=ms.milestone_id,
+        title=ms.name,
+        objective=ms.description,
+        allowed_files=allowed_files,
+        denied_files=list(_DEFAULT_DENIED),
+        required_checks=["pytest"] if intent != "read" else [],
+        expected_evidence=["test_output.txt", "diff.patch"]
+        if intent != "read" else [],
+        risk_level="medium",
+    )
+
+
 def _handle_project_continue(args, store: ProjectSessionStore) -> None:
     """Resume the current project — rebuild plan, execute the current milestone.
 
@@ -1990,6 +2089,12 @@ def _handle_project_continue(args, store: ProjectSessionStore) -> None:
     max_workers = getattr(args, "max_workers", 2)
     execution_backend = getattr(args, "execution_backend", "native")
 
+    # Build PlannedWorkerTask from the current milestone so the packet
+    # carries intent-aware allowed_files — "Read" milestones produce
+    # allowed_files=[] (worker may read but must not modify), while
+    # "Modify"/"Run"/"Review" milestones extract target file paths.
+    milestone_task = _milestone_to_worker_task(ms)
+
     from .planning import PlanContract
     plan = PlanContract(
         plan_id=f"resume-{pid}",
@@ -1998,6 +2103,7 @@ def _handle_project_continue(args, store: ProjectSessionStore) -> None:
         planning_mode=planning_mode,
         steps=[m.description for m in remaining],
         risks=session.open_risks,
+        planned_worker_tasks=[milestone_task] if milestone_task else [],
     )
     plan.approve()  # resume plan is pre-approved — derived from existing milestones
 

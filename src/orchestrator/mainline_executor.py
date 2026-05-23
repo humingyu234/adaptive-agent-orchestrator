@@ -261,6 +261,7 @@ class MainlineExecutor:
             # 5. Run ControlPlane checks
             control_decisions = test_decisions + self._run_control_checks(
                 packet, evidence_status, final_worker_result,
+                worker_mode=worker_mode,
             )
             all_control_decisions = control_decisions
 
@@ -411,6 +412,8 @@ class MainlineExecutor:
                 risk_level=packet.risk_level,
                 rule_findings=list(review_findings),
                 repair_history=repair_rounds if repair_rounds else None,
+                allowed_files=packet.allowed_files,
+                changed_files=final_evidence_status.changed_files,
             ):
                 codex_findings = self._run_codex_reviewer(packet)
                 for finding in codex_findings:
@@ -524,6 +527,7 @@ class MainlineExecutor:
         # Run control checks
         control_decisions = test_decisions + self._run_control_checks(
             packet, evidence_status, worker_result,
+            worker_mode=worker_mode,
         )
 
         # Generate report
@@ -869,6 +873,8 @@ class MainlineExecutor:
         risk_level: str = "low",
         rule_findings: list[ReviewFinding] | None = None,
         repair_history: list[dict[str, Any]] | None = None,
+        allowed_files: list[str] | None = None,
+        changed_files: list[str] | None = None,
     ) -> bool:
         """Determine whether Layer 2 (Codex LLM) review is warranted.
 
@@ -879,17 +885,25 @@ class MainlineExecutor:
           - task_size == "large"
           - risk_level == "high"
 
-        Suspicious-signal triggers:
+        Suspicious-signal triggers (independent of Layer 1):
+          - allowed_files is empty but changed_files is non-empty
+            (read-only milestone produced file changes — Layer 1 may
+            have a blind spot, so Codex gets a direct look)
           - Layer 1 found ANY finding (rules fired — worth a second look)
           - Previous repair round failed then current one "passed"
         """
-        # Hard gate: codex must be on PATH
         import shutil
         if not shutil.which("codex"):
             return False
 
         # Always invoke for high-stakes work
         if task_size == "large" or risk_level == "high":
+            return True
+
+        # Read-only milestone with file changes — independent trigger
+        # that does NOT depend on Layer 1 findings (defense in depth)
+        if (allowed_files is not None and changed_files is not None
+                and not allowed_files and changed_files):
             return True
 
         # Layer 1 found something — worth a semantic second opinion
@@ -1093,13 +1107,19 @@ class MainlineExecutor:
 
         policy = self._policy
 
-        # Gather file boundaries from planned_worker_tasks or extract from steps
+        # Gather file boundaries from planned_worker_tasks or extract from steps.
+        # IMPORTANT: planned_worker_tasks may INTENTIONALLY set allowed_files=[]
+        # to signal a read-only milestone.  The fallback extraction must only
+        # run when there are NO planned_worker_tasks — never when the list is
+        # present but empty.
         allowed_files: list[str] = []
         denied_files: list[str] = []
         required_checks: list[str] = []
         expected_evidence: list[str] = list(plan.required_evidence)
 
-        if plan.planned_worker_tasks:
+        has_explicit_tasks = bool(plan.planned_worker_tasks)
+
+        if has_explicit_tasks:
             pwt = plan.planned_worker_tasks[0]
             allowed_files = list(pwt.allowed_files)
             denied_files = list(pwt.denied_files)
@@ -1107,11 +1127,14 @@ class MainlineExecutor:
             if pwt.expected_evidence:
                 expected_evidence = list(pwt.expected_evidence)
 
-        # Fallback: extract from objective/steps
-        if not allowed_files:
-            allowed_files = self._extract_files_from_plan(plan)
-        if not required_checks:
-            required_checks = self._infer_required_checks(plan)
+        # Fallback: only when no planned_worker_tasks exist.
+        # When planned_worker_tasks IS present, allowed_files=[] is a
+        # deliberate read-only signal — do NOT overwrite it.
+        if not has_explicit_tasks:
+            if not allowed_files:
+                allowed_files = self._extract_files_from_plan(plan)
+            if not required_checks:
+                required_checks = self._infer_required_checks(plan)
         if not expected_evidence:
             expected_evidence = ["test_output.txt", "diff.patch"]
 
@@ -1191,11 +1214,37 @@ class MainlineExecutor:
             "observed_paths": [],
         }
 
-    def _execute_claude_code_worker(self, packet: WorkerTaskPacket) -> dict[str, Any]:
-        """Launch a real Claude Code subprocess as the worker."""
+    def _resolve_claude_code_cli(self) -> str | None:
+        """Resolve the Claude Code CLI path, preferring native Linux binary.
+
+        On WSL, Windows npm shims shadow the native Linux binary because
+        WSL interop appends the Windows PATH.  We explicitly try native
+        paths first so the Linux binary wins.
+        """
         import shutil
 
-        if not shutil.which("claude"):
+        candidates: list[str] = []
+        # 1. Native Linux npm-global (common for npm install -g)
+        candidates.append(
+            str(Path.home() / ".npm-global" / "bin" / "claude")
+        )
+        # 2. Standard Linux npm global
+        candidates.append("/usr/local/bin/claude")
+        # 3. Fallback: whatever shutil.which finds
+        system = shutil.which("claude")
+        if system:
+            candidates.append(system)
+
+        for c in candidates:
+            if Path(c).is_file():
+                return c
+        return None
+
+    def _execute_claude_code_worker(self, packet: WorkerTaskPacket) -> dict[str, Any]:
+        """Launch a real Claude Code subprocess as the worker."""
+        claude_cli = self._resolve_claude_code_cli()
+
+        if claude_cli is None:
             return {
                 "run_id": _new_run_id(),
                 "task_id": packet.task_id,
@@ -1224,6 +1273,7 @@ class MainlineExecutor:
         config = ClaudeCodeWorkerConfig.from_env(
             project_root=str(self.project_root),
         )
+        config.command = claude_cli  # force native Linux CLI path
         result = run_claude_code_worker(packet, config=config)
 
         return {
@@ -1295,6 +1345,77 @@ class MainlineExecutor:
         return decisions
 
     # ------------------------------------------------------------------
+    # File boundary enforcement
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _check_file_boundary(
+        *,
+        changed_files: list[str],
+        allowed_files: list[str],
+        worker_mode: str = "fake",
+    ) -> ControlDecision | None:
+        """Detect worker file modifications outside the plan's file boundaries.
+
+        Two enforcement modes:
+
+        1. **Read-only** (allowed_files is empty): ANY changed_files is a
+           violation — the milestone must not modify any files.  Enforced
+           for ALL worker modes.
+
+        2. **Bounded** (allowed_files has entries): every changed file must
+           fall within at least one allowed prefix/glob pattern.  Only
+           enforced for non-fake workers — fake workers generate synthetic
+           changed_files that don't reflect real file modifications.
+        """
+        if not changed_files:
+            return None
+
+        if not allowed_files:
+            # Read-only milestone — no files may be modified
+            return ControlDecision(
+                passed=False,
+                action="needs_human_review",
+                reason=(
+                    "Milestone is read-only (allowed_files=[]) but worker "
+                    f"modified files: {', '.join(changed_files)}"
+                ),
+                severity="high",
+                failure_category="policy_error",
+                failure_origin="control_plane",
+                recovery_hint="needs_human_review",
+            )
+
+        # Bounded enforcement only for real workers.
+        # Fake-worker changed_files are synthetic test artifacts and don't
+        # represent actual file modifications — checking them against the
+        # allowlist produces false positives.
+        if worker_mode == "fake":
+            return None
+
+        # Bounded milestone — verify every changed file is within scope
+        out_of_bounds: list[str] = []
+        for f in changed_files:
+            if not any(_path_within_prefix(f, prefix) for prefix in allowed_files):
+                out_of_bounds.append(f)
+
+        if out_of_bounds:
+            return ControlDecision(
+                passed=False,
+                action="needs_human_review",
+                reason=(
+                    f"Worker modified files outside allowed_files: "
+                    f"{', '.join(out_of_bounds)}"
+                ),
+                severity="high",
+                failure_category="policy_error",
+                failure_origin="control_plane",
+                recovery_hint="needs_human_review",
+            )
+
+        return None
+
+    # ------------------------------------------------------------------
     # Test result checking (P1.2)
     # ------------------------------------------------------------------
 
@@ -1343,6 +1464,8 @@ class MainlineExecutor:
         packet: WorkerTaskPacket,
         evidence_status: WorkerEvidenceStatus,
         worker_result: dict[str, Any],
+        *,
+        worker_mode: str = "fake",
     ) -> list[ControlDecision]:
         """Run all relevant ControlPlane checks using the loaded policy."""
         cp = ControlPlane(policy=self._policy)
@@ -1357,6 +1480,17 @@ class MainlineExecutor:
         if changed_files:
             policy_decision = cp.check_policy_for_file_changes(files_changed=changed_files)
             decisions.append(policy_decision)
+
+            # 2b. Boundary check — worker must not modify files outside the
+            #     plan's allowed_files.  A plan with allowed_files=[] means
+            #     "read only" and any file change is a violation.
+            boundary_decision = self._check_file_boundary(
+                changed_files=changed_files,
+                allowed_files=packet.allowed_files,
+                worker_mode=worker_mode,
+            )
+            if boundary_decision is not None:
+                decisions.append(boundary_decision)
 
         # 3. Output guardrail check (against result text)
         result_text = evidence_status.reported_summary
@@ -1677,6 +1811,32 @@ def _evidence_status_to_dict(es: WorkerEvidenceStatus) -> dict[str, Any]:
         "has_missing_required": es.has_missing_required,
         "is_malformed": es.is_malformed,
     }
+
+
+def _path_within_prefix(path: str, prefix: str) -> bool:
+    """Return True if *path* falls within the directory/file scope of *prefix*.
+
+    Handles both exact matches and glob-style ``dir/**`` patterns.
+    """
+    # Normalize separators
+    p = path.replace("\\", "/").rstrip("/")
+    pre = prefix.replace("\\", "/").rstrip("/")
+
+    # Exact file match
+    if p == pre:
+        return True
+
+    # Glob match: "dir/**" means everything under dir/
+    if pre.endswith("/**"):
+        base = pre[:-3].rstrip("/") + "/"
+        return p.startswith(base)
+
+    # Directory prefix match: "dir/" means everything under dir/
+    if pre.endswith("/"):
+        return p.startswith(pre)
+
+    # Partial path match (less common but valid)
+    return p.startswith(pre + "/") or p.startswith(pre + ".")
 
 
 def _decision_to_dict(d: ControlDecision) -> dict[str, Any]:

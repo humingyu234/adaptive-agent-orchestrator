@@ -232,20 +232,49 @@ class RuleBasedReviewer(Reviewer):
         return findings
 
     def _check_file_boundaries(self, evidence: EvidenceBundle) -> list[ReviewFinding]:
-        """Detect diff changes outside allowed_files."""
+        """Detect diff changes outside allowed_files.
+
+        Two enforcement modes:
+
+        1. **Read-only** (allowed_files is empty): ANY file change is a
+           violation — the milestone must not modify any files.
+        2. **Bounded** (allowed_files has entries): only changes inside
+           the listed files are permitted.
+        """
         findings: list[ReviewFinding] = []
         diff = evidence.diff_content
-        allowed = set(evidence.allowed_files)
-        if not diff or not allowed:
+        if not diff:
             return findings
 
-        # Extract file paths from git diff headers (--- a/... / +++ b/...)
         import re
         diff_files: set[str] = set()
         for marker in ("--- a/", "+++ b/"):
             for m in re.finditer(rf"{re.escape(marker)}(\S+)", diff):
                 diff_files.add(m.group(1))
 
+        if not diff_files:
+            return findings
+
+        allowed = set(evidence.allowed_files)
+
+        if not allowed:
+            # Read-only milestone — every changed file is a violation
+            for path in sorted(diff_files):
+                findings.append(ReviewFinding(
+                    finding_id=_new_finding_id(),
+                    step_id=evidence.step_id,
+                    severity="blocking",
+                    category="protected_action",
+                    description=(
+                        f"Read-only milestone: diff touches {path} "
+                        f"but allowed_files is empty (no files may be modified)"
+                    ),
+                    location=path,
+                    source="reviewer",
+                ))
+            return findings
+
+        # Bounded milestone — files must be within the allowlist
         out_of_bounds = diff_files - allowed
         for path in sorted(out_of_bounds):
             findings.append(ReviewFinding(
