@@ -77,6 +77,7 @@ class WorkerTaskPacket:
     expected_evidence: list[str] = field(default_factory=list)
     risk_level: str = "low"
     run_mode: str = "controlled"
+    timeout_seconds: int = 600
     project_root: str = "."
     created_at: str = ""
 
@@ -99,6 +100,7 @@ class WorkerTaskPacket:
         expected_evidence: list[str] | None = None,
         risk_level: str = "low",
         run_mode: str = "controlled",
+        timeout_seconds: int = 600,
     ) -> WorkerTaskPacket:
         run_id = run_id or _utc_now_compact()
         task_id = task_id or f"task-{_utc_now_compact()}"
@@ -115,6 +117,7 @@ class WorkerTaskPacket:
             expected_evidence=expected_evidence or [],
             risk_level=risk_level,
             run_mode=run_mode,
+            timeout_seconds=timeout_seconds,
             project_root=project_root,
             created_at=datetime.now(timezone.utc).isoformat(),
         )
@@ -151,6 +154,7 @@ class WorkerTaskPacket:
             "expected_evidence": self.expected_evidence,
             "risk_level": self.risk_level,
             "run_mode": self.run_mode,
+            "timeout_seconds": self.timeout_seconds,
             "created_at": self.created_at,
         }
 

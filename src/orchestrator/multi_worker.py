@@ -10,7 +10,7 @@ from __future__ import annotations
 import json
 import os
 import uuid
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -168,12 +168,16 @@ class MultiWorkerExecutor:
         policy: Policy | None = None,
         max_workers: int = 2,
         worker_mode: str = "fake",
+        timeout_seconds: int = 600,
+        behaviour: str | None = None,
         progress_callback: Callable[[MultiWorkerResult], None] | None = None,
     ) -> None:
         self.project_root = project_root or Path.cwd()
         self._policy = policy or self._load_policy()
         self._max_workers = max_workers
         self._worker_mode = worker_mode
+        self._timeout_seconds = timeout_seconds
+        self._behaviour = behaviour
         self._progress_callback = progress_callback
 
         self._cp = ControlPlane(policy=self._policy)
@@ -421,11 +425,16 @@ class MultiWorkerExecutor:
             for future in as_completed(futures):
                 step = futures[future]
                 try:
-                    step_result = future.result()
+                    step_result = future.result(timeout=self._timeout_seconds)
                     if step_result.status == "passed":
                         completed.add(step.step_id)
                     else:
                         failed.add(step.step_id)
+                except FutureTimeoutError:
+                    step.status = "failed"
+                    step.error = f"Worker timed out after {self._timeout_seconds}s"
+                    step.finished_at = _utc_now_iso()
+                    failed.add(step.step_id)
                 except Exception as exc:
                     step.status = "failed"
                     step.error = str(exc)
@@ -443,12 +452,28 @@ class MultiWorkerExecutor:
         completed: set[str],
         failed: set[str],
     ) -> None:
-        """Execute one step synchronously."""
-        step_result = self._run_one_step(plan, step, run_id)
-        if step_result.status == "passed":
-            completed.add(step.step_id)
-        else:
-            failed.add(step.step_id)
+        """Execute one step with timeout enforcement."""
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(self._run_one_step, plan, step, run_id)
+            try:
+                step_result = future.result(timeout=self._timeout_seconds)
+                if step_result.status == "passed":
+                    completed.add(step.step_id)
+                else:
+                    failed.add(step.step_id)
+            except FutureTimeoutError:
+                step.status = "failed"
+                step.error = f"Worker timed out after {self._timeout_seconds}s"
+                step.finished_at = _utc_now_iso()
+                failed.add(step.step_id)
+            except Exception as exc:
+                step.status = "failed"
+                step.error = str(exc)
+                step.finished_at = _utc_now_iso()
+                failed.add(step.step_id)
+
+        if self._progress_callback:
+            self._notify_progress(step)
 
     # ------------------------------------------------------------------
     # Single step execution (the real work)
@@ -482,17 +507,16 @@ class MultiWorkerExecutor:
             # 3. Execute worker
             worker_result = self._execute_worker(packet)
 
-            # 3b. Infrastructure failure check
-            if self._worker_mode == "claude-code":
-                infra = self._check_worker_infrastructure(worker_result)
-                if infra:
-                    step.control_decisions.extend(infra)
-                    step.status = "failed"
-                    step.error = worker_result.get("error", "infrastructure failure")
-                    step.finished_at = _utc_now_iso()
-                    step.packet_dir = str(packet.packet_root)
-                    step.worker_result = worker_result
-                    return step
+            # 3b. Infrastructure failure check (applies to all worker modes)
+            infra = self._check_worker_infrastructure(worker_result)
+            if infra:
+                step.control_decisions.extend(infra)
+                step.status = "failed"
+                step.error = worker_result.get("error", "infrastructure failure")
+                step.finished_at = _utc_now_iso()
+                step.packet_dir = str(packet.packet_root)
+                step.worker_result = worker_result
+                return step
 
             # 4. Classify evidence
             evidence_status = classify_worker_evidence_from_packet(packet)
@@ -555,6 +579,7 @@ class MultiWorkerExecutor:
                 ],
                 risk_level=worker_task.risk_level,
                 run_mode=plan.run_mode,
+                timeout_seconds=self._timeout_seconds,
             )
 
         # Fallback: build from plan.steps text
@@ -574,6 +599,7 @@ class MultiWorkerExecutor:
             expected_evidence=evidence,
             risk_level="medium",
             run_mode=plan.run_mode,
+            timeout_seconds=self._timeout_seconds,
         )
 
     def _preflight_check(self, packet: WorkerTaskPacket) -> ControlDecision | None:
@@ -622,7 +648,12 @@ class MultiWorkerExecutor:
 
     def _execute_fake(self, packet: WorkerTaskPacket) -> dict[str, Any]:
         from .workers.fake_worker import run_fake_worker
-        return run_fake_worker(packet, packet_dir=packet.packet_root)
+        return run_fake_worker(
+            packet,
+            packet_dir=packet.packet_root,
+            behaviour=self._behaviour,
+            timeout_seconds=self._timeout_seconds,
+        )
 
     def _execute_claude_code(self, packet: WorkerTaskPacket) -> dict[str, Any]:
         from .workers.claude_code import (

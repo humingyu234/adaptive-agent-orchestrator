@@ -29,12 +29,14 @@ BEHAVIOUR_SUCCESS = "success"
 BEHAVIOUR_MISSING_EVIDENCE = "missing_evidence"
 BEHAVIOUR_TEST_FAILURE = "test_failure"
 BEHAVIOUR_PROTECTED_FILE = "protected_file"
+BEHAVIOUR_TIMEOUT = "timeout"
 
 _KNOWN_BEHAVIOURS = frozenset([
     BEHAVIOUR_SUCCESS,
     BEHAVIOUR_MISSING_EVIDENCE,
     BEHAVIOUR_TEST_FAILURE,
     BEHAVIOUR_PROTECTED_FILE,
+    BEHAVIOUR_TIMEOUT,
 ])
 
 
@@ -44,6 +46,8 @@ def _pick_behaviour(packet: WorkerTaskPacket, explicit: str | None) -> str:
         return explicit
     # Default: detect from packet title / objective keywords
     combined = f"{packet.title} {packet.objective}".lower()
+    if "timeout" in combined:
+        return BEHAVIOUR_TIMEOUT
     if "missing evidence" in combined or "no evidence" in combined or "skip evidence" in combined:
         return BEHAVIOUR_MISSING_EVIDENCE
     if "protected file" in combined or "secrets" in combined or "credential" in combined:
@@ -99,6 +103,16 @@ def _write_result_md(packet_dir: Path, behaviour: str, task_title: str) -> Path:
             f"### Tests run\n"
             f"- pytest: 5 passed\n"
         ),
+        BEHAVIOUR_TIMEOUT: (
+            f"## Result: {task_title}\n\n"
+            f"### What happened\n"
+            f"The worker exceeded its time limit and was terminated.\n\n"
+            f"### Tests run\n"
+            f"- No tests completed within the time window.\n\n"
+            f"### Risks\n"
+            f"- Task may be too large for the configured timeout.\n"
+            f"- Partial results may exist but were not written.\n"
+        ),
     }
     content = summaries.get(behaviour, summaries[BEHAVIOUR_SUCCESS])
     path = packet_dir / "result.md"
@@ -128,6 +142,10 @@ def _write_status_json(packet_dir: Path, behaviour: str, task_id: str) -> Path:
     elif behaviour == BEHAVIOUR_PROTECTED_FILE:
         status_data["changed_files"] = ["src/main.py", "config/secrets.yaml"]
         status_data["summary"] = "Updated main entry point and secrets"
+    elif behaviour == BEHAVIOUR_TIMEOUT:
+        status_data["status"] = "timeout"
+        status_data["changed_files"] = []
+        status_data["summary"] = "Worker timed out before completing"
 
     path = packet_dir / "status.json"
     path.write_text(json.dumps(status_data, indent=2, ensure_ascii=False), encoding="utf-8")
@@ -140,8 +158,8 @@ def _write_observed_evidence(packet_dir: Path, behaviour: str) -> list[Path]:
     observed_dir.mkdir(parents=True, exist_ok=True)
     written: list[Path] = []
 
-    if behaviour == BEHAVIOUR_MISSING_EVIDENCE:
-        # Intentionally write nothing — this is the "missing evidence" scenario
+    if behaviour in (BEHAVIOUR_MISSING_EVIDENCE, BEHAVIOUR_TIMEOUT):
+        # Intentionally write nothing — missing evidence / timeout scenarios
         return written
 
     # test_output.txt
@@ -312,6 +330,7 @@ def run_fake_worker(
     *,
     behaviour: str | None = None,
     packet_dir: Path | None = None,
+    timeout_seconds: int = 600,
 ) -> dict[str, Any]:
     """Execute a fake worker, writing result/status/evidence files to disk.
 
@@ -319,14 +338,39 @@ def run_fake_worker(
         packet: The WorkerTaskPacket describing what to do.
         behaviour: One of BEHAVIOUR_* or None to auto-detect from packet.
         packet_dir: Override the packet directory (defaults to packet.packet_root).
+        timeout_seconds: Timeout for this worker execution (used in timeout
+            behaviour to report the configured limit).
 
     Returns:
         A dict with keys: run_id, task_id, packet_dir, behaviour, result_md_path,
-        status_json_path, observed_paths, changed_files, summary.
+        status_json_path, observed_paths, changed_files, summary, and
+        timeout-specific keys (timed_out, exit_code, error, timeout) when
+        the timeout behaviour triggers.
     """
     resolved_behaviour = _pick_behaviour(packet, behaviour)
     pdir = packet_dir or packet.packet_root
     pdir.mkdir(parents=True, exist_ok=True)
+
+    if resolved_behaviour == BEHAVIOUR_TIMEOUT:
+        _write_result_md(pdir, resolved_behaviour, packet.title or packet.objective)
+        _write_status_json(pdir, resolved_behaviour, packet.task_id)
+        _write_observed_evidence(pdir, resolved_behaviour)
+        return {
+            "run_id": packet.run_id,
+            "task_id": packet.task_id,
+            "packet_dir": str(pdir),
+            "behaviour": resolved_behaviour,
+            "timed_out": True,
+            "exit_code": -1,
+            "error": f"Worker timed out after {timeout_seconds}s",
+            "timeout": timeout_seconds,
+            "worker_status": "timeout",
+            "changed_files": [],
+            "summary": "Worker timed out before completing",
+            "result_md_path": str(pdir / "result.md"),
+            "status_json_path": str(pdir / "status.json"),
+            "observed_paths": [],
+        }
 
     result_md = _write_result_md(pdir, resolved_behaviour, packet.title or packet.objective)
     status_json = _write_status_json(pdir, resolved_behaviour, packet.task_id)
@@ -346,4 +390,7 @@ def run_fake_worker(
         "changed_files": status_data.get("changed_files", []),
         "summary": status_data.get("summary", ""),
         "worker_status": status_data.get("status", "completed"),
+        "timed_out": False,
+        "exit_code": 0,
+        "error": "",
     }

@@ -1,3 +1,4 @@
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from typing import Any
 import hashlib
 import json
@@ -72,6 +73,7 @@ class Scheduler:
         llm_overrides: dict[str, dict[str, str | None]] | None = None,
         policy: Policy | None = None,
         recovery_playbook: RecoveryPlaybook | None = None,
+        timeout_seconds: int = 600,
     ):
         self.workflow = workflow
         self.evaluator = Evaluator()
@@ -97,6 +99,7 @@ class Scheduler:
         self._policy = policy or Policy.defaults()
         self._attempt_tracker = AttemptTracker()
         self._playbook = recovery_playbook or RecoveryPlaybook()
+        self._timeout_seconds = timeout_seconds
 
     def run(self, query: str) -> tuple[StateCenter, RunResult]:
         state = StateCenter(query=query, max_steps=self.workflow.get("max_steps", 10))
@@ -358,11 +361,19 @@ class Scheduler:
             start = perf_counter()
             output: dict = {}
             error_message = ""
+            failure_reason = ""
             status = "success"
 
             try:
                 self._run_input_guardrails(agent=agent, agent_name=agent_name, view=view)
-                output = agent.run(view)
+                with ThreadPoolExecutor(max_workers=1) as executor:
+                    future = executor.submit(agent.run, view)
+                    try:
+                        output = future.result(timeout=self._timeout_seconds)
+                    except FutureTimeoutError:
+                        raise TimeoutError(
+                            f"Agent {agent_name} timed out after {self._timeout_seconds}s"
+                        )
                 self._run_output_guardrails(agent=agent, agent_name=agent_name, output=output)
                 for write_spec in agent.config.writes:
                     if write_spec.field in output:
@@ -370,6 +381,7 @@ class Scheduler:
             except GuardrailViolation as exc:
                 status = "guardrail_blocked"
                 error_message = exc.message
+                failure_reason = "input_guardrail_blocked"
                 state.execution_trace.append(
                     {
                         "event": "guardrail_violation",
@@ -381,9 +393,23 @@ class Scheduler:
                         "timestamp": utc_now_iso(),
                     }
                 )
+            except TimeoutError as exc:
+                status = "error"
+                error_message = str(exc)
+                failure_reason = "timeout"
+                state.execution_trace.append(
+                    {
+                        "event": "agent_timeout",
+                        "agent_name": agent_name,
+                        "timeout_seconds": self._timeout_seconds,
+                        "reason": error_message,
+                        "timestamp": utc_now_iso(),
+                    }
+                )
             except Exception as exc:  # pragma: no cover - runtime defensive path
                 status = "error"
                 error_message = str(exc)
+                failure_reason = "unknown"
 
             duration_ms = int((perf_counter() - start) * 1000)
 
@@ -451,9 +477,7 @@ class Scheduler:
                     failure_category=FailureCategory.GUARDRAIL_BLOCKED
                     if status == "guardrail_blocked"
                     else FailureCategory.UNKNOWN,
-                    failure_reason="input_guardrail_blocked"
-                    if status == "guardrail_blocked"
-                    else "unknown",
+                    failure_reason=failure_reason,
                     failure_origin="control_plane"
                     if status == "guardrail_blocked"
                     else "scheduler",
