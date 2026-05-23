@@ -882,7 +882,7 @@ def _default_model_for(provider_name: str) -> str:
     """Return a sensible default model for a given provider."""
     defaults: dict[str, str] = {
         "deepseek": os.environ.get("AAO_PLANNING_DEFAULT_MODEL", "deepseek-v4-pro"),
-        "glm": "GLM-5.1",
+        "glm": os.environ.get("GLM_DEFAULT_MODEL", "GLM-5.1"),
         "kimi": "moonshot-v1-8k",
         "openai": "gpt-4o-mini",
         "anthropic": "claude-sonnet-4-6",
@@ -1107,10 +1107,15 @@ class PlanningCouncil:
         seen_non_blocking: set[str] = set()
 
         for c in candidates:
-            for s in c.steps:
-                if s not in seen_steps:
-                    seen_steps.add(s)
-                    all_steps.append(s)
+            # Only take steps from the planner (first candidate).  Risk
+            # reviewer and execution planner produce their own structured
+            # outputs (blocking concerns, worker_tasks) — mixing their
+            # steps into the plan creates near-duplicate milestones.
+            if c is candidates[0]:
+                for s in c.steps:
+                    if s not in seen_steps:
+                        seen_steps.add(s)
+                        all_steps.append(s)
             for r in c.risks:
                 if r not in seen_risks:
                     seen_risks.add(r)
