@@ -1118,6 +1118,7 @@ class MainlineExecutor:
         expected_evidence: list[str] = list(plan.required_evidence)
 
         has_explicit_tasks = bool(plan.planned_worker_tasks)
+        explicit_read_only = False
 
         if has_explicit_tasks:
             pwt = plan.planned_worker_tasks[0]
@@ -1126,6 +1127,11 @@ class MainlineExecutor:
             required_checks = list(pwt.required_checks)
             if pwt.expected_evidence:
                 expected_evidence = list(pwt.expected_evidence)
+            explicit_read_only = (
+                not pwt.allowed_files
+                and not pwt.required_checks
+                and not pwt.expected_evidence
+            )
 
         # Fallback: only when no planned_worker_tasks exist.
         # When planned_worker_tasks IS present, allowed_files=[] is a
@@ -1135,16 +1141,17 @@ class MainlineExecutor:
                 allowed_files = self._extract_files_from_plan(plan)
             if not required_checks:
                 required_checks = self._infer_required_checks(plan)
-        if not expected_evidence:
+        if not expected_evidence and not explicit_read_only:
             expected_evidence = ["test_output.txt", "diff.patch"]
 
         # Policy-driven: protected files from the loaded policy, not hardcoded
         protected_files = list(policy.protected_files)
         # Policy-driven: required checks from policy
         policy_checks = policy.get_required_checks()
-        for check in policy_checks:
-            if check not in required_checks:
-                required_checks.append(check)
+        if not explicit_read_only:
+            for check in policy_checks:
+                if check not in required_checks:
+                    required_checks.append(check)
 
         # Filter out standard packet outputs — these live at the packet root
         # and are verified via load_worker_status/load_worker_result_text, not
@@ -1153,7 +1160,7 @@ class MainlineExecutor:
             e for e in expected_evidence
             if e not in ("result.md", "status.json")
         ]
-        if not expected_evidence:
+        if not expected_evidence and not explicit_read_only:
             expected_evidence = ["test_output.txt", "diff.patch"]
 
         risk_level = "high" if plan.human_review_gates else "medium"

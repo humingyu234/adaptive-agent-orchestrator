@@ -93,6 +93,8 @@ class ClaudeCodeTaskRenderer:
             lines.append("")
             for f in packet.allowed_files:
                 lines.append(f"- `{f}`")
+        elif _is_read_only_packet(packet):
+            lines.append("- Read-only task. Do not modify project files.")
         else:
             lines.append("- (no allowlist — all files may be in scope)")
         lines.append("")
@@ -198,6 +200,14 @@ class ClaudeCodeTaskRenderer:
 _DEFAULT_RENDERER = ClaudeCodeTaskRenderer()
 
 
+def _is_read_only_packet(packet: WorkerTaskPacket) -> bool:
+    return (
+        not packet.allowed_files
+        and not packet.required_checks
+        and not packet.expected_evidence
+    )
+
+
 # =============================================================================
 # Result loading
 # =============================================================================
@@ -275,7 +285,7 @@ class ClaudeCodeWorkerConfig:
     timeout_seconds: int = 600
     prompt_mode: str = "stdin"  # stdin | file
     project_root: str = ""
-    extra_args: list[str] = field(default_factory=lambda: ["-p", "--verbose", "--permission-mode", "auto"])
+    extra_args: list[str] = field(default_factory=lambda: ["-p", "--verbose"])
 
     @classmethod
     def from_env(cls, project_root: str = "") -> "ClaudeCodeWorkerConfig":

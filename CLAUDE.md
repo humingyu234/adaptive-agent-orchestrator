@@ -8,7 +8,14 @@ AAO 项目级操作指南。改代码前先读这个。遵循它除非用户明�
 
 新开 Claude Code / Codex 会话接管 AAO 时，不要直接凭记忆判断功能状态。
 
-先读 `AAO_FRONT_DOOR.md`，再做：
+先读：
+
+- `AAO_FRONT_DOOR.md`
+- `docs/current_state.md`
+- `docs/next_steps.md`
+- 最新的 `docs/incidents/*.md` / `docs/reviews/*.md`
+
+再做：
 
 ```bash
 git status --short

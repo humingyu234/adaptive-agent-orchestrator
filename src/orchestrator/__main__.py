@@ -1608,6 +1608,27 @@ def _handle_project_command(args) -> None:
         _handle_project_self_check(args, store)
 
 
+_PROJECT_SESSION_DEFERRED_CONCERN_PREFIXES = (
+    "BLOCKING: Code change requested but no files specified",
+    "BLOCKING: Large code task with zero files mentioned",
+    "BLOCKING: Planned worker task has no allowed_files / denied_files",
+    "BLOCKING: Cannot plan execution steps without file boundaries",
+)
+
+
+def _project_start_blocking_concerns(plan: PlanContract) -> list[str]:
+    """Return concerns that should really block project session creation.
+
+    File-boundary concerns are important, but project sessions are allowed to
+    start broad and refine boundaries at each milestone/worker packet.  Those
+    concerns become open risks instead of preventing milestone creation.
+    """
+    return [
+        c for c in plan.blocking_concerns
+        if not any(c.startswith(prefix) for prefix in _PROJECT_SESSION_DEFERRED_CONCERN_PREFIXES)
+    ]
+
+
 def _handle_project_start(args, store: ProjectSessionStore) -> None:
     """Create a new project session and optionally generate a plan."""
     session = store.create_session(
@@ -1626,16 +1647,16 @@ def _handle_project_start(args, store: ProjectSessionStore) -> None:
         task_type="project",
     )
 
-    # Check for blocking concerns BEFORE creating milestones.
-    # If any advisor (planner, reviewer, execution planner) raised
-    # blocking issues, we must show them and stop — not create an
-    # empty or broken project.
-    if plan.has_blocking_concerns:
+    # Check for blocking concerns BEFORE creating milestones.  Concerns about
+    # missing file boundaries are deferred to milestone execution; project-level
+    # planning often starts from a broad goal and refines scope later.
+    blocking_concerns = _project_start_blocking_concerns(plan)
+    if blocking_concerns:
         store.log_decision(session.project_id, DecisionLog(
             entry_id=_new_id(),
             timestamp=_now(),
             decision="Project creation blocked by planning council concerns",
-            reason="; ".join(plan.blocking_concerns[:5]),
+            reason="; ".join(blocking_concerns[:5]),
             made_by="planning_council",
         ))
         print(json.dumps({
@@ -1643,7 +1664,7 @@ def _handle_project_start(args, store: ProjectSessionStore) -> None:
             "goal": session.goal,
             "status": session.status,
             "error": "Planning Council found blocking concerns — cannot create milestones.",
-            "blocking_concerns": plan.blocking_concerns,
+            "blocking_concerns": blocking_concerns,
             "next": (
                 "Resolve the blocking concerns above and try again, "
                 "or use --planning-mode deterministic to bypass LLM planning."
@@ -1668,6 +1689,7 @@ def _handle_project_start(args, store: ProjectSessionStore) -> None:
         session.current_milestone = milestones[0].milestone_id
 
     store.save_milestones(session.project_id, milestones)
+    session.open_risks = list(plan.blocking_concerns)
     session.next_recommended_action = (
         f"Review and approve milestone: {milestones[0].name}"
         if milestones else "No milestones yet"

@@ -4,7 +4,7 @@
 Refactor error handling in src/errors.py, src/middleware.py, and tests/test_errors.py to use structured error types
 
 ## Plan
-- **Steps**: 12
+- **Steps**: 7
 - **Success criteria**: All required checks pass, All expected evidence is produced and verified, Evidence files present: test_output.txt, diff.patch, result.md, status.json, All human review gates are satisfied
 - **Required evidence**: test_output.txt, diff.patch, result.md, status.json
 - **Approval status**: approved

@@ -37,7 +37,7 @@
   "plan_verification": {
     "plan_id": "demo-full-control-loop-001",
     "task_size": "large",
-    "steps_count": 12,
+    "steps_count": 7,
     "has_success_criteria": true,
     "has_required_evidence": true,
     "blocking_concerns": [],

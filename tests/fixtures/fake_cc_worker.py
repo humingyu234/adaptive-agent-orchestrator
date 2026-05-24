@@ -117,7 +117,7 @@ def main() -> None:
         encoding="utf-8",
     )
     _write_minimal(str(pdir), "completed", "14 passed, 0 failed. Added helper function.",
-                   changed_files=["src/utils.py", "tests/test_utils.py"])
+                   changed_files=["src/utils.py"])
     (pdir / "result.md").write_text(
         "## Result\n\n### What changed\n- Added helper function to src/utils.py\n"
         "### Tests run\n- pytest: 14 passed, 0 failed\n",

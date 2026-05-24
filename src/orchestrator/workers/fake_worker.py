@@ -57,6 +57,14 @@ def _pick_behaviour(packet: WorkerTaskPacket, explicit: str | None) -> str:
     return BEHAVIOUR_SUCCESS
 
 
+def _is_read_only_packet(packet: WorkerTaskPacket) -> bool:
+    return (
+        not packet.allowed_files
+        and not packet.required_checks
+        and not packet.expected_evidence
+    )
+
+
 # ---------------------------------------------------------------------------
 # File writers
 # ---------------------------------------------------------------------------
@@ -370,6 +378,43 @@ def run_fake_worker(
             "result_md_path": str(pdir / "result.md"),
             "status_json_path": str(pdir / "status.json"),
             "observed_paths": [],
+        }
+
+    if resolved_behaviour == BEHAVIOUR_SUCCESS and _is_read_only_packet(packet):
+        result_md = pdir / "result.md"
+        result_md.write_text(
+            f"## Result: {packet.title or packet.objective}\n\n"
+            "### What changed\n"
+            "- No files changed. Read-only inspection completed.\n\n"
+            "### Tests run\n"
+            "- Not required for this read-only milestone.\n",
+            encoding="utf-8",
+        )
+        status_json = pdir / "status.json"
+        status_json.write_text(
+            json.dumps({
+                "task_id": packet.task_id,
+                "status": "completed",
+                "worker_kind": "fake",
+                "changed_files": [],
+                "summary": "Read-only inspection completed. No files changed.",
+            }, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        return {
+            "run_id": packet.run_id,
+            "task_id": packet.task_id,
+            "packet_dir": str(pdir),
+            "behaviour": resolved_behaviour,
+            "result_md_path": str(result_md),
+            "status_json_path": str(status_json),
+            "observed_paths": [],
+            "changed_files": [],
+            "summary": "Read-only inspection completed. No files changed.",
+            "worker_status": "completed",
+            "timed_out": False,
+            "exit_code": 0,
+            "error": "",
         }
 
     result_md = _write_result_md(pdir, resolved_behaviour, packet.title or packet.objective)
