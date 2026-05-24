@@ -7,6 +7,7 @@ and run-mode behaviour (log vs controlled for missing evidence).
 from __future__ import annotations
 
 import json
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -560,6 +561,17 @@ class TestReportWriterWorkerEvidence:
 FAKE_CC = str(Path(__file__).resolve().parent / "fixtures" / "fake_cc_worker.py")
 
 
+def _init_git_worktree(root: Path, *, with_passing_test: bool = False) -> None:
+    subprocess.run(["git", "-C", str(root), "init", "-q"], check=True)
+    subprocess.run(["git", "-C", str(root), "config", "user.email", "t@t.t"], check=True)
+    subprocess.run(["git", "-C", str(root), "config", "user.name", "t"], check=True)
+    (root / "README.md").write_text("# Test project\n", encoding="utf-8")
+    if with_passing_test:
+        (root / "test_pass.py").write_text("def test_pass():\n    assert True\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(root), "add", "-A"], check=True)
+    subprocess.run(["git", "-C", str(root), "commit", "-q", "-m", "init"], check=True)
+
+
 def _make_test_packet(tmp_path: Path, **kwargs) -> WorkerTaskPacket:
     """Create a WorkerTaskPacket pointing at a temp directory."""
     pkt_root = tmp_path / ".aao" / "tasks" / "run-test" / "task-test"
@@ -697,6 +709,7 @@ class TestMainlineClaudeCodeWorker:
         from orchestrator.mainline_executor import MainlineExecutor
         from orchestrator.planning import PlanContract
 
+        _init_git_worktree(tmp_path, with_passing_test=True)
         monkeypatch.setenv("AAO_CLAUDE_CODE_COMMAND",
                           f"python3 {FAKE_CC} --behavior success --packet-dir REPLACE_ME")
         # We need to intercept the command to fix the packet dir.  Use a wrapper.
@@ -774,6 +787,7 @@ class TestMainlineClaudeCodeWorker:
         from orchestrator.mainline_executor import MainlineExecutor
         from orchestrator.planning import PlanContract
 
+        _init_git_worktree(tmp_path)
         plan = PlanContract(
             objective="Test command missing",
             run_mode="controlled",
@@ -819,6 +833,7 @@ class TestMainlineClaudeCodeWorker:
         from orchestrator.mainline_executor import MainlineExecutor
         from orchestrator.planning import PlanContract
 
+        _init_git_worktree(tmp_path)
         plan = PlanContract(
             objective="Test timeout",
             run_mode="controlled",
@@ -863,6 +878,7 @@ class TestMainlineClaudeCodeWorker:
         from orchestrator.mainline_executor import MainlineExecutor
         from orchestrator.planning import PlanContract
 
+        _init_git_worktree(tmp_path)
         plan = PlanContract(
             objective="Test nonzero exit",
             run_mode="controlled",

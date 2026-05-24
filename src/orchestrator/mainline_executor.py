@@ -23,7 +23,13 @@ from .auto_repair import AutoRepairLoop, FixTask, ReviewFinding
 from .control_models import ControlDecision, WorkerEvidenceStatus
 from .control_plane import ControlPlane
 from .failure_taxonomy import FailureCategory, FailureReason
-from .independent_evidence import IndependentEvidence, capture_independent_evidence
+from .independent_evidence import (
+    GitBaseline,
+    IndependentEvidence,
+    capture_git_baseline,
+    capture_independent_evidence,
+    rejected_required_checks,
+)
 from .planning import PlanContract, PlannedWorkerTask, plan_contract_to_dict
 from .policy import Policy
 from .worker_protocol import (
@@ -200,6 +206,34 @@ class MainlineExecutor:
         # 1. Convert plan to WorkerTaskPacket
         packet = self._plan_to_packet(plan, run_id=run_id, task_id=task_id)
 
+        baseline: GitBaseline | None = None
+        if worker_mode == "claude-code":
+            check_policy_decisions = self._check_required_check_policy(packet)
+            if check_policy_decisions:
+                return MainlineResult(
+                    run_id=run_id,
+                    task_id=task_id,
+                    plan_id=plan.plan_id,
+                    status="blocked_needs_review",
+                    worker_mode=worker_mode,
+                    control_decisions=[_decision_to_dict(d) for d in check_policy_decisions],
+                    worker_packet_path=str(packet.packet_root),
+                    summary=check_policy_decisions[0].reason,
+                )
+            baseline = capture_git_baseline(packet, self.project_root)
+            if baseline is None:
+                decision = self._missing_git_baseline_decision()
+                return MainlineResult(
+                    run_id=run_id,
+                    task_id=task_id,
+                    plan_id=plan.plan_id,
+                    status="blocked_needs_review",
+                    worker_mode=worker_mode,
+                    control_decisions=[_decision_to_dict(decision)],
+                    worker_packet_path=str(packet.packet_root),
+                    summary=decision.reason,
+                )
+
         # 2. Execute worker
         worker_result = self._execute_worker(packet, worker_mode=worker_mode)
 
@@ -250,6 +284,7 @@ class MainlineExecutor:
         all_control_decisions: list[ControlDecision] = []
         final_evidence_status: WorkerEvidenceStatus | None = None
         final_worker_result: dict[str, Any] = worker_result
+        final_independent: IndependentEvidence | None = None
 
         for attempt in range(max_retries + 1):
             # 2d. Independent observation (real worker modes only): AAO runs the
@@ -258,7 +293,10 @@ class MainlineExecutor:
             #     (→ fall back to reported evidence) when not a git work tree.
             independent: IndependentEvidence | None = None
             if worker_mode == "claude-code":
-                independent = capture_independent_evidence(packet, self.project_root)
+                independent = capture_independent_evidence(
+                    packet, self.project_root, baseline=baseline
+                )
+            final_independent = independent
 
             # 3. Classify evidence (AAO-observed changed files override self-report)
             evidence_status = classify_worker_evidence_from_packet(
@@ -277,7 +315,11 @@ class MainlineExecutor:
                 test_decisions = self._check_test_results(packet)
 
             # 5. Run ControlPlane checks
-            control_decisions = test_decisions + self._run_control_checks(
+            baseline_decisions = (
+                self._check_baseline_integrity(independent)
+                if independent is not None else []
+            )
+            control_decisions = test_decisions + baseline_decisions + self._run_control_checks(
                 packet, evidence_status, final_worker_result,
                 worker_mode=worker_mode,
             )
@@ -308,6 +350,9 @@ class MainlineExecutor:
                         time.sleep(random.uniform(0.5, 3.0))
 
                 # Re-execute worker for next attempt
+                # Keep the original task baseline across retries so final
+                # evidence contains every net change introduced by this task,
+                # not only changes made during the last attempt.
                 final_worker_result = self._execute_worker(packet, worker_mode=worker_mode)
                 continue
             break
@@ -339,7 +384,7 @@ class MainlineExecutor:
                     category=primary.failure_category,
                     location=affected_file,
                 )
-                repair_result, fix_packet = self._try_auto_repair(
+                repair_result, fix_packet, fix_independent, fix_worker_result = self._try_auto_repair(
                     finding=finding,
                     worker_mode=worker_mode,
                 )
@@ -358,6 +403,16 @@ class MainlineExecutor:
                     # fix evidence, not the stale original packet.
                     if fix_packet is not None:
                         packet = fix_packet
+                        final_independent = fix_independent
+                        if fix_worker_result is not None:
+                            final_worker_result = fix_worker_result
+                        final_evidence_status = classify_worker_evidence_from_packet(
+                            packet,
+                            observed_changed_files=(
+                                fix_independent.changed_files
+                                if fix_independent is not None else None
+                            ),
+                        )
 
         # 6c. Phase 23: run reviewer on observed evidence
         #
@@ -367,7 +422,7 @@ class MainlineExecutor:
         # trigger a bounded auto-repair attempt; non-blocking ones are recorded.
         review_finding_dicts: list[dict[str, Any]] = []
         if worker_mode != "packet":
-            review_findings = self._run_reviewer(packet)
+            review_findings = self._run_reviewer(packet, final_independent)
             for finding in review_findings:
                 finding_dict: dict[str, Any] = {
                     "finding_id": finding.finding_id,
@@ -380,7 +435,7 @@ class MainlineExecutor:
                     "source": finding.source,
                 }
                 if finding.is_blocking:
-                    repair_result, _fix_pkt = self._try_auto_repair(
+                    repair_result, _fix_pkt, _fix_ev, _fix_wr = self._try_auto_repair(
                         finding=finding,
                         worker_mode=worker_mode,
                     )
@@ -433,7 +488,7 @@ class MainlineExecutor:
                 allowed_files=packet.allowed_files,
                 changed_files=final_evidence_status.changed_files,
             ):
-                codex_findings = self._run_codex_reviewer(packet)
+                codex_findings = self._run_codex_reviewer(packet, final_independent)
                 for finding in codex_findings:
                     cf_dict: dict[str, Any] = {
                         "finding_id": finding.finding_id,
@@ -446,7 +501,7 @@ class MainlineExecutor:
                         "source": "codex_reviewer",
                     }
                     if finding.is_blocking:
-                        repair_result, _fp = self._try_auto_repair(
+                        repair_result, _fp, _fev, _fwr = self._try_auto_repair(
                             finding=finding,
                             worker_mode=worker_mode,
                         )
@@ -711,7 +766,12 @@ class MainlineExecutor:
         *,
         finding: ReviewFinding,
         worker_mode: str = "fake",
-    ) -> tuple[Any, WorkerTaskPacket | None]:
+    ) -> tuple[
+        Any,
+        WorkerTaskPacket | None,
+        IndependentEvidence | None,
+        dict[str, Any] | None,
+    ]:
         """Attempt the auto-repair loop for a single blocking finding.
 
         Returns (repair_result, last_fix_packet).  *last_fix_packet* is the
@@ -720,16 +780,53 @@ class MainlineExecutor:
         evidence instead of the stale original packet.
         """
         packets: list[WorkerTaskPacket] = []
+        independent_by_task: dict[str, IndependentEvidence | None] = {}
+        worker_results: dict[str, dict[str, Any]] = {}
 
         def _dispatch(fix_task: FixTask) -> dict[str, Any]:
             fix_packet = self._fix_task_to_packet(fix_task)
             packets.append(fix_packet)
-            return self._execute_worker(fix_packet, worker_mode=worker_mode)
+            if worker_mode == "claude-code":
+                decisions = self._check_required_check_policy(fix_packet)
+                if decisions:
+                    result = {
+                        "behaviour": "blocked",
+                        "worker_status": "blocked",
+                        "summary": decisions[0].reason,
+                    }
+                    worker_results[fix_packet.task_id] = result
+                    independent_by_task[fix_packet.task_id] = None
+                    return result
+                baseline = capture_git_baseline(fix_packet, self.project_root)
+                if baseline is None:
+                    result = {
+                        "behaviour": "blocked",
+                        "worker_status": "blocked",
+                        "summary": self._missing_git_baseline_decision().reason,
+                    }
+                    worker_results[fix_packet.task_id] = result
+                    independent_by_task[fix_packet.task_id] = None
+                    return result
+            else:
+                baseline = None
+            result = self._execute_worker(fix_packet, worker_mode=worker_mode)
+            worker_results[fix_packet.task_id] = result
+            independent_by_task[fix_packet.task_id] = (
+                capture_independent_evidence(
+                    fix_packet, self.project_root, baseline=baseline
+                )
+                if worker_mode == "claude-code" else None
+            )
+            return result
 
         def _verify(result: dict[str, Any]) -> bool:
             if not packets:
                 return False
-            return self._verify_fix(result, packets[-1])
+            return self._verify_fix(
+                result,
+                packets[-1],
+                independent=independent_by_task.get(packets[-1].task_id),
+            )
 
         repair_result = self._repair_loop.attempt_repair(
             finding,
@@ -737,12 +834,20 @@ class MainlineExecutor:
             verify_fn=_verify,
             target_file=finding.location,
         )
-        return repair_result, packets[-1] if packets else None
+        last_packet = packets[-1] if packets else None
+        return (
+            repair_result,
+            last_packet,
+            independent_by_task.get(last_packet.task_id) if last_packet else None,
+            worker_results.get(last_packet.task_id) if last_packet else None,
+        )
 
     def _verify_fix(
         self,
         worker_result: dict[str, Any],
         packet: WorkerTaskPacket,
+        *,
+        independent: IndependentEvidence | None = None,
     ) -> bool:
         """Verify a FixTask's output by re-running on-disk checks.
 
@@ -755,12 +860,22 @@ class MainlineExecutor:
             return False
         if worker_result.get("worker_status") in ("blocked", "failed", "error"):
             return False
-        # Re-run test-output check
-        test_decisions = self._check_test_results(packet)
+        # Prefer checks AAO ran itself for a real worker fix.
+        if independent is not None and independent.checks:
+            test_decisions = self._check_independent_results(independent)
+        else:
+            test_decisions = self._check_test_results(packet)
         if any(not d.passed for d in test_decisions):
             return False
+        if independent is not None and self._check_baseline_integrity(independent):
+            return False
         # Evidence classification must not report missing required checks
-        evidence_status = classify_worker_evidence_from_packet(packet)
+        evidence_status = classify_worker_evidence_from_packet(
+            packet,
+            observed_changed_files=(
+                independent.changed_files if independent is not None else None
+            ),
+        )
         if evidence_status.has_missing_required:
             return False
         return True
@@ -790,20 +905,14 @@ class MainlineExecutor:
     # Phase 23 — Isolated Reviewer
     # ------------------------------------------------------------------
 
-    def _run_reviewer(self, packet: WorkerTaskPacket) -> list[ReviewFinding]:
-        """Run the reviewer on a completed packet's observed evidence.
+    def _build_reviewer_bundle(
+        self,
+        packet: WorkerTaskPacket,
+        independent: IndependentEvidence | None = None,
+    ) -> Any:
+        """Build the single evidence view consumed by both reviewer layers."""
+        from .reviewer import EvidenceBundle
 
-        Builds an EvidenceBundle from on-disk files (diff, test output,
-        result.md) and runs the configured reviewer (default: RuleBasedReviewer).
-        The reviewer receives a read-only snapshot — it cannot mutate the
-        packet or write code.
-        """
-        from .reviewer import EvidenceBundle, RuleBasedReviewer
-
-        # Read observed evidence from packet.  Prefer AAO-owned ground-truth
-        # files (written by capture_independent_evidence) over worker-deposited
-        # ones, so the reviewer audits what AAO observed, not what the worker
-        # chose to report.
         observed = packet.packet_root / "observed"
         aao_diff = observed / "aao_diff.patch"
         aao_test_output = observed / "aao_test_output.txt"
@@ -814,21 +923,25 @@ class MainlineExecutor:
         )
         result_md_path = packet.packet_root / PacketFiles.RESULT
 
-        diff_content = ""
-        if diff_path.exists():
-            diff_content = diff_path.read_text(encoding="utf-8", errors="replace")
-
-        test_output = ""
-        if test_output_path.exists():
-            test_output = test_output_path.read_text(encoding="utf-8", errors="replace")
-
-        result_md = ""
-        if result_md_path.exists():
-            result_md = result_md_path.read_text(encoding="utf-8", errors="replace")
-
-        evidence_status = classify_worker_evidence_from_packet(packet)
-
-        bundle = EvidenceBundle.from_packet(
+        diff_content = (
+            diff_path.read_text(encoding="utf-8", errors="replace")
+            if diff_path.exists() else ""
+        )
+        test_output = (
+            test_output_path.read_text(encoding="utf-8", errors="replace")
+            if test_output_path.exists() else ""
+        )
+        result_md = (
+            result_md_path.read_text(encoding="utf-8", errors="replace")
+            if result_md_path.exists() else ""
+        )
+        evidence_status = classify_worker_evidence_from_packet(
+            packet,
+            observed_changed_files=(
+                independent.changed_files if independent is not None else None
+            ),
+        )
+        return EvidenceBundle.from_packet(
             task_id=packet.task_id,
             step_id=packet.task_id,
             changed_files=evidence_status.changed_files,
@@ -841,15 +954,31 @@ class MainlineExecutor:
             worker_status=evidence_status.worker_status,
         )
 
+    def _run_reviewer(
+        self,
+        packet: WorkerTaskPacket,
+        independent: IndependentEvidence | None = None,
+    ) -> list[ReviewFinding]:
+        """Run the reviewer on a completed packet's observed evidence.
+
+        Builds an EvidenceBundle from on-disk files (diff, test output,
+        result.md) and runs the configured reviewer (default: RuleBasedReviewer).
+        The reviewer receives a read-only snapshot — it cannot mutate the
+        packet or write code.
+        """
+        from .reviewer import RuleBasedReviewer
+
         reviewer = self._reviewer or RuleBasedReviewer()
-        return reviewer.review(bundle)
+        return reviewer.review(self._build_reviewer_bundle(packet, independent))
 
     # ------------------------------------------------------------------
     # Phase 30 — Codex LLM Reviewer (Layer 2)
     # ------------------------------------------------------------------
 
     def _run_codex_reviewer(
-        self, packet: WorkerTaskPacket,
+        self,
+        packet: WorkerTaskPacket,
+        independent: IndependentEvidence | None = None,
     ) -> list[ReviewFinding]:
         """Run Codex CLI read-only sandbox reviewer on the packet evidence.
 
@@ -857,41 +986,10 @@ class MainlineExecutor:
         Codex is unavailable or the review fails — the caller treats this
         as "no additional findings."
         """
-        from .reviewer import CodexReviewer, EvidenceBundle
-
-        diff_path = packet.packet_root / PacketFiles.DIFF
-        test_output_path = packet.packet_root / PacketFiles.TEST_OUTPUT
-        result_md_path = packet.packet_root / PacketFiles.RESULT
-
-        diff_content = ""
-        if diff_path.exists():
-            diff_content = diff_path.read_text(encoding="utf-8", errors="replace")
-
-        test_output = ""
-        if test_output_path.exists():
-            test_output = test_output_path.read_text(encoding="utf-8", errors="replace")
-
-        result_md = ""
-        if result_md_path.exists():
-            result_md = result_md_path.read_text(encoding="utf-8", errors="replace")
-
-        evidence_status = classify_worker_evidence_from_packet(packet)
-
-        bundle = EvidenceBundle.from_packet(
-            task_id=packet.task_id,
-            step_id=packet.task_id,
-            changed_files=evidence_status.changed_files,
-            diff_content=diff_content,
-            test_output=test_output,
-            result_md=result_md,
-            allowed_files=packet.allowed_files,
-            denied_files=packet.denied_files,
-            required_checks=packet.required_checks,
-            worker_status=evidence_status.worker_status,
-        )
+        from .reviewer import CodexReviewer
 
         reviewer = CodexReviewer()
-        return reviewer.review(bundle)
+        return reviewer.review(self._build_reviewer_bundle(packet, independent))
 
     @staticmethod
     def _should_invoke_codex_reviewer(
@@ -1456,6 +1554,57 @@ class MainlineExecutor:
     _TEST_FAILURE_RE = re.compile(r"(\d+)\s+failed", re.IGNORECASE)
     _TEST_FAILED_LINE = re.compile(r"\bFAILED\b")
 
+    def _check_required_check_policy(
+        self, packet: WorkerTaskPacket
+    ) -> list[ControlDecision]:
+        """Block unsafe or unsupported validation commands before real execution."""
+        rejected = rejected_required_checks(packet.required_checks)
+        if not rejected:
+            return []
+        details = "; ".join(f"{cmd!r}: {reason}" for cmd, reason in rejected)
+        return [ControlDecision(
+            passed=False,
+            action="needs_human_review",
+            reason=f"Unsafe required_checks blocked before worker launch: {details}",
+            severity="high",
+            failure_category=FailureCategory.POLICY_ERROR.value,
+            failure_origin="control_plane",
+            recovery_hint="needs_human_review",
+        )]
+
+    @staticmethod
+    def _check_baseline_integrity(
+        independent: IndependentEvidence,
+    ) -> list[ControlDecision]:
+        """Block a real worker that mutates git staging/history during its task."""
+        if not independent.baseline_violations:
+            return []
+        return [ControlDecision(
+            passed=False,
+            action="needs_human_review",
+            reason="; ".join(independent.baseline_violations),
+            severity="high",
+            failure_category=FailureCategory.POLICY_ERROR.value,
+            failure_origin="worker",
+            recovery_hint="needs_human_review",
+        )]
+
+    @staticmethod
+    def _missing_git_baseline_decision() -> ControlDecision:
+        """Real controlled execution needs a git baseline for trustworthy attribution."""
+        return ControlDecision(
+            passed=False,
+            action="needs_human_review",
+            reason=(
+                "Independent evidence unavailable: real claude-code execution "
+                "requires a git worktree so AAO can capture a pre-worker baseline"
+            ),
+            severity="high",
+            failure_category=FailureCategory.POLICY_ERROR.value,
+            failure_origin="control_plane",
+            recovery_hint="needs_human_review",
+        )
+
     def _check_independent_results(
         self, independent: IndependentEvidence
     ) -> list[ControlDecision]:
@@ -1465,6 +1614,18 @@ class MainlineExecutor:
         a worker-written text file — so a worker that claims success cannot pass
         when its checks actually fail.
         """
+        rejected = [check for check in independent.checks if check.rejected]
+        if rejected:
+            names = "; ".join(c.command for c in rejected)
+            return [ControlDecision(
+                passed=False,
+                action="needs_human_review",
+                reason=f"AAO refused unsafe required check(s): {names}",
+                severity="high",
+                failure_category=FailureCategory.POLICY_ERROR.value,
+                failure_origin="control_plane",
+                recovery_hint="needs_human_review",
+            )]
         failed = independent.failed_checks
         if not failed:
             return [ControlDecision(

@@ -4,23 +4,26 @@ Updated: 2026-05-25
 
 ## P0
 
-1. Record and commit the current stable worktree.
-   - Confirm current diffs are intentional.
-   - Remove or archive temporary helper scripts such as `tmp_write_evidence.py`.
-   - Run targeted tests and full test suite where practical.
+Completed on the real single-worker `claude-code` mainline path:
 
-2. Finish hardening the Opus independent evidence review.
-   - Done for the real `claude-code` mainline path.
-   - Still decide how packet/fake/multi-worker/langgraph paths should label reported vs observed evidence.
-   - Add baseline handling or a clean-worktree precondition so old dirty files do not contaminate worker changed-file evidence.
+- AAO-owned evidence capture.
+- Pre-worker git baseline and baseline-relative worker attribution.
+- Git `HEAD` / index mutation detection during real worker execution.
+- Shared AAO-owned evidence bundle for RuleBasedReviewer and CodexReviewer.
+- Safe required-check command families and a total execution budget.
+- Fail-fast git-worktree requirement for real controlled `claude-code` execution.
 
-3. Add Worker Doctor / Claude worker preflight.
+Next:
+
+1. Remove or archive temporary helper script `tmp_write_evidence.py`.
+
+2. Add Worker Doctor / Claude worker preflight.
    - Check configured `claude` path.
    - Check relevant env/API/proxy presence.
    - Run a short `claude -p` smoke test before long worker tasks.
    - Fail fast with observed evidence instead of waiting 600 seconds.
 
-4. Run medium real task acceptance.
+3. Run medium real task acceptance.
    - Real Claude Code worker.
    - 1-3 files changed.
    - AAO-owned checks and diff.
@@ -31,6 +34,8 @@ Updated: 2026-05-25
 
 - Run one large project session acceptance:
   Planning Council -> milestones -> real worker -> AAO evidence -> ControlPlane -> reviewer -> repair if needed -> audit -> resume.
+- Decide and implement independent-evidence semantics for packet/multi-worker/langgraph paths.
+- Validate the audit representation of real multi-round auto-repair.
 - Fix CLI/docs mismatches found by the Opus review, especially flags that look supported but are no-ops on a path.
 - Keep fake, packet, dry-run, and real worker evidence visibly separated in reports.
 - Add a small real-run proof pack under `examples/real_run/`.

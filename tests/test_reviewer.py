@@ -615,7 +615,7 @@ class TestReviewerMainlineIntegration:
             suggested_fix="Fix the flaky assertion",
         )
 
-        repair_result, fix_packet = executor._try_auto_repair(
+        repair_result, fix_packet, _independent, _worker_result = executor._try_auto_repair(
             finding=finding,
             worker_mode="fake",
         )

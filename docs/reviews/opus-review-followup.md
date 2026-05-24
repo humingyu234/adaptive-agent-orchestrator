@@ -47,8 +47,12 @@ Current repo status on 2026-05-25:
 - `src/orchestrator/independent_evidence.py` has been added.
 - `tests/test_independent_evidence.py` has been added.
 - Mainline `claude-code` execution now captures AAO-owned evidence after worker execution.
-- Reviewer now prefers `observed/aao_diff.patch` and `observed/aao_test_output.txt` when present.
-- Validation: `tests/test_independent_evidence.py` passed, and the full suite passed with `1346 passed, 2 skipped, 32 subtests passed`.
+- Mainline captures `observed/aao_baseline.json` before worker execution and reports only baseline-relative file changes/diff afterward.
+- The baseline also records Git `HEAD` and staged-index state; changing either during a real worker run is a policy violation.
+- Both RuleBasedReviewer and CodexReviewer now consume the same bundle, preferring `observed/aao_diff.patch` and `observed/aao_test_output.txt`.
+- `required_checks` are filtered to bounded test/lint command families before real worker launch, and AAO-run checks share one total timeout budget.
+- Real `claude-code` execution without a git baseline is blocked before launch instead of falling back to worker-reported evidence.
+- Validation after follow-up fixes: `1356 passed, 2 skipped, 32 subtests passed`.
 
 ## Acceptance Tests Needed
 
@@ -61,7 +65,8 @@ Current repo status on 2026-05-25:
 
 - The first integration is for the real `claude-code` mainline path.
 - Packet/fake/multi-worker/langgraph evidence labeling still needs explicit follow-up.
-- Git evidence currently observes the whole worktree relative to `HEAD`; real runs should start from a known baseline, or AAO should add a pre-worker baseline snapshot.
+- Real auto-repair now independently verifies its fix packet; the final audit representation of multi-round repair still needs an acceptance test.
+- An allowlisted test command can still execute repository test code; command filtering prevents arbitrary launcher commands but is not a sandbox.
 
 ## Relationship To Worker Doctor
 
