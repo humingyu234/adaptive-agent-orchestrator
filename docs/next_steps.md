@@ -9,13 +9,10 @@ Updated: 2026-05-25
    - Remove or archive temporary helper scripts such as `tmp_write_evidence.py`.
    - Run targeted tests and full test suite where practical.
 
-2. Absorb the Opus independent evidence review.
-   - Add AAO-owned evidence capture.
-   - Run `git status --porcelain` after real worker execution.
-   - Run `git diff HEAD` after real worker execution.
-   - Run each `required_checks` command from AAO, not from worker self-report.
-   - Write `observed/aao_test_output.txt` and `observed/aao_diff.patch`.
-   - Treat worker files as reported evidence unless AAO generated them.
+2. Finish hardening the Opus independent evidence review.
+   - Done for the real `claude-code` mainline path.
+   - Still decide how packet/fake/multi-worker/langgraph paths should label reported vs observed evidence.
+   - Add baseline handling or a clean-worktree precondition so old dirty files do not contaminate worker changed-file evidence.
 
 3. Add Worker Doctor / Claude worker preflight.
    - Check configured `claude` path.
@@ -51,4 +48,3 @@ Updated: 2026-05-25
 - Do not build a large memory system before worker/evidence stabilization.
 - Do not rewrite Planning Council prompts as a substitute for evidence integrity.
 - Do not merge unrelated refactors into the evidence/worker reliability fixes.
-

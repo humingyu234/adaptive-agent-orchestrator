@@ -4,10 +4,10 @@ Updated: 2026-05-25
 
 ## Current Judgment
 
-AAO is not broken or thrown away. It is a production-minded prototype with a real control-plane skeleton, but it still needs two hardening steps before it can be trusted for real project work:
+AAO is not broken or thrown away. It is a production-minded prototype with a real control-plane skeleton. The first evidence-hardening step has now been absorbed from the Opus review; the next hardening step is worker preflight.
 
-1. Independent evidence integrity: AAO must verify worker results itself.
-2. Worker reliability: AAO must preflight real Claude Code workers before launching long tasks.
+1. Independent evidence integrity: AAO now has a first merged path for AAO-owned checks/diff after real `claude-code` worker execution.
+2. Worker reliability: AAO still needs to preflight real Claude Code workers before launching long tasks.
 
 ## What Is Real Today
 
@@ -18,8 +18,8 @@ AAO is not broken or thrown away. It is a production-minded prototype with a rea
 
 ## Current Weak Spots
 
-- Some evidence still depends on worker-written files such as `status.json`, `test_output.txt`, and `diff.patch`.
-- AAO does not yet have a merged independent evidence module that always runs `git status`, `git diff`, and `required_checks` itself.
+- Independent evidence is currently integrated for the `claude-code` mainline path. Packet/fake/multi-worker/langgraph paths still need explicit boundary decisions.
+- Independent git evidence is based on the current git worktree. Real task runs should start from a known baseline, or a future baseline snapshot should be added.
 - Real Claude Code worker execution can fail or hang because CLI/env/API/proxy state is not checked before milestone execution.
 - Fake/dry-run paths are useful for tests, but they must stay clearly labeled as fake evidence.
 - Memory/OpenViking work is useful later, but it is not the current blocker.
@@ -30,6 +30,8 @@ AAO is not broken or thrown away. It is a production-minded prototype with a rea
 - Added read-only packet handling so read-only milestones do not require diff/test evidence or policy checks.
 - Project session start now defers missing file-boundary concerns into open risks instead of blocking milestone creation immediately.
 - Fake worker can now complete explicit read-only packets without pretending to change files.
+- Added independent evidence capture for real `claude-code` worker runs:
+  `observed/aao_test_output.txt`, `observed/aao_diff.patch`, AAO-owned `git status`, and AAO-run `required_checks`.
 
 ## Current Priority
 
@@ -41,4 +43,3 @@ real worker can start
 -> medium task runs end to end
 -> large project session runs with resume/audit
 ```
-

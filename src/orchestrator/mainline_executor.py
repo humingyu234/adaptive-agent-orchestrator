@@ -23,6 +23,7 @@ from .auto_repair import AutoRepairLoop, FixTask, ReviewFinding
 from .control_models import ControlDecision, WorkerEvidenceStatus
 from .control_plane import ControlPlane
 from .failure_taxonomy import FailureCategory, FailureReason
+from .independent_evidence import IndependentEvidence, capture_independent_evidence
 from .planning import PlanContract, PlannedWorkerTask, plan_contract_to_dict
 from .policy import Policy
 from .worker_protocol import (
@@ -251,12 +252,29 @@ class MainlineExecutor:
         final_worker_result: dict[str, Any] = worker_result
 
         for attempt in range(max_retries + 1):
-            # 3. Classify evidence
-            evidence_status = classify_worker_evidence_from_packet(packet)
+            # 2d. Independent observation (real worker modes only): AAO runs the
+            #     required checks and computes the git diff itself, so evidence
+            #     is ground truth rather than worker self-report.  Returns None
+            #     (→ fall back to reported evidence) when not a git work tree.
+            independent: IndependentEvidence | None = None
+            if worker_mode == "claude-code":
+                independent = capture_independent_evidence(packet, self.project_root)
+
+            # 3. Classify evidence (AAO-observed changed files override self-report)
+            evidence_status = classify_worker_evidence_from_packet(
+                packet,
+                observed_changed_files=(
+                    independent.changed_files if independent is not None else None
+                ),
+            )
             final_evidence_status = evidence_status
 
-            # 4. Check test results for failures
-            test_decisions = self._check_test_results(packet)
+            # 4. Check results — prefer AAO's real exit codes over scraping a
+            #    worker-written test_output.txt.
+            if independent is not None and independent.checks:
+                test_decisions = self._check_independent_results(independent)
+            else:
+                test_decisions = self._check_test_results(packet)
 
             # 5. Run ControlPlane checks
             control_decisions = test_decisions + self._run_control_checks(
@@ -782,9 +800,18 @@ class MainlineExecutor:
         """
         from .reviewer import EvidenceBundle, RuleBasedReviewer
 
-        # Read observed evidence from packet
-        diff_path = packet.packet_root / PacketFiles.DIFF
-        test_output_path = packet.packet_root / PacketFiles.TEST_OUTPUT
+        # Read observed evidence from packet.  Prefer AAO-owned ground-truth
+        # files (written by capture_independent_evidence) over worker-deposited
+        # ones, so the reviewer audits what AAO observed, not what the worker
+        # chose to report.
+        observed = packet.packet_root / "observed"
+        aao_diff = observed / "aao_diff.patch"
+        aao_test_output = observed / "aao_test_output.txt"
+        diff_path = aao_diff if aao_diff.exists() else packet.packet_root / PacketFiles.DIFF
+        test_output_path = (
+            aao_test_output if aao_test_output.exists()
+            else packet.packet_root / PacketFiles.TEST_OUTPUT
+        )
         result_md_path = packet.packet_root / PacketFiles.RESULT
 
         diff_content = ""
@@ -1428,6 +1455,32 @@ class MainlineExecutor:
 
     _TEST_FAILURE_RE = re.compile(r"(\d+)\s+failed", re.IGNORECASE)
     _TEST_FAILED_LINE = re.compile(r"\bFAILED\b")
+
+    def _check_independent_results(
+        self, independent: IndependentEvidence
+    ) -> list[ControlDecision]:
+        """Decide on required-check outcomes AAO ran itself (real exit codes).
+
+        Unlike :meth:`_check_test_results`, this trusts process exit codes, not
+        a worker-written text file — so a worker that claims success cannot pass
+        when its checks actually fail.
+        """
+        failed = independent.failed_checks
+        if not failed:
+            return [ControlDecision(
+                passed=True, action="continue",
+                reason=f"AAO ran {len(independent.checks)} required check(s); all passed",
+            )]
+        names = "; ".join(c.command for c in failed)
+        return [ControlDecision(
+            passed=False,
+            action="retry",
+            reason=f"AAO independently ran required checks; {len(failed)} failed: {names}",
+            severity="medium",
+            failure_category=FailureCategory.TASK_QUALITY_ERROR.value,
+            failure_origin="worker",
+            recovery_hint="retry",
+        )]
 
     def _check_test_results(self, packet: WorkerTaskPacket) -> list[ControlDecision]:
         """Parse test_output.txt for failures. Returns blocking decision if found."""

@@ -42,11 +42,13 @@ The review package includes:
 - `new-files/independent_evidence.py`
 - `new-files/test_independent_evidence.py`
 
-Current repo check on 2026-05-25:
+Current repo status on 2026-05-25:
 
-- `src/orchestrator/independent_evidence.py` is not yet present.
-- `aao_test_output` / `aao_diff` markers are not present in current source.
-- `git apply --check evidence-integrity.patch` succeeded, but the worktree already has unrelated local changes, so this should be absorbed after current changes are committed or otherwise separated.
+- `src/orchestrator/independent_evidence.py` has been added.
+- `tests/test_independent_evidence.py` has been added.
+- Mainline `claude-code` execution now captures AAO-owned evidence after worker execution.
+- Reviewer now prefers `observed/aao_diff.patch` and `observed/aao_test_output.txt` when present.
+- Validation: `tests/test_independent_evidence.py` passed, and the full suite passed with `1346 passed, 2 skipped, 32 subtests passed`.
 
 ## Acceptance Tests Needed
 
@@ -54,6 +56,12 @@ Current repo check on 2026-05-25:
 - A worker reports `changed_files: []`, but actually modifies a denied file -> AAO catches it via `git status`.
 - A normal passing check produces a clean decision.
 - Non-git projects degrade honestly instead of pretending to have independent git evidence.
+
+## Remaining Boundaries
+
+- The first integration is for the real `claude-code` mainline path.
+- Packet/fake/multi-worker/langgraph evidence labeling still needs explicit follow-up.
+- Git evidence currently observes the whole worktree relative to `HEAD`; real runs should start from a known baseline, or AAO should add a pre-worker baseline snapshot.
 
 ## Relationship To Worker Doctor
 
@@ -70,4 +78,3 @@ Can the real worker start and talk to its model/API before we wait on a long tas
 ```
 
 Both are P0, but they solve different failure points.
-

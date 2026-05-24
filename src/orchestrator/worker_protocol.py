@@ -283,6 +283,7 @@ def classify_worker_evidence(
     expected_evidence: list[str],
     worker_kind: str = "claude_code",
     denied_files: list[str] | None = None,
+    observed_changed_files: list[str] | None = None,
 ) -> WorkerEvidenceStatus:
     """Inspect a completed packet and classify evidence status.
 
@@ -293,6 +294,11 @@ def classify_worker_evidence(
     *denied_files* is the authoritative deny-list from the manifest (AAO-side).
     When provided, it replaces the worker-reported list in status.json so that
     a worker cannot hide a denied-file change by omitting the field.
+
+    *observed_changed_files* is the authoritative changed-file list AAO computed
+    itself (e.g. from ``git status``).  When provided it overrides the worker's
+    self-reported ``changed_files`` entirely, so a worker cannot hide a change
+    by omitting it from status.json.
     """
     status_data = load_worker_status(packet_path)
     result_text = load_worker_result_text(packet_path)
@@ -300,9 +306,12 @@ def classify_worker_evidence(
 
     worker_status = status_data.get("status", "unknown")
 
-    changed_files = status_data.get("changed_files", [])
-    if not changed_files and result_text:
-        changed_files = _extract_changed_files_from_result(result_text)
+    if observed_changed_files is not None:
+        changed_files = list(observed_changed_files)
+    else:
+        changed_files = status_data.get("changed_files", [])
+        if not changed_files and result_text:
+            changed_files = _extract_changed_files_from_result(result_text)
 
     items: list[WorkerEvidenceItem] = []
     for key in expected_evidence:
@@ -344,13 +353,19 @@ def classify_worker_evidence(
 
 def classify_worker_evidence_from_packet(
     packet: WorkerTaskPacket,
+    observed_changed_files: list[str] | None = None,
 ) -> WorkerEvidenceStatus:
-    """Shorthand: classify evidence from a WorkerTaskPacket."""
+    """Shorthand: classify evidence from a WorkerTaskPacket.
+
+    *observed_changed_files*, when supplied, is AAO's own ground-truth file
+    list (e.g. from ``git status``) and overrides the worker's self-report.
+    """
     return classify_worker_evidence(
         packet_path=packet.packet_root,
         expected_evidence=packet.expected_evidence,
         worker_kind=packet.worker_kind,
         denied_files=packet.denied_files,
+        observed_changed_files=observed_changed_files,
     )
 
 
