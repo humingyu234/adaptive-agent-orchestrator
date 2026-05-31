@@ -16,7 +16,7 @@ files:
 
 checks:
   required:
-    - pytest
+    - python -m pytest -q
 
 human_review:
   required_for:

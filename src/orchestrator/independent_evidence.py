@@ -196,7 +196,22 @@ def _snapshot_at_ref(root: Path, ref: str, relative_path: str) -> FileSnapshot:
     )
     if r.returncode != 0:
         return FileSnapshot(None)
-    return FileSnapshot(r.stdout, kind="file")
+    mode = _mode_at_ref(root, ref, relative_path)
+    return FileSnapshot(r.stdout, mode=mode, kind="file")
+
+
+def _mode_at_ref(root: Path, ref: str, relative_path: str) -> int | None:
+    r = subprocess.run(
+        ["git", "-C", str(root), "ls-tree", ref, "--", relative_path],
+        capture_output=True, text=True, timeout=_GIT_TIMEOUT,
+    )
+    if r.returncode != 0 or not r.stdout.strip():
+        return None
+    raw_mode = r.stdout.split(maxsplit=1)[0]
+    try:
+        return int(raw_mode[-3:], 8)
+    except ValueError:
+        return None
 
 
 def capture_git_baseline(packet, project_root: str | Path) -> GitBaseline | None:

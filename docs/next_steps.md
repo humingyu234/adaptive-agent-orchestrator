@@ -14,6 +14,7 @@ Completed on the real single-worker `claude-code` mainline path:
 - Fail-fast git-worktree requirement for real controlled `claude-code` execution.
 - Lean `CLAUDE.md` plus official `.claude/skills/<skill>/SKILL.md` entrypoints.
 - Claude Code Worker Doctor preflight with AAO-owned observed evidence.
+- Medium real task acceptance completed after policy check normalization.
 
 Next:
 
@@ -22,14 +23,7 @@ Next:
    - Tracked `tmp/test_*.py` probe scripts should be removed from the repo or moved under non-test fixtures.
    - Rotate any API keys that were ever written into temporary probe scripts.
 
-2. Run medium real task acceptance.
-   - Real Claude Code worker.
-   - 1-3 files changed.
-   - AAO-owned checks and diff.
-   - Audit report generated.
-   - Repeat until the failure mode is explainable.
-
-3. Add lightweight Control Trace output for demos and PR review.
+2. Add lightweight Control Trace output for demos and PR review.
    - Task / plan / worker / observed evidence / decision / failure / recovery / audit.
    - Keep it CLI/artifact-first; do not build a large dashboard yet.
 

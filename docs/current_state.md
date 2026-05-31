@@ -39,12 +39,15 @@ AAO is not broken or thrown away. It is a production-minded prototype with a rea
 - Real controlled `claude-code` execution now requires a git worktree; otherwise it stops before worker launch rather than downgrading silently to worker-reported evidence.
 - Slimmed `CLAUDE.md` into a session front door and moved detailed project operating modes into official `.claude/skills/<skill>/SKILL.md` entrypoints. Legacy `.claude/project-skills/` files are retained only for old phase specs.
 - Added Claude Code Worker Doctor preflight. AAO now runs a short `claude -p` smoke test before long real worker tasks, records `observed/aao_worker_doctor.json`, `observed/aao_worker_doctor_stdout.txt`, and `observed/aao_worker_doctor_stderr.txt`, and blocks before the long worker if preflight fails.
+- Normalized the default policy required check from bare `pytest` to `python -m pytest -q`, because AAO's independent check runner must use the same reliable pytest entrypoint as the rest of the project.
 
 ## Verification Baseline
 
+- Medium real task acceptance rerun validated after policy check normalization.
 - Targeted evidence/reviewer/worker/doctor tests: `89 passed` on the latest Worker Doctor slice.
 - Previous targeted evidence/reviewer/worker tests: `179 passed`.
-- Full test suite: `1360 passed, 2 skipped, 32 subtests passed`.
+- Latest targeted evidence/worker/demo tests: `103 passed`.
+- Full test suite: `1361 passed, 2 skipped, 32 subtests passed`.
 
 ## Current Priority
 

@@ -148,6 +148,25 @@ def test_baseline_excludes_dirty_files_untouched_by_worker(tmp_path: Path):
     assert "old.py" not in Path(ev.diff_path).read_text(encoding="utf-8")
 
 
+def test_baseline_diff_does_not_invent_mode_change_for_clean_tracked_file(tmp_path: Path):
+    """A content-only edit to a clean tracked file must not report a fake mode change."""
+    _init_repo(tmp_path)
+    (tmp_path / "tracked.py").write_text("value = 1\n")
+    _commit_all(tmp_path)
+
+    packet = _packet(tmp_path)
+    baseline = capture_git_baseline(packet, tmp_path)
+    (tmp_path / "tracked.py").write_text("value = 2\n")
+
+    ev = capture_independent_evidence(packet, tmp_path, baseline=baseline, run_checks=False)
+
+    assert ev is not None
+    diff = Path(ev.diff_path).read_text(encoding="utf-8")
+    assert "-value = 1" in diff
+    assert "+value = 2" in diff
+    assert "mode change tracked.py" not in diff
+
+
 def test_baseline_detects_worker_edit_to_already_dirty_file(tmp_path: Path):
     """If the worker edits a dirty file again, that new delta is still caught."""
     _init_repo(tmp_path)
