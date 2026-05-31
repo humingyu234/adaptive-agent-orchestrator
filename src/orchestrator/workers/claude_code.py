@@ -286,6 +286,9 @@ class ClaudeCodeWorkerConfig:
     prompt_mode: str = "stdin"  # stdin | file
     project_root: str = ""
     extra_args: list[str] = field(default_factory=lambda: ["-p", "--verbose"])
+    doctor_enabled: bool = True
+    doctor_timeout_seconds: float = 30.0
+    doctor_prompt: str = "say hi"
 
     @classmethod
     def from_env(cls, project_root: str = "") -> "ClaudeCodeWorkerConfig":
@@ -294,6 +297,12 @@ class ClaudeCodeWorkerConfig:
             timeout_seconds=int(os.environ.get("AAO_CLAUDE_CODE_TIMEOUT_SECONDS", "600")),
             prompt_mode=os.environ.get("AAO_CLAUDE_CODE_PROMPT_MODE", "stdin"),
             project_root=project_root,
+            doctor_enabled=os.environ.get("AAO_CLAUDE_CODE_DOCTOR", "1").lower()
+            not in {"0", "false", "no", "off"},
+            doctor_timeout_seconds=float(
+                os.environ.get("AAO_CLAUDE_CODE_DOCTOR_TIMEOUT_SECONDS", "30")
+            ),
+            doctor_prompt=os.environ.get("AAO_CLAUDE_CODE_DOCTOR_PROMPT", "say hi"),
         )
 
 
@@ -321,6 +330,132 @@ class WorkerRunResult:
     @property
     def succeeded(self) -> bool:
         return self.exit_code == 0 and not self.timed_out
+
+
+@dataclass
+class ClaudeCodeDoctorResult:
+    """AAO-owned preflight result for a Claude Code worker launch."""
+
+    ok: bool = False
+    exit_code: int = -1
+    timed_out: bool = False
+    elapsed_seconds: float = 0.0
+    command: str = ""
+    error: str = ""
+    stdout_path: str = ""
+    stderr_path: str = ""
+    report_path: str = ""
+    observed_paths: list[str] = field(default_factory=list)
+    env_snapshot: dict[str, bool] = field(default_factory=dict)
+
+
+def run_claude_code_doctor(
+    packet: WorkerTaskPacket,
+    *,
+    config: ClaudeCodeWorkerConfig,
+) -> ClaudeCodeDoctorResult:
+    """Run a short AAO-owned Claude Code smoke test before a long worker task.
+
+    The doctor proves only that AAO can launch the configured CLI in the current
+    environment and get a bounded subprocess result. It does not prove task
+    correctness; it prevents 600-second worker hangs from hiding basic CLI/env
+    failures.
+    """
+    pdir = packet.packet_root
+    observed_dir = pdir / "observed"
+    observed_dir.mkdir(parents=True, exist_ok=True)
+
+    stdout_path = observed_dir / "aao_worker_doctor_stdout.txt"
+    stderr_path = observed_dir / "aao_worker_doctor_stderr.txt"
+    report_path = observed_dir / "aao_worker_doctor.json"
+
+    cmd = _build_doctor_command(config)
+    cmd_display = " ".join(cmd)
+    cwd = config.project_root or str(Path.cwd())
+    env_snapshot = _env_presence_snapshot()
+
+    start = time.monotonic()
+    exit_code = -1
+    timed_out = False
+    stdout_text = ""
+    stderr_text = ""
+    error = ""
+
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            cwd=cwd,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        try:
+            stdout_text, stderr_text = proc.communicate(
+                input=config.doctor_prompt,
+                timeout=config.doctor_timeout_seconds,
+            )
+            exit_code = proc.returncode
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            stdout_text, stderr_text = proc.communicate(timeout=10)
+            timed_out = True
+            exit_code = -1
+            error = (
+                "Claude Code Worker Doctor timed out after "
+                f"{config.doctor_timeout_seconds:g}s"
+            )
+    except FileNotFoundError:
+        error = f"Claude Code command not found during Worker Doctor: {config.command!r}"
+        exit_code = -2
+    except PermissionError:
+        error = f"Permission denied during Worker Doctor: {config.command!r}"
+        exit_code = -3
+    except OSError as exc:
+        error = f"OS error during Worker Doctor: {exc}"
+        exit_code = -4
+
+    elapsed = time.monotonic() - start
+    ok = exit_code == 0 and not timed_out and not error
+    if not ok and not error:
+        error = f"Claude Code Worker Doctor exited with code {exit_code}"
+
+    stdout_path.write_text(stdout_text or "", encoding="utf-8", errors="replace")
+    stderr_path.write_text(stderr_text or "", encoding="utf-8", errors="replace")
+    report_path.write_text(
+        json.dumps({
+            "ok": ok,
+            "exit_code": exit_code,
+            "timed_out": timed_out,
+            "elapsed_seconds": round(elapsed, 2),
+            "command": cmd_display,
+            "error": error,
+            "stdout_path": str(stdout_path),
+            "stderr_path": str(stderr_path),
+            "env_snapshot": env_snapshot,
+        }, indent=2),
+        encoding="utf-8",
+    )
+
+    return ClaudeCodeDoctorResult(
+        ok=ok,
+        exit_code=exit_code,
+        timed_out=timed_out,
+        elapsed_seconds=round(elapsed, 2),
+        command=cmd_display,
+        error=error,
+        stdout_path=str(stdout_path),
+        stderr_path=str(stderr_path),
+        report_path=str(report_path),
+        observed_paths=[
+            str(stdout_path.relative_to(pdir)).replace("\\", "/"),
+            str(stderr_path.relative_to(pdir)).replace("\\", "/"),
+            str(report_path.relative_to(pdir)).replace("\\", "/"),
+        ],
+        env_snapshot=env_snapshot,
+    )
 
 
 def run_claude_code_worker(
@@ -492,3 +627,20 @@ def _build_worker_command(
     # stdin mode: -p alone reads from the subprocess stdin pipe
 
     return cmd
+
+
+def _build_doctor_command(config: ClaudeCodeWorkerConfig) -> list[str]:
+    """Build the Worker Doctor argv using the same CLI route as the worker."""
+    return shlex.split(config.command) + list(config.extra_args)
+
+
+def _env_presence_snapshot() -> dict[str, bool]:
+    """Record env/proxy presence without leaking secret values."""
+    return {
+        "ANTHROPIC_API_KEY": bool(os.environ.get("ANTHROPIC_API_KEY")),
+        "ANTHROPIC_AUTH_TOKEN": bool(os.environ.get("ANTHROPIC_AUTH_TOKEN")),
+        "ANTHROPIC_BASE_URL": bool(os.environ.get("ANTHROPIC_BASE_URL")),
+        "HTTP_PROXY": bool(os.environ.get("HTTP_PROXY")),
+        "HTTPS_PROXY": bool(os.environ.get("HTTPS_PROXY")),
+        "ALL_PROXY": bool(os.environ.get("ALL_PROXY")),
+    }

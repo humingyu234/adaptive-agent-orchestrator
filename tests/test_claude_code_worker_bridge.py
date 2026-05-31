@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -701,6 +702,60 @@ class TestRealWorkerSubprocess:
         assert "allowed" in content.lower() or "Allowed" in content
 
 
+class TestClaudeCodeWorkerDoctor:
+    """AAO-owned preflight before launching a long Claude Code worker."""
+
+    def test_worker_doctor_writes_observed_evidence_on_success(self, tmp_path):
+        from orchestrator.workers.claude_code import (
+            ClaudeCodeWorkerConfig,
+            run_claude_code_doctor,
+        )
+
+        packet = _make_test_packet(tmp_path)
+        config = ClaudeCodeWorkerConfig(
+            command=sys.executable,
+            project_root=str(tmp_path),
+            extra_args=[
+                "-c",
+                "import sys; data=sys.stdin.read(); print('doctor ok:' + data.strip())",
+            ],
+            doctor_prompt="say hi",
+            doctor_timeout_seconds=5,
+        )
+
+        result = run_claude_code_doctor(packet, config=config)
+
+        assert result.ok
+        assert result.exit_code == 0
+        assert "observed/aao_worker_doctor.json" in result.observed_paths
+        assert "doctor ok:say hi" in Path(result.stdout_path).read_text(encoding="utf-8")
+        report = json.loads(Path(result.report_path).read_text(encoding="utf-8"))
+        assert report["ok"] is True
+        assert "env_snapshot" in report
+
+    def test_worker_doctor_timeout_is_observed_failure(self, tmp_path):
+        from orchestrator.workers.claude_code import (
+            ClaudeCodeWorkerConfig,
+            run_claude_code_doctor,
+        )
+
+        packet = _make_test_packet(tmp_path)
+        config = ClaudeCodeWorkerConfig(
+            command=sys.executable,
+            project_root=str(tmp_path),
+            extra_args=["-c", "import time; time.sleep(5)"],
+            doctor_timeout_seconds=0.1,
+        )
+
+        result = run_claude_code_doctor(packet, config=config)
+
+        assert not result.ok
+        assert result.timed_out
+        assert "Worker Doctor timed out" in result.error
+        report = json.loads(Path(result.report_path).read_text(encoding="utf-8"))
+        assert report["timed_out"] is True
+
+
 class TestMainlineClaudeCodeWorker:
     """Integration: MainlineExecutor with claude-code worker mode using fake subprocess."""
 
@@ -936,6 +991,64 @@ class TestMainlineClaudeCodeWorker:
 
         # And that MainlineExecutor dispatches to the right method
         assert hasattr(executor, "_execute_claude_code_worker")
+
+    def test_mainline_worker_doctor_blocks_before_long_worker(self, tmp_path, monkeypatch):
+        """A failed preflight must stop before launching the long worker task."""
+        import orchestrator.workers.claude_code as cc
+        from orchestrator.mainline_executor import MainlineExecutor
+
+        _init_git_worktree(tmp_path)
+        plan = PlanContract(
+            objective="Test worker doctor",
+            run_mode="controlled",
+            task_size="medium",
+            steps=["Implement"],
+            required_evidence=["test_output.txt"],
+            success_criteria=["Works"],
+            planned_worker_tasks=[
+                PlannedWorkerTask(
+                    title="Modify app",
+                    objective="Modify src/app.py",
+                    allowed_files=["src/app.py"],
+                    required_checks=["python -m pytest"],
+                    expected_evidence=["test_output.txt", "diff.patch"],
+                )
+            ],
+        )
+        plan.approve()
+
+        executor = MainlineExecutor(tmp_path)
+        monkeypatch.setattr(executor, "_resolve_claude_code_cli", lambda: sys.executable)
+        monkeypatch.setattr(
+            cc,
+            "run_claude_code_worker",
+            lambda *_args, **_kwargs: pytest.fail("long worker must not start"),
+        )
+
+        result = executor.execute(plan, worker_mode="claude-code")
+
+        assert result.status == "blocked_failed"
+        assert "Worker Doctor" in result.summary
+        assert any(
+            "aao_worker_doctor.json" in p
+            for p in result.worker_result.get("observed_paths", [])
+        )
+
+    def test_mainline_worker_doctor_records_missing_cli_as_observed(self, tmp_path, monkeypatch):
+        """Even a missing CLI should produce AAO-owned doctor evidence."""
+        from orchestrator.mainline_executor import MainlineExecutor
+
+        packet = _make_test_packet(tmp_path)
+        executor = MainlineExecutor(tmp_path)
+        monkeypatch.setattr(executor, "_resolve_claude_code_cli", lambda: None)
+        monkeypatch.setenv("AAO_CLAUDE_CODE_COMMAND", "/nonexistent/claude-worker-doctor")
+
+        result = executor._execute_claude_code_worker(packet)
+
+        assert result["worker_status"] == "infrastructure_error"
+        assert result["exit_code"] == -2
+        assert "not found" in result["error"].lower()
+        assert any("aao_worker_doctor.json" in p for p in result["observed_paths"])
 
 
 class TestCliClaudeCodeMode:

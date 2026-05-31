@@ -658,9 +658,33 @@ class MultiWorkerExecutor:
     def _execute_claude_code(self, packet: WorkerTaskPacket) -> dict[str, Any]:
         from .workers.claude_code import (
             ClaudeCodeWorkerConfig,
+            run_claude_code_doctor,
             run_claude_code_worker,
         )
         config = ClaudeCodeWorkerConfig.from_env(project_root=str(self.project_root))
+        if config.doctor_enabled:
+            doctor = run_claude_code_doctor(packet, config=config)
+            if not doctor.ok:
+                return {
+                    "run_id": packet.run_id,
+                    "task_id": packet.task_id,
+                    "packet_dir": str(packet.packet_root),
+                    "behaviour": "claude-code",
+                    "exit_code": doctor.exit_code,
+                    "timed_out": doctor.timed_out,
+                    "worker_status": "infrastructure_error",
+                    "changed_files": [],
+                    "summary": "Claude Code Worker Doctor failed",
+                    "error": doctor.error,
+                    "observed_paths": doctor.observed_paths,
+                    "stdout_path": doctor.stdout_path,
+                    "stderr_path": doctor.stderr_path,
+                    "transcript_path": doctor.report_path,
+                    "command": doctor.command,
+                    "timeout": config.doctor_timeout_seconds,
+                    "doctor_report_path": doctor.report_path,
+                    "doctor_env_snapshot": doctor.env_snapshot,
+                }
         result = run_claude_code_worker(packet, config=config)
         return {
             "run_id": result.run_id,

@@ -1,13 +1,13 @@
 # AAO Current State
 
-Updated: 2026-05-29
+Updated: 2026-06-01
 
 ## Current Judgment
 
-AAO is not broken or thrown away. It is a production-minded prototype with a real control-plane skeleton. The real single-worker `claude-code` mainline now has an evidence-integrity hardening pass; the next runtime blocker is worker preflight.
+AAO is not broken or thrown away. It is a production-minded prototype with a real control-plane skeleton. The real single-worker `claude-code` mainline now has evidence-integrity hardening and Worker Doctor preflight; the next runtime blocker is a real medium-task acceptance run.
 
 1. Independent evidence integrity: AAO now records a pre-worker git baseline, computes the worker-attributable delta, executes bounded `required_checks`, and feeds AAO-owned evidence to both reviewer layers on the real single-worker `claude-code` path.
-2. Worker reliability: AAO still needs to preflight real Claude Code workers before launching long tasks.
+2. Worker reliability: AAO now runs a bounded Claude Code Worker Doctor before long real worker tasks and records AAO-owned doctor evidence.
 
 ## What Is Real Today
 
@@ -20,7 +20,7 @@ AAO is not broken or thrown away. It is a production-minded prototype with a rea
 
 - Independent evidence is currently integrated for the real single-worker `claude-code` mainline path. Packet/fake/multi-worker/langgraph paths still need explicit boundary decisions.
 - Auto-repair executed by a real `claude-code` worker now uses independent evidence for fix verification, but the broader audit representation of multi-round repair still deserves acceptance validation.
-- Real Claude Code worker execution can fail or hang because CLI/env/API/proxy state is not checked before milestone execution.
+- Real Claude Code worker execution now has preflight, but still needs a live medium-task acceptance run to prove the local CLI/env/API/proxy path works outside tests.
 - Fake/dry-run paths are useful for tests, but they must stay clearly labeled as fake evidence.
 - Memory/OpenViking work is useful later, but it is not the current blocker.
 
@@ -38,11 +38,13 @@ AAO is not broken or thrown away. It is a production-minded prototype with a rea
 - Added a bounded required-check runner policy and one total timeout budget for AAO-run checks.
 - Real controlled `claude-code` execution now requires a git worktree; otherwise it stops before worker launch rather than downgrading silently to worker-reported evidence.
 - Slimmed `CLAUDE.md` into a session front door and moved detailed project operating modes into official `.claude/skills/<skill>/SKILL.md` entrypoints. Legacy `.claude/project-skills/` files are retained only for old phase specs.
+- Added Claude Code Worker Doctor preflight. AAO now runs a short `claude -p` smoke test before long real worker tasks, records `observed/aao_worker_doctor.json`, `observed/aao_worker_doctor_stdout.txt`, and `observed/aao_worker_doctor_stderr.txt`, and blocks before the long worker if preflight fails.
 
 ## Verification Baseline
 
-- Targeted evidence/reviewer/worker tests: `179 passed`.
-- Full test suite: `1356 passed, 2 skipped, 32 subtests passed`.
+- Targeted evidence/reviewer/worker/doctor tests: `89 passed` on the latest Worker Doctor slice.
+- Previous targeted evidence/reviewer/worker tests: `179 passed`.
+- Full test suite: `1360 passed, 2 skipped, 32 subtests passed`.
 
 ## Current Priority
 

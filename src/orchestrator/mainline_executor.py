@@ -1376,7 +1376,43 @@ class MainlineExecutor:
         """Launch a real Claude Code subprocess as the worker."""
         claude_cli = self._resolve_claude_code_cli()
 
-        if claude_cli is None:
+        from .workers.claude_code import (
+            ClaudeCodeWorkerConfig,
+            run_claude_code_doctor,
+            run_claude_code_worker,
+        )
+
+        config = ClaudeCodeWorkerConfig.from_env(
+            project_root=str(self.project_root),
+        )
+        if claude_cli is not None:
+            config.command = claude_cli  # force native Linux CLI path
+        if config.doctor_enabled:
+            doctor = run_claude_code_doctor(packet, config=config)
+            if not doctor.ok:
+                return {
+                    "run_id": packet.run_id,
+                    "task_id": packet.task_id,
+                    "packet_dir": str(packet.packet_root),
+                    "behaviour": "claude-code",
+                    "exit_code": doctor.exit_code,
+                    "timed_out": doctor.timed_out,
+                    "worker_status": "infrastructure_error",
+                    "changed_files": [],
+                    "summary": "Claude Code Worker Doctor failed",
+                    "error": doctor.error,
+                    "observed_paths": doctor.observed_paths,
+                    "stdout_path": doctor.stdout_path,
+                    "stderr_path": doctor.stderr_path,
+                    "transcript_path": doctor.report_path,
+                    "result_md_path": "",
+                    "status_json_path": "",
+                    "command": doctor.command,
+                    "timeout": config.doctor_timeout_seconds,
+                    "doctor_report_path": doctor.report_path,
+                    "doctor_env_snapshot": doctor.env_snapshot,
+                }
+        elif claude_cli is None and config.command == "claude":
             return {
                 "run_id": _new_run_id(),
                 "task_id": packet.task_id,
@@ -1396,16 +1432,6 @@ class MainlineExecutor:
                 "status_json_path": "",
                 "command": "claude (not found)",
             }
-
-        from .workers.claude_code import (
-            ClaudeCodeWorkerConfig,
-            run_claude_code_worker,
-        )
-
-        config = ClaudeCodeWorkerConfig.from_env(
-            project_root=str(self.project_root),
-        )
-        config.command = claude_cli  # force native Linux CLI path
         result = run_claude_code_worker(packet, config=config)
 
         return {
