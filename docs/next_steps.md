@@ -1,6 +1,6 @@
 # AAO Next Steps
 
-Updated: 2026-05-25
+Updated: 2026-05-29
 
 ## P0
 
@@ -12,6 +12,7 @@ Completed on the real single-worker `claude-code` mainline path:
 - Shared AAO-owned evidence bundle for RuleBasedReviewer and CodexReviewer.
 - Safe required-check command families and a total execution budget.
 - Fail-fast git-worktree requirement for real controlled `claude-code` execution.
+- Lean `CLAUDE.md` plus official `.claude/skills/<skill>/SKILL.md` entrypoints.
 
 Next:
 
@@ -30,6 +31,10 @@ Next:
    - Audit report generated.
    - Repeat until the failure mode is explainable.
 
+4. Add lightweight Control Trace output for demos and PR review.
+   - Task / plan / worker / observed evidence / decision / failure / recovery / audit.
+   - Keep it CLI/artifact-first; do not build a large dashboard yet.
+
 ## P1
 
 - Run one large project session acceptance:
@@ -39,6 +44,8 @@ Next:
 - Fix CLI/docs mismatches found by the Opus review, especially flags that look supported but are no-ops on a path.
 - Keep fake, packet, dry-run, and real worker evidence visibly separated in reports.
 - Add a small real-run proof pack under `examples/real_run/`.
+- Add a PR Proof Pack format for future open-source PRs:
+  problem, change, verification, risk, AAO-observed evidence, reviewer findings.
 
 ## P2 / Parking Lot
 
@@ -47,6 +54,7 @@ Next:
 - Evaluate OpenViking only after the memory schema is clear and the real worker/evidence path is stable.
 - LangGraph runner persistence hardening.
 - Multi-worker real-world reliability and conflict handling.
+- Archive legacy `.claude/project-skills/*.md` after old phase-spec references are migrated.
 
 ## Non-Goals Right Now
 

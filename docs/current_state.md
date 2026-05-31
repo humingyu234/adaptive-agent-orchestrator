@@ -1,6 +1,6 @@
 # AAO Current State
 
-Updated: 2026-05-25
+Updated: 2026-05-29
 
 ## Current Judgment
 
@@ -24,7 +24,7 @@ AAO is not broken or thrown away. It is a production-minded prototype with a rea
 - Fake/dry-run paths are useful for tests, but they must stay clearly labeled as fake evidence.
 - Memory/OpenViking work is useful later, but it is not the current blocker.
 
-## Recent Local Fixes Pending In Worktree
+## Recent Stabilization Fixes
 
 - Reverted default Claude worker args from `--permission-mode auto` back to `-p --verbose`, because a real worker run timed out after 600s with no stdout/stderr after adding the flag.
 - Added read-only packet handling so read-only milestones do not require diff/test evidence or policy checks.
@@ -37,6 +37,7 @@ AAO is not broken or thrown away. It is a production-minded prototype with a rea
 - Unified RuleBasedReviewer and CodexReviewer on the same AAO-owned evidence bundle.
 - Added a bounded required-check runner policy and one total timeout budget for AAO-run checks.
 - Real controlled `claude-code` execution now requires a git worktree; otherwise it stops before worker launch rather than downgrading silently to worker-reported evidence.
+- Slimmed `CLAUDE.md` into a session front door and moved detailed project operating modes into official `.claude/skills/<skill>/SKILL.md` entrypoints. Legacy `.claude/project-skills/` files are retained only for old phase specs.
 
 ## Verification Baseline
 
