@@ -1,6 +1,6 @@
 # AAO Next Steps
 
-Updated: 2026-06-01
+Updated: 2026-06-04
 
 ## P0
 
@@ -15,11 +15,13 @@ Completed on the real single-worker `claude-code` mainline path:
 - Lean `CLAUDE.md` plus official `.claude/skills/<skill>/SKILL.md` entrypoints.
 - Claude Code Worker Doctor preflight with AAO-owned observed evidence.
 - Medium real task acceptance completed after policy check normalization.
+- Removed the untracked `tmp_write_evidence.py` helper after confirming it was
+  not part of the production code path.
+- Recorded the AI-native harness model in `docs/ai_native_harness_principles.md`.
 
 Next:
 
 1. Remove or archive temporary helper/probe scripts.
-   - `tmp_write_evidence.py` is untracked and should be deleted or archived after confirmation.
    - Tracked `tmp/test_*.py` probe scripts should be removed from the repo or moved under non-test fixtures.
    - Rotate any API keys that were ever written into temporary probe scripts.
 
@@ -38,6 +40,13 @@ Next:
 - Add a small real-run proof pack under `examples/real_run/`.
 - Add a PR Proof Pack format for future open-source PRs:
   problem, change, verification, risk, AAO-observed evidence, reviewer findings.
+- Keep applying `docs/ai_native_harness_principles.md` as the operating model:
+  Claude best practices for worker discipline, AAO for project-level control,
+  and ultracode as a future worker-backend candidate rather than the current
+  default execution path.
+- Start integrating Claude hooks / permissions after Control Trace and Review
+  Brief are stable, so worker-level hard stops complement AAO checkpoint-level
+  controls.
 
 ## P2 / Parking Lot
 
@@ -47,6 +56,8 @@ Next:
 - LangGraph runner persistence hardening.
 - Multi-worker real-world reliability and conflict handling.
 - Archive legacy `.claude/project-skills/*.md` after old phase-spec references are migrated.
+- Evaluate Claude ultracode / dynamic workflows as an optional large-task
+  worker backend after AAO can independently verify and review large outputs.
 
 ## Non-Goals Right Now
 
